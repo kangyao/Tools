@@ -8,3 +8,5 @@ fastgithub_win-x64/dnscrypt-proxy/relays.md
 fastgithub_win-x64/dnscrypt-proxy/relays.md.minisig
 fastgithub_win-x64/dnsendpoints.json
 fastgithub_win-x64/logs/log20250606.txt
+*.txt
+fastgithub_win-x64/dnscrypt-proxy/dnscrypt-proxy.toml
