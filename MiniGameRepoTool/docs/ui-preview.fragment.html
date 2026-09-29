@@ -1,0 +1,319 @@
+<style>
+#repo-tool { --rt-bg:light-dark(#f6f7f9,#181b22); --rt-panel:light-dark(#ffffff,#21252e); --rt-ink:light-dark(#1d2838,#e8edf6); --rt-muted:light-dark(#596579,#a9b5c7); --rt-line:light-dark(#dce2ea,#39414e); --rt-blue:light-dark(#1e5ac6,#8db5ff); --rt-blue-bg:light-dark(#edf3ff,#283952); --rt-good:light-dark(#23663f,#91d1ac); --rt-warn:light-dark(#9a5810,#f0bd76); --rt-red:light-dark(#b53037,#ff9da2); color:var(--rt-ink); background:var(--rt-bg); font:14px/1.5 "Segoe UI","Microsoft YaHei",sans-serif; border:1px solid var(--rt-line); border-radius:10px; overflow:hidden; width:100%; }
+#repo-tool * { box-sizing:border-box; }
+#repo-tool button, #repo-tool input, #repo-tool select { font:inherit; color:inherit; }
+#repo-tool button { display:inline-flex; gap:7px; align-items:center; justify-content:center; border:1px solid var(--rt-line); border-radius:5px; padding:7px 12px; background:var(--rt-panel); min-height:34px; }
+#repo-tool button:hover:not(:disabled) { background:var(--rt-blue-bg); border-color:var(--rt-blue); }
+#repo-tool button:disabled { opacity:.45; }
+#repo-tool input:not([type=checkbox]), #repo-tool select { border:1px solid var(--rt-line); border-radius:5px; padding:7px 9px; background:var(--rt-panel); min-width:0; width:100%; }
+#repo-tool input[type=checkbox] { accent-color:var(--rt-blue); width:15px; height:15px; margin:0; }
+#repo-tool label { display:grid; gap:5px; min-width:0; font-size:12px; color:var(--rt-muted); }
+#repo-tool label input, #repo-tool label select { font-size:13px; color:var(--rt-ink); }
+#repo-tool .rt-titlebar { display:flex; align-items:center; gap:9px; flex-wrap:wrap; padding:13px 18px; background:var(--rt-panel); border-bottom:1px solid var(--rt-line); }
+#repo-tool .rt-titlebar strong { font-size:15px; font-weight:500; }
+#repo-tool .rt-sample { margin-left:auto; font-size:12px; color:var(--rt-muted); }
+#repo-tool .rt-config { padding:15px 18px; display:grid; gap:12px; border-bottom:1px solid var(--rt-line); }
+#repo-tool .rt-config-top { display:grid; grid-template-columns:210px minmax(120px,1fr) auto; gap:12px; align-items:end; }
+#repo-tool .rt-branches { display:grid; grid-template-columns:1fr 1fr; gap:12px; }
+#repo-tool .rt-root { min-width:0; }
+#repo-tool .rt-root output { display:block; min-height:35px; padding:7px 0; font-size:13px; color:var(--rt-ink); overflow-wrap:anywhere; }
+#repo-tool .rt-manager { display:grid; grid-template-columns:1fr 1fr auto; gap:12px; align-items:end; padding-top:12px; border-top:1px solid var(--rt-line); }
+#repo-tool [hidden] { display:none !important; }
+#repo-tool .rt-toolbar { display:flex; align-items:center; gap:8px; flex-wrap:wrap; padding:12px 18px; background:var(--rt-panel); border-bottom:1px solid var(--rt-line); }
+#repo-tool .rt-primary { background:var(--rt-blue); color:light-dark(#fff,#17253d); border-color:var(--rt-blue); }
+#repo-tool .rt-primary:hover:not(:disabled) { background:var(--rt-blue); opacity:.9; }
+#repo-tool .rt-count { margin-left:auto; color:var(--rt-muted); font-size:12px; }
+#repo-tool .rt-main { display:grid; grid-template-columns:minmax(0,1fr) 270px; background:var(--rt-panel); }
+#repo-tool .rt-list { min-width:0; }
+#repo-tool table { width:100%; border-collapse:collapse; table-layout:fixed; font-size:13px; }
+#repo-tool th { font-size:12px; color:var(--rt-muted); font-weight:400; text-align:left; padding:10px 8px; background:var(--rt-bg); border-bottom:1px solid var(--rt-line); }
+#repo-tool td { padding:var(--rt-row-pad,12px) 8px; border-bottom:1px solid var(--rt-line); vertical-align:middle; overflow-wrap:anywhere; }
+#repo-tool th:first-child, #repo-tool td:first-child { width:34px; text-align:center; }
+#repo-tool th:nth-child(2) { width:34%; }
+#repo-tool th:nth-child(3) { width:24%; }
+#repo-tool th:nth-child(4) { width:14%; }
+#repo-tool tr[aria-selected=true] td { background:var(--rt-blue-bg); }
+#repo-tool .rt-repo-button { border:0; background:transparent; padding:0; min-height:24px; justify-content:flex-start; text-align:left; width:100%; font-weight:500; overflow-wrap:anywhere; word-break:break-word; }
+#repo-tool .rt-repo-button:hover:not(:disabled) { border:0; background:transparent; }
+#repo-tool .rt-status { display:inline-flex; gap:6px; align-items:baseline; flex-wrap:wrap; }
+#repo-tool .rt-dot { display:inline-block; width:6px; height:6px; border-radius:50%; flex:0 0 auto; background:currentColor; }
+#repo-tool .rt-good { color:var(--rt-good); } #repo-tool .rt-warn { color:var(--rt-warn); } #repo-tool .rt-error { color:var(--rt-red); }
+#repo-tool .rt-blue { color:var(--rt-blue); } #repo-tool .rt-muted { color:var(--rt-muted); }
+#repo-tool .rt-list-foot { padding:10px 13px; display:flex; gap:7px; align-items:center; flex-wrap:wrap; color:var(--rt-muted); font-size:12px; }
+#repo-tool .rt-list-foot button { padding:4px 8px; min-height:29px; font-size:12px; }
+#repo-tool .rt-detail { border-left:1px solid var(--rt-line); padding:16px; min-width:0; background:var(--rt-bg); }
+#repo-tool .rt-detail-head { display:flex; align-items:center; gap:8px; margin-bottom:12px; }
+#repo-tool .rt-detail-head strong { font-size:15px; font-weight:500; overflow-wrap:anywhere; }
+#repo-tool dl { margin:0; }
+#repo-tool dt { font-size:12px; color:var(--rt-muted); margin-top:13px; }
+#repo-tool dd { margin:4px 0 0; font-size:12px; overflow-wrap:anywhere; }
+#repo-tool .rt-explain { font-size:13px; padding:12px 0; border-top:1px solid var(--rt-line); margin-top:15px; }
+#repo-tool .rt-detail-actions { display:flex; flex-wrap:wrap; gap:6px; }
+#repo-tool .rt-detail-actions button { font-size:12px; padding:5px 9px; }
+#repo-tool .rt-editor { display:grid; gap:9px; margin-top:12px; }
+#repo-tool .rt-tabs { display:flex; align-items:center; gap:14px; border-top:1px solid var(--rt-line); border-bottom:1px solid var(--rt-line); padding:0 18px; background:var(--rt-panel); }
+#repo-tool .rt-tabs button { background:transparent; border:0; border-radius:0; padding:11px 0; font-size:13px; color:var(--rt-muted); }
+#repo-tool .rt-tabs button[aria-selected=true] { color:var(--rt-blue); box-shadow:inset 0 -2px var(--rt-blue); }
+#repo-tool .rt-plan { padding:13px 18px; min-height:107px; background:var(--rt-panel); }
+#repo-tool .rt-plan ol { margin:0; padding-left:19px; color:var(--rt-muted); font-size:12px; }
+#repo-tool .rt-plan li { padding:2px 0; }
+#repo-tool .rt-log { white-space:pre-wrap; overflow-wrap:anywhere; font:12px/1.7 Consolas,"Microsoft YaHei",monospace; margin:0; }
+#repo-tool .rt-footer { border-top:1px solid var(--rt-line); display:flex; align-items:center; justify-content:space-between; gap:12px; flex-wrap:wrap; padding:10px 18px; }
+#repo-tool .rt-footer span { font-size:12px; overflow-wrap:anywhere; }
+#repo-tool .rt-footer button { font-size:12px; padding:5px 9px; }
+#repo-tool[data-detail=below] .rt-main { grid-template-columns:1fr; }
+#repo-tool[data-detail=below] .rt-detail { border-left:0; border-top:1px solid var(--rt-line); }
+#repo-tool[data-detail=below] dl { display:grid; grid-template-columns:120px 1fr; align-items:baseline; gap:6px 10px; }
+#repo-tool[data-detail=below] dt, #repo-tool[data-detail=below] dd { margin:0; }
+@media(max-width:760px) {
+  #repo-tool .rt-main { grid-template-columns:1fr; }
+  #repo-tool .rt-detail { border-left:0; border-top:1px solid var(--rt-line); }
+  #repo-tool .rt-config-top { grid-template-columns:1fr auto; }
+  #repo-tool .rt-root { grid-column:1 / -1; grid-row:2; }
+  #repo-tool .rt-count { margin-left:0; width:100%; }
+}
+@media(max-width:460px) {
+  #repo-tool .rt-config, #repo-tool .rt-toolbar { padding:12px; }
+  #repo-tool .rt-branches, #repo-tool .rt-manager { grid-template-columns:1fr; }
+  #repo-tool .rt-sample { margin-left:0; width:100%; }
+  #repo-tool th:nth-child(4), #repo-tool td:nth-child(4) { display:none; }
+  #repo-tool th:nth-child(2) { width:35%; }
+  #repo-tool th:nth-child(3) { width:29%; }
+  #repo-tool th, #repo-tool td { padding-left:5px; padding-right:5px; }
+  #repo-tool input:not([type=checkbox]), #repo-tool select { font-size:16px; }
+}
+@media(pointer:coarse) { #repo-tool button, #repo-tool input:not([type=checkbox]), #repo-tool select { min-height:44px; } #repo-tool td:first-child { min-width:36px; } }
+</style>
+<section id="repo-tool" aria-label="MiniGame 仓库管理界面设计" data-detail="right">
+  <div class="rt-titlebar"><i data-lucide="git-branch" aria-hidden="true"></i><strong>MiniGame 仓库管理</strong><span class="rt-sample">交互示意 · 示例状态</span></div>
+  <div class="rt-config">
+    <div class="rt-config-top">
+      <label>当前方案<select id="rt-profile"><option value="dev">MiniGame 开发 · E 盘</option><option value="engine">引擎验证 · W 盘</option></select></label>
+      <label class="rt-root">工程根目录<output id="rt-root">E:\MiniGame</output></label>
+      <button type="button" id="rt-manage" class="cursor-interaction"><i data-lucide="settings-2" aria-hidden="true"></i>管理方案</button>
+    </div>
+    <div class="rt-branches">
+      <label>游戏分支<input id="rt-game" value="miniw/release/v1.55.50_ai_framework_V2" spellcheck="false"></label>
+      <label>引擎分支<input id="rt-engine" value="Engine/Release_v6.2.9_ai_framework_V2" spellcheck="false"></label>
+    </div>
+    <div class="rt-manager" id="rt-manager" hidden>
+      <label>方案名称<input id="rt-profile-name" value="MiniGame 开发 · E 盘"></label>
+      <label>工程根目录<input id="rt-root-edit" value="E:\MiniGame" spellcheck="false"></label>
+      <button id="rt-profile-save" type="button" class="cursor-interaction">保存方案</button>
+    </div>
+  </div>
+  <div class="rt-toolbar">
+    <button type="button" id="rt-check" class="cursor-interaction"><i data-lucide="refresh-cw" aria-hidden="true"></i>检查状态</button>
+    <button type="button" id="rt-sync" class="rt-primary cursor-interaction"><i data-lucide="download" aria-hidden="true"></i>同步所选</button>
+    <button type="button" id="rt-retry" class="cursor-interaction" disabled>重试失败</button>
+    <button type="button" id="rt-stop" class="cursor-interaction" disabled>停止队列</button>
+    <span class="rt-count" id="rt-count"></span>
+  </div>
+  <div class="rt-main">
+    <div class="rt-list">
+      <table aria-label="仓库状态与计划操作">
+        <thead><tr><th><input type="checkbox" id="rt-all" aria-label="选择所有可执行仓库" checked></th><th>仓库</th><th>当前状态</th><th>目标分支</th><th>计划动作</th></tr></thead>
+        <tbody id="rt-rows"></tbody>
+      </table>
+      <div class="rt-list-foot"><button id="rt-add" type="button" class="cursor-interaction"><i data-lucide="plus" aria-hidden="true"></i>添加仓库</button><span>目录层级决定执行顺序</span></div>
+    </div>
+    <aside class="rt-detail" aria-label="选中仓库详情">
+      <div class="rt-detail-head"><i data-lucide="folder-git-2" aria-hidden="true"></i><strong id="rt-detail-name"></strong></div>
+      <dl>
+        <dt>本地目录</dt><dd id="rt-detail-path"></dd>
+        <dt>远端地址</dt><dd id="rt-detail-remote"></dd>
+        <dt>当前分支</dt><dd id="rt-detail-current"></dd>
+        <dt>目标分支</dt><dd id="rt-detail-target"></dd>
+        <dt>前置仓库</dt><dd id="rt-detail-parent"></dd>
+      </dl>
+      <div class="rt-explain" id="rt-explain"></div>
+      <div class="rt-detail-actions">
+        <button type="button" id="rt-edit" class="cursor-interaction">编辑仓库</button>
+        <button type="button" id="rt-inspect" class="cursor-interaction">重新检查</button>
+      </div>
+      <div class="rt-editor" id="rt-editor" hidden>
+        <label>名称<input id="rt-edit-name"></label>
+        <label>相对目录<input id="rt-edit-path" spellcheck="false"></label>
+        <label>远端地址<input id="rt-edit-remote" spellcheck="false"></label>
+        <label>分支来源<select id="rt-edit-group"><option value="game">游戏分支</option><option value="engine">引擎分支</option></select></label>
+        <div class="rt-detail-actions"><button id="rt-save-repo" type="button" class="cursor-interaction">保存配置</button><button id="rt-remove" type="button" class="cursor-interaction">移除配置</button></div>
+      </div>
+    </aside>
+  </div>
+  <div class="rt-tabs" role="tablist" aria-label="运行详情">
+    <button type="button" id="rt-plan-tab" role="tab" aria-selected="true" aria-controls="rt-plan" class="cursor-interaction">执行计划</button>
+    <button type="button" id="rt-log-tab" role="tab" aria-selected="false" aria-controls="rt-logs" class="cursor-interaction">运行日志</button>
+  </div>
+  <div class="rt-plan" id="rt-plan" role="tabpanel" aria-labelledby="rt-plan-tab"><ol id="rt-plan-list"></ol></div>
+  <div class="rt-plan" id="rt-logs" role="tabpanel" aria-labelledby="rt-log-tab" hidden><pre id="rt-log-content" class="rt-log"></pre></div>
+  <div class="rt-footer"><span id="rt-message" role="status" aria-live="polite">已读取配置 · 1 个仓库有本地修改</span><button type="button" id="rt-setup" class="cursor-interaction" disabled>准备构建环境</button></div>
+</section>
+<script>
+(function () {
+  const root = document.getElementById('repo-tool');
+  const el = function (id) { return root.querySelector('#rt-' + id); };
+  const originalGame = 'miniw/release/v1.55.50_ai_framework_V2';
+  const originalEngine = 'Engine/Release_v6.2.9_ai_framework_V2';
+  const client = 'git@client-gitlab.miniworldplus.com:miniwan/';
+  const yw = 'git@yw-gitlab.miniworldplus.com:';
+  const base = [
+    { id:'main', name:'MiniGame', path:'.', group:'game', parent:null, depth:0, state:'latest', remote:client+'MiniGame.git' },
+    { id:'assets', name:'AssetRuntime', path:'AssetRuntime', group:'game', parent:'main', depth:1, state:'empty', remote:client+'assetruntimenew.git' },
+    { id:'common', name:'CommonResource', path:'AssetRuntime/CommonResource', group:'game', parent:'assets', depth:2, state:'absent', remote:client+'CommonResource.git' },
+    { id:'source', name:'Source', path:'Source', group:'game', parent:'main', depth:1, state:'latest', remote:client+'MiniGameCode.git' },
+    { id:'sandbox', name:'SandboxEngine', path:'Source/SandboxEngine', group:'game', parent:'source', depth:2, state:'behind', remote:yw+'minitech/sandboxengine.git' },
+    { id:'ai', name:'AIGamePlay', path:'Source/AIGamePlay', group:'game', parent:'source', depth:2, state:'dirty', remote:yw+'engine/aigameplay.git' },
+    { id:'rainbow', name:'RainbowEngine', path:'Source/Core/RainbowEngine', group:'engine', parent:'source', depth:2, state:'absent', remote:yw+'minitech/engine.git' },
+    { id:'editor', name:'Editor', path:'Source/Editor', group:'engine', parent:'source', depth:2, state:'absent', remote:yw+'minitech/editor.git' }
+  ];
+  const design = { density:'comfortable', detail:'right', scene:'initial' };
+  let appliedScene = '', repos = [], chosen = 'assets', busy = false, stop = false, log = [], addIndex = 0;
+  const texts = { latest:'已是最新', empty:'空目录', absent:'未克隆', behind:'落后 3 个提交', dirty:'2 项本地修改', failed:'认证失败', blocked:'依赖未就绪', running:'正在同步', done:'同步完成', stopped:'未执行' };
+  const hints = {
+    empty:'目录已经存在，且没有任何内容。可直接克隆目标分支。',
+    absent:'先准备前置仓库，再创建目录并克隆目标分支。',
+    latest:'当前目标分支已同步。检查通过后无需更新文件。',
+    behind:'目标分支可快进更新。获取提交后更新到远端目标。',
+    dirty:'检测到未提交修改。处理工作区后重新检查，可单独继续。',
+    failed:'SSH 认证未通过。检查密钥与仓库权限后重试此项。',
+    blocked:'前置仓库尚未完成。前置恢复后会重新评估此项。',
+    running:'当前任务正在执行，日志会持续更新。',
+    done:'已完成目标分支同步，结果保留在本次运行记录中。',
+    stopped:'队列已停止。再次同步时会重新检查当前目录状态。'
+  };
+  const esc = function (s) { return String(s).replace(/[&<>"']/g,function(c){return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c];}); };
+  const get = function (id) { return repos.find(function(r){return r.id===id;}); };
+  const target = function (r) { return el(r.group).value; };
+  const color = function (s) { return ['latest','done'].includes(s)?'rt-good':s==='dirty'?'rt-warn':['failed','blocked'].includes(s)?'rt-error':['running','empty','behind'].includes(s)?'rt-blue':'rt-muted'; };
+  function action(r) {
+    if (r.state==='done') return '已完成';
+    if (r.state==='running') return '执行中';
+    if (r.state==='dirty') return '待处理';
+    if (r.state==='failed') return '可重试';
+    if (r.state==='blocked') return '等待前置';
+    if (r.state==='latest') return r.current===target(r)?'无需更新':'切换分支';
+    if (r.state==='behind') return '快进更新';
+    return '克隆';
+  }
+  function message(s) { el('message').textContent=s; }
+  function renderDetails() {
+    const r=get(chosen); if(!r) return;
+    el('detail-name').textContent=r.name;
+    el('detail-path').textContent=el('root').textContent+(r.path==='.'?'':'\\'+r.path.replaceAll('/','\\'));
+    el('detail-remote').textContent=r.remote;
+    el('detail-current').textContent=r.current||'尚未创建';
+    el('detail-target').textContent=target(r);
+    el('detail-parent').textContent=r.parent&&get(r.parent)?get(r.parent).name:'无';
+    el('explain').textContent=hints[r.state]||'等待检查';
+  }
+  function render() {
+    root.style.setProperty('--rt-row-pad',design.density==='compact'?'8px':'12px');
+    root.dataset.detail=design.detail;
+    el('rows').innerHTML=repos.map(function(r){
+      return '<tr aria-selected="'+(r.id===chosen)+'"><td><input type="checkbox" aria-label="选择 '+esc(r.name)+'" data-check="'+r.id+'" '+(r.checked?'checked ':'')+((busy||r.state==='dirty')?'disabled':'')+'></td><td><button type="button" class="rt-repo-button cursor-interaction" data-row="'+r.id+'" style="padding-left:'+r.depth*7+'px">'+esc(r.name)+'</button></td><td><span class="rt-status '+color(r.state)+'"><span class="rt-dot"></span>'+esc(texts[r.state])+'</span></td><td class="rt-muted">'+(r.group==='game'?'游戏分支':'引擎分支')+'</td><td>'+esc(action(r))+'</td></tr>';
+    }).join('');
+    const eligible=repos.filter(function(r){return r.state!=='dirty';});
+    const selected=repos.filter(function(r){return r.checked;});
+    el('count').textContent='已选 '+selected.length+' / '+repos.length+' 个仓库';
+    el('all').checked=eligible.length>0&&eligible.every(function(r){return r.checked;});
+    el('all').indeterminate=selected.length>0&&!el('all').checked;
+    el('all').disabled=busy;
+    ['check','sync','manage','game','engine','profile','add','edit','inspect','save-repo','remove','profile-save'].forEach(function(id){el(id).disabled=busy;});
+    el('sync').disabled=busy||!selected.length;
+    el('stop').disabled=!busy||stop;
+    el('retry').disabled=busy||!repos.some(function(r){return ['failed','blocked'].includes(r.state);});
+    el('setup').disabled=busy||!repos.every(function(r){return ['done','latest'].includes(r.state)&&r.current===target(r);});
+    el('plan-list').innerHTML=[
+      '先验证目标目录与目标分支，再按目录依赖执行。',
+      'AssetRuntime → CommonResource；Source → SandboxEngine / AIGamePlay / RainbowEngine / Editor。',
+      repos.some(function(r){return r.state==='dirty';})?'AIGamePlay 有本地修改，处理后可单独同步。':'各仓库结果独立记录，失败后可单独重试。'
+    ].map(function(s){return '<li>'+esc(s)+'</li>';}).join('');
+    el('log-content').textContent=log.length?log.slice(-7).join('\n'):'尚未开始执行。';
+    renderDetails();
+  }
+  function applyDesign() {
+    if(appliedScene!==design.scene && !busy) {
+      appliedScene=design.scene;
+      repos=base.map(function(r){const x=Object.assign({},r);x.checked=r.state!=='dirty';x.current=['latest','behind','dirty'].includes(r.state)?(r.group==='game'?originalGame:originalEngine):'';return x;});
+      if(design.scene==='daily') repos.forEach(function(r){r.state=r.id==='sandbox'?'behind':'latest';r.checked=true;r.current=r.group==='game'?originalGame:originalEngine;});
+      if(design.scene==='auth') {get('assets').state='failed';get('common').state='blocked';}
+      chosen='assets';log=[];el('editor').hidden=true;
+      message(design.scene==='daily'?'检查完成 · 1 个仓库可以快进更新':design.scene==='auth'?'AssetRuntime 认证失败 · CommonResource 等待前置':'已读取配置 · 1 个仓库有本地修改');
+    }
+    render();
+  }
+  function tab(which) {
+    ['plan','log'].forEach(function(n){el(n+'-tab').setAttribute('aria-selected',String(n===which));});
+    el('plan').hidden=which!=='plan';el('logs').hidden=which!=='log';
+  }
+  function editSelected() {
+    const r=get(chosen); el('edit-name').value=r.name;el('edit-path').value=r.path;el('edit-remote').value=r.remote;el('edit-group').value=r.group;el('editor').hidden=false;
+  }
+  el('rows').addEventListener('click',function(e){const b=e.target.closest('[data-row]');if(b){chosen=b.dataset.row;el('editor').hidden=true;render();}});
+  el('rows').addEventListener('change',function(e){
+    if(!e.target.dataset.check)return;const r=get(e.target.dataset.check);r.checked=e.target.checked;
+    if(r.checked){let p=get(r.parent);while(p){if(['empty','absent','failed','blocked'].includes(p.state))p.checked=true;p=get(p.parent);}}
+    else if(['empty','absent','failed','blocked'].includes(r.state)){repos.forEach(function(x){let p=get(x.parent);while(p){if(p.id===r.id)x.checked=false;p=get(p.parent);}});}
+    render();
+  });
+  el('all').addEventListener('change',function(){const checked=el('all').checked;repos.forEach(function(r){r.checked=checked&&r.state!=='dirty';});render();});
+  el('plan-tab').addEventListener('click',function(){tab('plan');});
+  el('log-tab').addEventListener('click',function(){tab('log');});
+  el('manage').addEventListener('click',function(){el('manager').hidden=!el('manager').hidden;});
+  el('profile-save').addEventListener('click',function(){el('root').textContent=el('root-edit').value;el('profile').selectedOptions[0].textContent=el('profile-name').value;el('manager').hidden=true;message('方案已保存 · 示意操作');render();});
+  el('profile').addEventListener('change',function(){
+    el('root').textContent=el('profile').value==='dev'?'E:\\MiniGame':'W:\\MiniGame';
+    el('root-edit').value=el('root').textContent;el('profile-name').value=el('profile').selectedOptions[0].textContent;
+    appliedScene='';applyDesign();message('已切换方案 · 显示示例检测状态');
+  });
+  ['game','engine'].forEach(function(id){el(id).addEventListener('change',function(){message('目标分支已修改 · 同步前会重新检查');render();});});
+  el('edit').addEventListener('click',editSelected);
+  el('save-repo').addEventListener('click',function(){
+    const r=get(chosen);r.name=el('edit-name').value.trim()||r.name;r.path=el('edit-path').value.trim()||r.path;r.remote=el('edit-remote').value.trim()||r.remote;r.group=el('edit-group').value;
+    el('editor').hidden=true;message('仓库配置已保存 · 示意操作');render();
+  });
+  el('add').addEventListener('click',function(){addIndex++;const r={id:'new'+addIndex,name:'新仓库 '+addIndex,path:'NewRepo'+addIndex,remote:client+'NewRepo.git',group:'game',parent:'main',depth:1,state:'absent',checked:true,current:''};repos.push(r);chosen=r.id;render();editSelected();message('编辑新仓库的目录、远端和目标分支');});
+  el('remove').addEventListener('click',function(){
+    const r=get(chosen);if(repos.some(function(x){return x.parent===r.id;})){message('此仓库还有子仓库配置，请先调整它们的依赖');return;}
+    repos=repos.filter(function(x){return x.id!==chosen;});chosen=repos[0].id;el('editor').hidden=true;message('已移除配置记录 · 本地文件不受影响');render();
+  });
+  el('inspect').addEventListener('click',function(){
+    const r=get(chosen);
+    if(r.state==='dirty'){r.state='behind';r.checked=true;message('示例：本地修改已处理，可以继续同步');}
+    else if(r.state==='failed'){r.state='empty';message('示例：认证已恢复，可重试克隆');}
+    else message(r.name+' 检查完成 · '+texts[r.state]);
+    render();
+  });
+  el('check').addEventListener('click',function(){message('检查完成 · '+repos.filter(function(r){return r.state==='dirty';}).length+' 个仓库待处理');log.push('[检查] 已验证工作树路径、分支与依赖关系。');render();});
+  const delay=function(ms){return new Promise(function(resolve){setTimeout(resolve,ms);});};
+  async function sync(onlyFailed) {
+    if(busy)return;
+    const queue=repos.filter(function(r){return onlyFailed?['failed','blocked'].includes(r.state):r.checked;});
+    busy=true;stop=false;log=[];tab('log');render();
+    for(const r of queue){
+      if(stop){log.push('[停止] 未继续派发剩余仓库。');break;}
+      const p=get(r.parent);
+      if(p&&['failed','blocked'].includes(p.state)){r.state='blocked';log.push('[等待] '+r.name+'：前置仓库未完成。');render();continue;}
+      if(r.state==='dirty'){log.push('[待处理] '+r.name+'：工作区有修改。');continue;}
+      const previous=r.state;r.state='running';chosen=r.id;message('正在同步 '+r.name);log.push('[开始] '+r.name+' · '+(['empty','absent','failed','blocked','stopped'].includes(previous)?'克隆':'检查并更新'));render();
+      await delay(650);
+      if(design.scene==='auth'&&r.id==='assets'&&!onlyFailed){r.state='failed';log.push('[失败] AssetRuntime：SSH 认证未通过。');}
+      else{r.state='done';r.current=target(r);log.push('[完成] '+r.name+' 已同步。');}
+      render();
+    }
+    busy=false;const problems=repos.filter(function(r){return ['dirty','failed','blocked'].includes(r.state);}).length;
+    message(stop?'队列已停止 · 当前仓库已完成':problems?'执行结束 · '+problems+' 个仓库需要处理':'所选仓库同步完成');render();
+  }
+  el('sync').addEventListener('click',function(){sync(false);});
+  el('retry').addEventListener('click',function(){sync(true);});
+  el('stop').addEventListener('click',function(){stop=true;message('将在当前仓库完成后停止');render();});
+  el('setup').addEventListener('click',function(){tab('log');log.push('[环境准备] 启动 Win_Setup · 此处为流程示意。');message('构建环境准备作为独立任务显示结果');render();});
+  applyDesign();
+  if(globalThis.Tweak){
+    const tweak=new Tweak({container:root,onChange:applyDesign});
+    tweak.addSelect(design,'density',{label:'列表密度',options:[{label:'舒适',value:'comfortable'},{label:'紧凑',value:'compact'}]});
+    tweak.addSelect(design,'detail',{label:'详情位置',options:[{label:'右侧',value:'right'},{label:'下方',value:'below'}]});
+    tweak.addSelect(design,'scene',{label:'使用场景',options:[{label:'初次拉取',value:'initial'},{label:'日常更新',value:'daily'},{label:'认证失败',value:'auth'}]});
+  }
+})();
+</script>

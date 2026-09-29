@@ -1,0 +1,110 @@
+{
+  "schema_version": 1,
+  "active_profile_id": "minigame-e",
+  "profiles": [
+    {
+      "id": "minigame-e",
+      "name": "MiniGame 开发",
+      "root": "E:/MiniGame",
+      "branch_groups": {
+        "game": "miniw/release/v1.55.50_ai_framework_V2",
+        "engine": "Engine/Release_v6.2.9_ai_framework_V2"
+      },
+      "repositories": [
+        {
+          "id": "main",
+          "name": "MiniGame",
+          "path": ".",
+          "remote": "git@client-gitlab.miniworldplus.com:miniwan/MiniGame.git",
+          "branch_group": "game",
+          "branch": "",
+          "enabled": true,
+          "depends_on": []
+        },
+        {
+          "id": "assets",
+          "name": "AssetRuntime",
+          "path": "AssetRuntime",
+          "remote": "git@client-gitlab.miniworldplus.com:miniwan/assetruntimenew.git",
+          "branch_group": "game",
+          "branch": "",
+          "enabled": true,
+          "depends_on": []
+        },
+        {
+          "id": "common",
+          "name": "CommonResource",
+          "path": "AssetRuntime/CommonResource",
+          "remote": "git@client-gitlab.miniworldplus.com:miniwan/CommonResource.git",
+          "branch_group": "game",
+          "branch": "",
+          "enabled": true,
+          "depends_on": []
+        },
+        {
+          "id": "source",
+          "name": "Source",
+          "path": "Source",
+          "remote": "git@client-gitlab.miniworldplus.com:miniwan/MiniGameCode.git",
+          "branch_group": "game",
+          "branch": "",
+          "enabled": true,
+          "depends_on": []
+        },
+        {
+          "id": "sandbox",
+          "name": "SandboxEngine",
+          "path": "Source/SandboxEngine",
+          "remote": "git@yw-gitlab.miniworldplus.com:minitech/sandboxengine.git",
+          "branch_group": "game",
+          "branch": "",
+          "enabled": true,
+          "depends_on": []
+        },
+        {
+          "id": "aigameplay",
+          "name": "AIGamePlay",
+          "path": "Source/AIGamePlay",
+          "remote": "git@yw-gitlab.miniworldplus.com:engine/aigameplay.git",
+          "branch_group": "game",
+          "branch": "",
+          "enabled": true,
+          "depends_on": []
+        },
+        {
+          "id": "rainbow",
+          "name": "RainbowEngine",
+          "path": "Source/Core/RainbowEngine",
+          "remote": "git@yw-gitlab.miniworldplus.com:minitech/engine.git",
+          "branch_group": "engine",
+          "branch": "",
+          "enabled": true,
+          "depends_on": []
+        },
+        {
+          "id": "editor",
+          "name": "Editor",
+          "path": "Source/Editor",
+          "remote": "git@yw-gitlab.miniworldplus.com:minitech/editor.git",
+          "branch_group": "engine",
+          "branch": "",
+          "enabled": true,
+          "depends_on": []
+        }
+      ],
+      "setup": {
+        "auto_run": false,
+        "required_repositories": [
+          "main",
+          "assets",
+          "common",
+          "source",
+          "sandbox",
+          "aigameplay",
+          "rainbow",
+          "editor"
+        ]
+      }
+    }
+  ]
+}
