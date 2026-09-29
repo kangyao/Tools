@@ -20,7 +20,7 @@
 
 ## 验证记录
 
-- 最终完整测试：45 passed，126.79 秒，0 失败。命令：.venv\Scripts\python.exe -m pytest -q --tb=short --junitxml=artifacts\test-results.xml。
+- 初始版本完整测试：45 passed，126.79 秒，0 失败。命令：.venv\Scripts\python.exe -m pytest -q --tb=short --junitxml=artifacts\test-results.xml。
 - 配置与 UI 回归先复现失败，再修复通过；Git 场景在系统临时目录创建真实仓库。
 - 第一轮完整测试：38 passed，117.31 秒。
 - 扩展 Windows 路径用例时发现测试本身误要求缺失子模块的父仓库状态为空；已改为检查操作前后状态不变，保留既有 D module。
@@ -36,6 +36,20 @@
 没有对真实 E:\MiniGame 执行克隆、fetch、切分支、同步或环境准备。真实工程仅用于只读核对批处理和 SetupWin.py 的行为。认证错误有分类代码，真实 SSH/凭据服务未做端到端验收。
 
 当前交付为 Python 源码与虚拟环境，无独立 exe。运行锁覆盖同一配置目录的实例；不同配置目录和其他 Git 客户端不受该锁控制。
+
+## 文件列表、Diff 与 Discard 扩展（2026-09-29）
+
+- 用户要求能看到修改的文件并操作 Discard；新增独立文件对话框，从仓库详情按钮或双击仓库进入。
+- 按文件展示暂存/未暂存状态，分别预览两个 Diff，支持未跟踪文本/二进制预览、勾选文件、确认后备份并丢弃、进入已配置子仓库。
+- Discard 只处理所选文件；工作区按原始字节备份，暂存区以完整 binary patch 备份；固定 HEAD、literal/NUL 路径、前后指纹检查、子模块和链接保护、部分失败记录已实现。
+- 完整回归：70 passed，189.21 秒，0 失败，包含 45 项原有用例及当时的 25 项新增用例。结果：artifacts/test-results.xml。
+- 完整回归之后，针对“窗口在首个扫描定时器触发前关闭”补充 1 项回归，先确认失败，再禁止关闭后启动 worker；文件对话框全部 3 项 UI 用例重新通过，17.82 秒。结果：artifacts/changes-ui-results.xml。目前共 71 项用例。
+- 核心覆盖：HEAD/index/worktree 各自变化、选择性丢弃、rename/新增/删除、未跟踪文件、literal 路径、完整二进制暂存补丁超过 4 MB 后重新应用还原、备份/清单/补丁写失败、部分失败、子模块指针、嵌套仓库、符号链接模式、intent-to-add、merge 与 stash 冲突。
+- 独立审查发现并关闭两项边界：重命名原路径重建且被忽略时仍应禁止覆盖；stash apply 冲突没有 MERGE_HEAD 时仍应禁止全仓库 Discard。对应回归先失败后修复通过，最终复核无遗留关键问题。
+- pip check、compileall、git diff --check 通过。run.py --smoke-test 实际窗口正常启动退出，新增主窗口按钮可见。
+- 真实 E:\MiniGame 只读验收：CommonResource 列出 29 项（子模块内部文件），Editor 列出 CoreAIHub/App/HubApplication.h；实际 Windows Qt 窗口的中文、文件列表和 Diff 已截图核对。截图：artifacts/changes-CommonResource.png、artifacts/changes-Editor.png。
+- 没有对真实工程执行 Discard、切分支或同步。所有破坏性和恢复验证均在系统临时 Git 仓库进行。
+- README、使用说明、设计文档同步更新；明确同时丢弃所选文件的暂存/未暂存改动、未跟踪文件删除、备份恢复步骤、子模块提交指针保留及不支持按 Diff 行丢弃。
 
 ## 集成裁定
 

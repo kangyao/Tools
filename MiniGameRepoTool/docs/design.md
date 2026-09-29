@@ -10,7 +10,7 @@
 
 主要流程：选择方案 → 检查状态 → 查看计划 → 同步所选 → 查看结果。直接点击“同步所选”也会先检查，无须每次手动走两遍。
 
-第一版支持完整克隆、获取指定分支、切换本地分支、快进更新、单仓库重试和构建环境准备。第一版不加入提交、推送、图形化解决冲突、自动定时更新。
+第一版支持完整克隆、获取指定分支、切换本地分支、快进更新、单仓库重试、构建环境准备，以及文件级 Diff 和备份后 Discard。第一版不加入提交、推送、图形化解决冲突、自动定时更新。
 
 **技术选择**
 
@@ -100,6 +100,18 @@ origin 与配置不一致时展示两个地址并标为待处理，提供编辑�
 
 不自动执行 stash、reset --hard、clean、变基或创建合并提交。未提交改动和分叉直接进入待处理状态。
 
+**文件改动和显式 Discard**
+
+主窗口的仓库详情提供“文件改动 / Discard”，双击仓库也可打开。独立对话框展示 Git porcelain v2 -z 文件状态，暂存区和工作区分栏；文件默认不勾选。Diff 使用 literal pathspec，分别预览 HEAD → index 与 index → worktree，并关闭 external diff/textconv。列表和预览都在后台线程执行。
+
+Discard 必须由用户勾选文件并在确认框核对后触发。已跟踪文件恢复到确认时的固定 HEAD，同时恢复 index 和 worktree；未跟踪普通文件只删除明确选中的路径。rename 包括原路径与目标路径；copy 仅包括目标路径。子模块 gitlink、嵌套仓库、目录、符号链接、junction/reparse path、合并冲突和未完成 Git 操作均不可作为普通文件丢弃。子模块自身工作树可处理普通文件，保留其 HEAD。
+
+执行流程：重新扫描并对比用户看到的快照 → 逐文件校验规范路径与内容 → 在仓库之外备份原始工作区字节及完整 binary staged patch → 写入清单和恢复说明 → 再次检查 HEAD/index/文件指纹 → 恢复/删除所选文件 → 检查实际结果 → 更新清单与运行记录 → 刷新 UI。工作区内容使用 SHA-256 校验；补丁由 Git 直接写文件，不受控制台输出截断或日志脱敏影响。批量 restore 从 NUL 分隔的路径文件读取 literal pathspec，并明确 --no-recurse-submodules。
+
+备份失败或校验失效时禁止开始修改。开始修改后发生错误，报告部分失败并保留备份，不承诺跨文件事务回滚。用户可以打开备份目录按 RECOVERY.md 恢复；本版不提供自动恢复。配置目录锁仅协调工具实例，无法锁住其他 Git 客户端，因此在备份前后检查状态仍有必要。
+
+参考：[Git restore 路径与递归规则](https://git-scm.com/docs/git-restore)、[Git status porcelain v2](https://git-scm.com/docs/git-status)、[Git diff binary/output](https://git-scm.com/docs/git-diff)。
+
 **准备构建环境**
 
 把当前脚本末尾的 Win_Setup 提升为独立任务。按钮明确叫“准备构建环境”。
@@ -115,6 +127,7 @@ origin 与配置不一致时展示两个地址并标为待处理，提供编辑�
 | ui | 主窗口、配置编辑、仓库详情、计划与日志 | 用户操作意图 |
 | models.py / profiles.py | 配置读写、版本、路径与依赖校验 | Profile、RepoSpec、ProfileDocument |
 | git_ops.py | 仓库识别、工作区、远端、提交关系与计划动作 | Snapshot |
+| changes.py | 文件改动快照、Diff、路径保护、备份与显式 Discard | ChangeSnapshot、DiscardResult |
 | process.py | Popen、输出解码、退出码、超时与进程树中断 | ProcessResult |
 | service.py | 调度、依赖阻塞、互斥、重新检查与执行 | RepoResult、结构化事件 |
 | setup.py | 环境准备及实际退出码 | RepoResult |

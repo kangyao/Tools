@@ -15,6 +15,7 @@ from PySide6.QtWidgets import (
 from ..models import ACTION_NAMES, OUTCOME_NAMES, STATUS_NAMES, dependencies, dependency_order, validate_profile
 from ..process import redact
 from ..profiles import ProfileStore
+from .changes_dialog import ChangesDialog
 from .dialogs import ProfilesDialog
 from .worker import JobThread
 
@@ -93,6 +94,7 @@ class MainWindow(QMainWindow):
             self.tree.setColumnWidth(col, width)
         self.tree.itemSelectionChanged.connect(self.show_detail)
         self.tree.itemChanged.connect(self.selection_changed)
+        self.tree.itemDoubleClicked.connect(lambda *_: self.open_changes())
         main_splitter.addWidget(self.tree)
         detail_widget = QWidget()
         detail_layout = QVBoxLayout(detail_widget)
@@ -116,7 +118,10 @@ class MainWindow(QMainWindow):
         self.adopt_button.clicked.connect(self.adopt_origin)
         self.open_button = QPushButton("打开仓库目录")
         self.open_button.clicked.connect(self.open_repo)
-        for index, button in enumerate([self.single_button, self.edit_button, self.branch_button, self.adopt_button, self.open_button]):
+        self.changes_button = QPushButton("文件改动 / Discard")
+        self.changes_button.clicked.connect(self.open_changes)
+        for index, button in enumerate([self.changes_button, self.open_button, self.single_button,
+                                        self.edit_button, self.branch_button, self.adopt_button]):
             detail_buttons.addWidget(button, index // 2, index % 2)
         detail_layout.addLayout(detail_buttons)
         main_splitter.addWidget(detail_widget)
@@ -368,9 +373,19 @@ class MainWindow(QMainWindow):
         self.cancel_button.setEnabled(busy and not self.worker.cancel_requested.is_set())
         key = self.current_repo_id()
         snap = self.snapshots.get(key)
+        self.changes_button.setEnabled(not busy and bool(key))
         self.adopt_button.setEnabled(not busy and snap is not None and snap.status == "remote_mismatch" and bool(snap.origin))
         # Setup performs its own complete prerequisite check in the worker.
         self.setup_button.setEnabled(not busy)
+
+    def open_changes(self):
+        key = self.current_repo_id()
+        if self.worker is not None or not key:
+            return
+        dialog = ChangesDialog(self.data_dir, self.profile, key, self)
+        dialog.exec()
+        if dialog.mutated:
+            self.start_job("local", [repo.id for repo in self.profile.repositories])
 
     def start_job(self, operation: str, selected: list[str], extra=None):
         if self.worker is not None:
