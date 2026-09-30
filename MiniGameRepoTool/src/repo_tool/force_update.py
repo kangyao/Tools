@@ -59,8 +59,9 @@ class ForceUpdate:
         rows = []
         for row in approved.files:
             child = root / row.path.rstrip("/")
-            if (row.kind == "untracked" and canonical(child) in children
-                    and changes.inspector.is_own_repository(child)):
+            # A configured child repository: untracked, or its commit drifting from our gitlink.
+            if ((row.kind == "untracked" or (row.kind == "submodule" and row.index_status == "."))
+                    and canonical(child) in children and changes.inspector.is_own_repository(child)):
                 continue
             if not row.discardable:
                 raise ValueError(f"无法强制更新 {row.path}：{row.reason}；未丢弃文件")

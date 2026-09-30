@@ -90,7 +90,7 @@ def test_sync_preserves_ignored_user_files_when_target_starts_tracking_them(tmp_
 
 @pytest.mark.parametrize("create_directory", [False, True])
 @pytest.mark.parametrize("configured_path", ["module", "MODULE", "MODULE/subdir"])
-def test_empty_uninitialized_submodule_is_blocked_before_clone(tmp_path, remote, create_directory, configured_path):
+def test_empty_gitlink_path_is_cloned_independently(tmp_path, remote, create_directory, configured_path):
     old = git(remote, "rev-parse", "HEAD")
     commit(remote, "later.txt", "later")
     parent = tmp_path / "parent"
@@ -103,12 +103,20 @@ def test_empty_uninitialized_submodule_is_blocked_before_clone(tmp_path, remote,
     if create_directory:
         module.mkdir()
     before_status = git(parent, "status", "--porcelain")
+    before_index = git(parent, "ls-files", "--stage")
     profile = make_profile(parent / configured_path, remote)
     result = service(tmp_path).sync(profile, ["root"])["root"]
-    assert result.outcome == "blocked"
-    assert result.snapshot.status == "submodule"
-    assert not module.exists() or list(module.iterdir()) == []
-    assert git(parent, "status", "--porcelain") == before_status
+    assert git(parent, "ls-files", "--stage") == before_index
+    if "/" in configured_path:
+        # Inside another gitlink: only that submodule can provide the directory.
+        assert result.outcome == "blocked"
+        assert result.snapshot.status == "submodule"
+        assert not module.exists() or list(module.iterdir()) == []
+        assert git(parent, "status", "--porcelain") == before_status
+    else:
+        assert result.outcome == "success", result.message
+        assert git(module, "rev-parse", "HEAD") == git(remote, "rev-parse", "HEAD") != old
+        assert git(module, "symbolic-ref", "--short", "HEAD") == "main"
 
 
 def test_auto_setup_requires_unselected_required_repositories(tmp_path, remote):

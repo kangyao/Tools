@@ -122,13 +122,15 @@ class ChangesService:
         validate_profile(profile)
         root = profile.directory(profile.repo(repo_id))
         if not self.inspector.is_own_repository(root):
-            raise ValueError("此目录不是自身的有效 Git 工作树")
+            raise ValueError(f"此目录尚未克隆，或不是自身的有效 Git 工作树：{root}；请先同步此仓库")
         head = self._run(root, ["rev-parse", "--verify", "HEAD"]).strip()
         git_dir = Path(self._run(root, ["rev-parse", "--absolute-git-dir"]).strip())
         operation = next((name for name in ("MERGE_HEAD", "CHERRY_PICK_HEAD", "REVERT_HEAD",
                                             "rebase-merge", "rebase-apply")
                           if (git_dir / name).exists()), "")
-        submodule = bool(self._run(root, ["rev-parse", "--show-superproject-working-tree"]).strip())
+        # Only a parent-initialized submodule (.git file); an independent clone at a gitlink path is ordinary.
+        submodule = (bool(self._run(root, ["rev-parse", "--show-superproject-working-tree"]).strip())
+                     and not (root / ".git").is_dir())
         output = self._run(root, ["status", "--porcelain=v2", "-z", "--untracked-files=all",
                                   "--ignore-submodules=none"])
         records = iter(output.split("\0"))

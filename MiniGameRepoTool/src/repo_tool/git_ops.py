@@ -96,7 +96,14 @@ class Inspector:
         result = self.git.run(["rev-parse", "--show-toplevel"], path)
         return result.returncode == 0 and canonical(Path(result.output.strip())) == canonical(path)
 
-    def has_parent_gitlink(self, path: Path) -> bool:
+    def parent_gitlink(self, path: Path) -> tuple[str, str]:
+        """Classify gitlinks that ancestor repositories record for this path.
+
+        ("exact", commit): a parent records this very path; the configured repository may
+        still be cloned here independently. ("inside", path): the path lies inside another
+        gitlink, which only that submodule can provide. ("", ""): no gitlink.
+        """
+        found = ("", "")
         for parent in path.parents:
             if not (parent / ".git").exists() or not self.is_own_repository(parent):
                 continue
@@ -107,14 +114,18 @@ class Inspector:
                                    *(magic + prefix for prefix in prefixes)], parent)
             if result.returncode:
                 raise ValueError("无法检查父仓库中的子模块记录：" + redact(result.output))
+            ancestors = {canonical(parent / prefix) for prefix in prefixes[:-1]}
             for entry in result.output.split("\0"):
-                if entry:
-                    metadata, name = entry.split("\t", 1)
-                    if metadata.startswith("160000 ") and canonical(parent / name) in {
-                        canonical(parent / prefix) for prefix in prefixes
-                    }:
-                        return True
-        return False
+                if not entry:
+                    continue
+                metadata, name = entry.split("\t", 1)
+                if not metadata.startswith("160000 "):
+                    continue
+                if canonical(parent / name) in ancestors:
+                    return "inside", str(parent / name)
+                if canonical(parent / name) == canonical(path):
+                    found = ("exact", metadata.split(" ")[1])
+        return found
 
     def layout_conflict(self, path: Path, children: list[Path], revisions: list[str]) -> str:
         trees = {}
@@ -139,6 +150,9 @@ class Inspector:
                     if entry is None:
                         break
                     mode, tree = entry
+                    if depth == len(relative.parts) and mode == "160000":
+                        # Checking out a gitlink never writes into the child's directory.
+                        break
                     if depth == len(relative.parts) or mode != "040000":
                         return f"目标提交占用了子仓库路径或其上级路径 {prefix}，请先调整目录布局"
         return ""
@@ -166,10 +180,14 @@ class Inspector:
         except OSError as error:
             return state("error", "error", str(error))
         if missing or empty:
-            if self.has_parent_gitlink(path):
-                return state("submodule", "block", "父仓库将此路径登记为 Git submodule，请通过父仓库管理")
+            kind, detail = self.parent_gitlink(path)
+            if kind == "inside":
+                return state("submodule", "block", f"此路径位于父仓库登记的子模块 {detail} 之内，请先处理该子模块")
             state("missing" if missing else "empty", "clone",
                   "验证目标分支后克隆" if missing else "现有目录为空，可以直接克隆")
+            if kind == "exact":
+                snap.message = (f"父仓库以 gitlink 记录此路径（提交 {detail[:10]}）；"
+                                "按配置独立克隆目标分支，不改变父仓库的记录")
             if remote:
                 result = self.git.run(["ls-remote", "--exit-code", "--heads", repo.remote,
                                        "refs/heads/" + snap.target_branch], network=True)
@@ -188,8 +206,11 @@ class Inspector:
         if not snap.current_branch:
             return state("detached", "block", "仓库处于分离 HEAD 状态，请先保存或切换到本地分支")
         superproject = self.git.run(["rev-parse", "--show-superproject-working-tree"], path)
-        if superproject.output.strip():
-            return state("submodule", "block", "此目录是 Git submodule，需要按父仓库提交指针管理")
+        # An independent clone at a gitlink path owns a .git directory and follows its branch.
+        # A .git file here means the parent initialized it with `git submodule`.
+        if superproject.output.strip() and not (path / ".git").is_dir():
+            return state("submodule", "block", "此目录由父仓库以 git submodule 方式初始化，需要按父仓库提交指针管理；"
+                                               "如需按分支独立更新，可删除该目录后由本工具重新克隆")
         origin = self.git.run(["remote", "get-url", "origin"], path)
         snap.origin = origin.output.strip() if not origin.returncode else ""
         if not snap.origin or normalized_remote(snap.origin) != normalized_remote(repo.remote):
@@ -211,7 +232,9 @@ class Inspector:
             if "R" in code or "C" in code:
                 next(parts, None)
             entry_path = (path / name.rstrip("/")).resolve()
-            if code == "??" and entry_path in children and self.is_own_repository(entry_path):
+            # A configured child is managed by itself: untracked, or its own commit differing
+            # from the gitlink this repository records. A staged gitlink change stays visible.
+            if (code == "??" or code[0] == " ") and entry_path in children and self.is_own_repository(entry_path):
                 continue
             snap.changes.append(f"{code} {name}")
         if snap.changes and not repo.force_update:

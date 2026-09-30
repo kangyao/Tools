@@ -299,9 +299,12 @@ class ChangesDialog(QDialog):
             self.message.setText(result.message)
 
     def job_failed(self, detail: str):
-        self.result_message = "操作失败：" + detail.strip().splitlines()[-1]
+        last = detail.strip().splitlines()[-1]
+        self.result_message = "操作失败：" + last
         self.message.setText(self.result_message)
-        self.preview.setPlainText(detail)
+        # Expected refusals carry a readable message; keep the traceback for unexpected errors.
+        expected = last.startswith(("ValueError: ", "RuntimeError: "))
+        self.preview.setPlainText(last.split(": ", 1)[1] if expected else detail)
         if self.operation == "changes":
             self.snapshot = None
             self.items = {}
