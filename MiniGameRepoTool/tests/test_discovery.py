@@ -1,9 +1,14 @@
 from dataclasses import replace
 from pathlib import Path
 
+from PySide6.QtWidgets import QMessageBox
+
 from repo_tool.discovery import discover_profile, find_repositories
-from repo_tool.models import Profile, RepoSpec, SetupOptions, validate_profile
+from repo_tool.models import Profile, ProfileDocument, RepoSpec, SetupOptions, validate_profile
+from repo_tool.profiles import default_profile
+from repo_tool.ui.dialogs import ProfilesDialog
 from test_git_service import commit, git
+from test_ui import qapp  # noqa: F401  (fixture)
 
 
 def make_remote(path: Path) -> Path:
@@ -55,6 +60,24 @@ def test_discovery_maps_existing_repositories_onto_template(tmp_path):
     updated = replace(template, branch_groups=result.branch_groups, repositories=result.repositories,
                       setup=SetupOptions(False, result.required))
     validate_profile(updated)
+
+
+def test_dialog_recognizes_profile_whose_repository_table_is_empty(tmp_path, qapp, monkeypatch):
+    remote = make_remote(tmp_path / "remotes/extra")
+    root = tmp_path / "工程"
+    root.mkdir()
+    git(tmp_path, "clone", str(remote), str(root / "Tools/Extra"))
+    empty = Profile("p", "空方案", str(root), {}, [])
+    dialog = ProfilesDialog(ProfileDocument(1, "p", [empty]), data_dir=tmp_path / "app")
+    monkeypatch.setattr(QMessageBox, "question", lambda *args, **kwargs: QMessageBox.StandardButton.Yes)
+    monkeypatch.setattr(QMessageBox, "warning", lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError(args)))
+    dialog.guard(dialog.discover_from_root)
+    saved = dialog.document.profiles[0]
+    builtin = [r.id for r in default_profile().repositories]
+    assert [r.id for r in saved.repositories] == builtin + ["tools-extra"]
+    assert [r.id for r in saved.repositories if r.enabled] == ["tools-extra"]
+    assert saved.branch_groups == default_profile().branch_groups
+    assert dialog.table.rowCount() == len(builtin) + 1
 
 
 def test_discovery_of_directory_without_repositories(tmp_path):

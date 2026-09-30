@@ -204,6 +204,13 @@ class ProfilesDialog(QDialog):
         self.table.item(row, 11).setToolTip("新建此仓库时优先使用的本地源仓库目录（绝对路径），例如 D:/AIMiniGame/AssetRuntime；留空按方案来源自动选择。")
 
     def save_current(self):
+        updated = self.collect_current()
+        validate_profile(updated)
+        self.document.profiles[self.current_index] = updated
+        self.list.item(self.current_index).setText(updated.name)
+
+    def collect_current(self) -> Profile:
+        """Read the form into a profile without validating it."""
         old = self.document.profiles[self.current_index]
         groups = {}
         for line in self.groups_edit.toPlainText().splitlines():
@@ -228,12 +235,9 @@ class ProfilesDialog(QDialog):
         init = InitOptions(self.init_mode.currentData(),
                            [line.strip() for line in self.sources_edit.toPlainText().splitlines() if line.strip()],
                            self.reuse_git.isChecked(), self.reuse_lfs.isChecked(), self.init_fallback.currentData())
-        updated = Profile(old.id, self.name_edit.text().strip(), self.root_edit.text().strip(),
-                          groups, repositories, SetupOptions(self.auto_setup.isChecked(), required),
-                          deepcopy(old.build), init)
-        validate_profile(updated)
-        self.document.profiles[self.current_index] = updated
-        self.list.item(self.current_index).setText(updated.name)
+        return Profile(old.id, self.name_edit.text().strip(), self.root_edit.text().strip(),
+                       groups, repositories, SetupOptions(self.auto_setup.isChecked(), required),
+                       deepcopy(old.build), init)
 
     def switch_profile(self, index: int):
         if index < 0 or index == self.current_index:
@@ -292,11 +296,16 @@ class ProfilesDialog(QDialog):
         root = Path(self.root_edit.text().strip())
         if not root.is_absolute() or not root.is_dir():
             raise ValueError("请先填写已存在的工程根目录（绝对路径）")
-        self.save_current()
-        profile = self.document.profiles[self.current_index]
+        # Recognition is for incomplete profiles too, so read the form without validating it.
+        profile = self.collect_current()
+        template = profile
+        if not profile.repositories:
+            builtin = default_profile()
+            template = replace(profile, repositories=builtin.repositories,
+                               branch_groups={**builtin.branch_groups, **profile.branch_groups})
         QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
         try:
-            result = discover_profile(root, profile)
+            result = discover_profile(root, template)
         finally:
             QApplication.restoreOverrideCursor()
         if not result.found:
@@ -318,6 +327,7 @@ class ProfilesDialog(QDialog):
                           setup=SetupOptions(profile.setup.auto_run, result.required))
         validate_profile(updated)
         self.document.profiles[self.current_index] = updated
+        self.list.item(self.current_index).setText(updated.name)
         self.load_profile(self.current_index)
 
     def browse_source(self):
