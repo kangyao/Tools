@@ -44,7 +44,7 @@ def test_discovery_maps_existing_repositories_onto_template(tmp_path):
 
     repos = {r.id: r for r in result.repositories}
     assert list(repos) == ["main", "child", "engine", "tools-extra"]
-    assert (repos["main"].path, repos["main"].enabled) == (".", True)
+    assert (repos["main"].name, repos["main"].path, repos["main"].enabled) == ("工程", ".", True)
     # Matched by remote identity: the path follows the disk, the options follow the template.
     assert (repos["child"].path, repos["child"].branch_group, repos["child"].ignore_changes) == ("Assets", "game", True)
     assert repos["engine"].enabled is False

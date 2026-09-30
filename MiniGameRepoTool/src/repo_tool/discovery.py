@@ -105,7 +105,10 @@ def discover_profile(root: Path, template: Profile, git: GitClient | None = None
         branch = head.output.strip() if head.returncode == 0 else ""
         spec = by_identity.get(remote_identity(remote)) or by_path.get(relative.casefold())
         if spec is not None and spec.id not in matched:
-            repo = replace(spec, path=relative, remote=remote, enabled=True, depends_on=list(spec.depends_on))
+            # The root repository is named after the project folder, which tells workspaces apart.
+            name = root.name if relative == "." and root.name else spec.name
+            repo = replace(spec, name=name, path=relative, remote=remote, enabled=True,
+                           depends_on=list(spec.depends_on))
             if repo.branch_group:
                 if branch:
                     votes.setdefault(repo.branch_group, Counter())[branch] += 1
