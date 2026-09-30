@@ -92,6 +92,7 @@ Discard 将选中的已跟踪文件恢复到当前提交，同时丢弃其暂存
 - [使用说明](docs/usage.md)：操作步骤、状态处理和故障恢复。
 - [编译构建说明](docs/build.md)：三步流程、参数、IB 技能接入、日志与停止规则。
 - [设计文档](docs/design.md)：执行规则、数据格式与架构。
+- [工程初始化加速方案](docs/initialization-acceleration-plan.md)：本地工程与 Git/LFS 数据复用、UGit 缓存接入、配置和分阶段实现范围；当前为待实现方案。
 - [实现计划](docs/implementation-plan.md)与[验证记录](docs/implementation-progress.md)。
 - [设计阶段交互预览](docs/ui-preview.html)：保留的早期 HTML 原型，其中的前置等待规则已取消；当前行为以桌面程序和使用说明为准，程序从 Start.bat 启动。
 - [完整示例配置](examples/profiles.json)。
