@@ -4,6 +4,7 @@ import threading
 from pathlib import Path
 from typing import Callable
 
+from .checks import ParallelChecks
 from .git_ops import GitClient, Inspector, remote_failure
 from .models import Profile, RepoResult, Snapshot, dependencies, dependency_order, validate_profile
 from .process import ProcessRunner, redact
@@ -48,16 +49,10 @@ class RepoService:
 
     def check(self, profile: Profile, selected: list[str], remote: bool = True) -> dict[str, Snapshot]:
         validate_profile(profile)
+        if set(selected) - {repo.id for repo in profile.repositories}:
+            raise ValueError("所选仓库不存在")
         with RunLock(self.data_dir):
-            result = {}
-            for repo_id in dependency_order(profile):
-                if repo_id not in selected:
-                    continue
-                if self.cancel.is_set() or self.stop.is_set():
-                    break
-                self.emit("started", repo_id)
-                result[repo_id] = self._inspect(profile, repo_id, remote)
-            return result
+            return ParallelChecks(self.emit, self.stop, self.cancel).run(profile, selected, remote)
 
     def branch_list(self, remote: str) -> list[str]:
         with RunLock(self.data_dir):

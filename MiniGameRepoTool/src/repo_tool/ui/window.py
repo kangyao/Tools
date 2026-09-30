@@ -15,8 +15,10 @@ from PySide6.QtWidgets import (
 from ..models import ACTION_NAMES, OUTCOME_NAMES, STATUS_NAMES, dependencies, dependency_order, validate_profile
 from ..process import redact
 from ..profiles import ProfileStore
+from ..storage import RunLock
 from .changes_dialog import ChangesDialog
 from .dialogs import ProfilesDialog
+from .native_menu import show_repository_menu
 from .worker import JobThread
 
 
@@ -28,6 +30,7 @@ class MainWindow(QMainWindow):
         self.document = self.store.load()
         self.profile = next(p for p in self.document.profiles if p.id == self.document.active_profile_id)
         self.worker: JobThread | None = None
+        self.native_menu_open = False
         self.snapshots = {}
         self.results = {}
         self.items = {}
@@ -95,6 +98,9 @@ class MainWindow(QMainWindow):
         self.tree.itemSelectionChanged.connect(self.show_detail)
         self.tree.itemChanged.connect(self.selection_changed)
         self.tree.itemDoubleClicked.connect(lambda *_: self.open_changes())
+        self.tree.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.tree.customContextMenuRequested.connect(self.open_native_menu)
+        self.tree.setToolTip("双击查看文件改动；右键打开 Windows 原生菜单")
         main_splitter.addWidget(self.tree)
         detail_widget = QWidget()
         detail_layout = QVBoxLayout(detail_widget)
@@ -353,13 +359,15 @@ class MainWindow(QMainWindow):
         self.update_controls()
 
     def update_controls(self):
-        busy = self.worker is not None
+        running = self.worker is not None
+        busy = running or self.native_menu_open
         for button in [self.check_button, self.sync_button, self.manage_button, self.save_button,
                        self.single_button, self.edit_button, self.branch_button]:
             button.setEnabled(not busy)
         self.profile_combo.setEnabled(not busy)
         self.branch_group.setEnabled(not busy)
-        self.tree.setEnabled(not busy or self.operation in {"sync", "check", "local", "setup"})
+        self.tree.setEnabled(not self.native_menu_open and
+                             (not running or self.operation in {"sync", "check", "local", "setup"}))
         self.tree.blockSignals(True)
         for node in self.items.values():
             flags = node.flags()
@@ -369,8 +377,8 @@ class MainWindow(QMainWindow):
         self.sync_button.setEnabled(not busy and bool(self.selected_ids()))
         self.check_button.setEnabled(not busy and bool(self.selected_ids()))
         self.retry_button.setEnabled(not busy and any(r.outcome in {"failed", "blocked"} for r in self.results.values()))
-        self.stop_button.setEnabled(busy and self.operation != "branches" and not self.worker.stop_requested.is_set())
-        self.cancel_button.setEnabled(busy and not self.worker.cancel_requested.is_set())
+        self.stop_button.setEnabled(running and self.operation != "branches" and not self.worker.stop_requested.is_set())
+        self.cancel_button.setEnabled(running and not self.worker.cancel_requested.is_set())
         key = self.current_repo_id()
         snap = self.snapshots.get(key)
         self.changes_button.setEnabled(not busy and bool(key))
@@ -380,7 +388,7 @@ class MainWindow(QMainWindow):
 
     def open_changes(self):
         key = self.current_repo_id()
-        if self.worker is not None or not key:
+        if self.worker is not None or self.native_menu_open or self.closing_requested or not key:
             return
         dialog = ChangesDialog(self.data_dir, self.profile, key, self)
         dialog.exec()
@@ -388,7 +396,7 @@ class MainWindow(QMainWindow):
             self.start_job("local", [repo.id for repo in self.profile.repositories])
 
     def start_job(self, operation: str, selected: list[str], extra=None):
-        if self.worker is not None:
+        if self.worker is not None or self.native_menu_open or self.closing_requested:
             return
         if operation not in {"setup", "branches"} and not selected:
             return
@@ -445,7 +453,16 @@ class MainWindow(QMainWindow):
             self.items[payload].setCheckState(0, Qt.CheckState.Checked)
             self.append_log(payload, "已加入必要的前置仓库")
             self.refresh_plan()
-        elif kind == "started":
+        elif kind == "check_progress":
+            self.progress.setRange(0, payload["total"])
+            self.progress.setValue(payload["completed"])
+            text = f"并行检查：已完成 {payload['completed']} / {payload['total']}，处理中 {payload['active']}"
+            if self.worker and self.worker.cancel_requested.is_set():
+                text += "；正在中断"
+            elif self.worker and self.worker.stop_requested.is_set():
+                text += "；等待已开始的检查结束"
+            self.message.setText(text)
+        elif kind == "started" and self.operation not in {"local", "check"}:
             name = self.profile.repo(payload).name if payload in self.items else "构建环境"
             self.message.setText("正在处理：" + name)
         elif kind == "log":
@@ -476,7 +493,8 @@ class MainWindow(QMainWindow):
             counts = {s: sum(r.outcome == s for r in result.values()) for s in OUTCOME_NAMES}
             self.message.setText("执行结束：" + " · ".join(f"{OUTCOME_NAMES[s]} {n}" for s, n in counts.items() if n))
         else:
-            self.message.setText(f"检查完成：{len(result)} 个仓库")
+            stopped = self.worker and (self.worker.stop_requested.is_set() or self.worker.cancel_requested.is_set())
+            self.message.setText(f"{'检查已停止' if stopped else '检查完成'}：{len(result)} 个仓库")
 
     def job_failed(self, text):
         self.append_log("系统", text)
@@ -519,7 +537,8 @@ class MainWindow(QMainWindow):
     def stop_queue(self):
         if self.worker:
             self.worker.stop_requested.set()
-            self.message.setText("将在当前仓库完成后停止队列")
+            self.message.setText("等待已开始的并行检查完成，不再启动新检查" if self.operation in {"local", "check"}
+                                 else "将在当前仓库完成后停止队列")
             self.update_controls()
 
     def cancel_current(self):
@@ -554,6 +573,36 @@ class MainWindow(QMainWindow):
             else:
                 self.message.setText("目录尚未创建")
 
+    def open_native_menu(self, point):
+        if self.closing_requested:
+            return
+        if self.worker is not None or self.native_menu_open:
+            self.message.setText("请等待当前任务完成后再使用原生右键菜单")
+            return
+        item = self.tree.itemAt(point)
+        if item is None:
+            return
+        self.tree.setCurrentItem(item)
+        path = self.profile.directory(self.profile.repo(self.current_repo_id()))
+        if not path.is_dir():
+            self.message.setText("目录尚未创建，无法打开原生右键菜单")
+            return
+        invoked = False
+        self.native_menu_open = True
+        self.update_controls()
+        try:
+            with RunLock(self.data_dir):
+                invoked = show_repository_menu(path, self, self.tree.viewport().mapTo(self, point))
+        except (OSError, RuntimeError) as error:
+            self.message.setText("无法打开原生右键菜单：" + str(error))
+        finally:
+            self.native_menu_open = False
+            self.update_controls()
+        if self.closing_requested:
+            self.close()
+        elif invoked:
+            self.start_job("local", [repo.id for repo in self.profile.repositories])
+
     def open_history(self):
         folder = self.data_dir / "runs"
         folder.mkdir(parents=True, exist_ok=True)
@@ -573,7 +622,12 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "导出失败", str(error))
 
     def closeEvent(self, event):
+        if self.native_menu_open:
+            self.closing_requested = True
+            event.ignore()
+            return
         if self.worker is None:
+            self.closing_requested = True
             event.accept()
             return
         if not self.closing_requested:
