@@ -1,5 +1,7 @@
 # MiniGame Repo Tool Implementation Plan
 
+> 此文保留初版实现计划。2026-09-30 已按用户要求取消前置等待和自动加入父仓库，改为只同步明确选中的仓库，各项独立执行；当前规则见 design.md 和 usage.md。下列依赖调度任务仅代表初版历史。
+
 > For agentic workers: use superpowers:executing-plans to execute this plan task by task.
 
 Goal: 在 D:\git\Tools\MiniGameRepoTool 交付可运行的 Python 桌面程序。

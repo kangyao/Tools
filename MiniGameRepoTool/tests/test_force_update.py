@@ -136,24 +136,29 @@ def test_force_does_not_discard_unselected_dirty_parent(tmp_path, remote):
     profile.repositories.append(RepoSpec("child", "Child", "Child", str(remote), branch="main"))
     (root / "file.txt").write_text("keep", encoding="utf-8")
     result = service.sync(profile, ["child"])
-    assert result["child"].outcome == "blocked"
+    assert list(result) == ["child"]
+    assert result["child"].outcome == "success"
     assert (root / "file.txt").read_text(encoding="utf-8") == "keep"
 
 
-def test_force_rechecks_explicit_selection_when_parent_becomes_dirty_mid_sync(tmp_path, remote):
+def test_unselected_parent_is_not_inspected_or_changed_during_child_sync(tmp_path, remote):
     git(remote, "branch", "feature")
     root, profile, service = checkout(tmp_path, remote)
     git(root, "clone", str(remote), str(root / "Child"))
     profile.repo("root").branch_group = ""
     profile.repo("root").branch = "feature"
     profile.repositories.append(RepoSpec("child", "Child", "Child", str(remote), branch="main"))
+    inspected = []
     def changed_after_remote_check(kind, payload):
-        if kind == "snapshot" and payload.repo_id == "root" and payload.remote_checked:
-            (root / "file.txt").write_text("new work after check", encoding="utf-8")
+        if kind == "snapshot":
+            inspected.append(payload.repo_id)
+            if payload.repo_id == "child" and payload.remote_checked:
+                (root / "file.txt").write_text("new work after check", encoding="utf-8")
     service.emit = changed_after_remote_check
     result = service.sync(profile, ["child"])
-    assert result["root"].outcome == "blocked"
-    assert result["child"].outcome == "blocked"
+    assert list(result) == ["child"]
+    assert result["child"].outcome == "success"
+    assert "root" not in inspected
     assert git(root, "branch", "--show-current") == "main"
     assert (root / "file.txt").read_text(encoding="utf-8") == "new work after check"
 

@@ -77,11 +77,6 @@ class Snapshot:
     def ready(self) -> bool:
         return self.status in {"up_to_date", "ahead"} and self.current_branch == self.target_branch
 
-    @property
-    def usable_parent(self) -> bool:
-        return (self.status in {"up_to_date", "ahead", "behind", "unchecked"}
-                and self.current_branch == self.target_branch)
-
 
 @dataclass
 class RepoResult:
@@ -99,7 +94,7 @@ STATUS_NAMES = {
     "force_update": "待强制更新",
     "detached": "分离 HEAD", "remote_mismatch": "远端不一致", "submodule": "Git 子模块",
     "branch_missing": "目标分支不存在", "auth_error": "认证失败", "remote_error": "远端访问失败",
-    "blocked": "依赖未就绪", "layout_conflict": "目录布局冲突", "cancelled": "已取消",
+    "blocked": "待处理", "layout_conflict": "目录布局冲突", "cancelled": "已取消",
     "error": "检查失败", "running": "执行中",
 }
 ACTION_NAMES = {"clone": "克隆", "switch": "切换并更新", "update": "快进更新",
@@ -125,6 +120,7 @@ def dependencies(profile: Profile) -> dict[str, set[str]]:
 
 
 def dependency_order(profile: Profile) -> list[str]:
+    """Order tree rows using directory parents and legacy depends_on hints, not sync prerequisites."""
     deps = dependencies(profile)
     ordered: list[str] = []
     visiting: set[str] = set()
@@ -133,16 +129,16 @@ def dependency_order(profile: Profile) -> list[str]:
         if key in ordered:
             return
         if key not in deps:
-            raise ValueError(f"依赖仓库不存在：{key}")
+            raise ValueError(f"排序参考仓库不存在：{key}")
         if key in visiting:
-            raise ValueError(f"仓库依赖形成循环：{key}")
+            raise ValueError(f"仓库排序参考与目录层级形成循环：{key}")
         visiting.add(key)
         for candidate in profile.repositories:
             if candidate.id in deps[key]:
                 visit(candidate.id)
         unknown = deps[key] - deps.keys()
         if unknown:
-            raise ValueError(f"依赖仓库不存在：{', '.join(sorted(unknown))}")
+            raise ValueError(f"排序参考仓库不存在：{', '.join(sorted(unknown))}")
         visiting.remove(key)
         ordered.append(key)
 
@@ -208,7 +204,7 @@ def validate_profile(profile: Profile) -> None:
             raise ValueError(f"{repo.name} 的目标分支无效：{target}")
         if (not isinstance(repo.enabled, bool) or not isinstance(repo.depends_on, list)
                 or not all(isinstance(x, str) for x in repo.depends_on)):
-            raise ValueError(f"{repo.name} 的启用状态或依赖格式无效")
+            raise ValueError(f"{repo.name} 的启用状态或排序参考格式无效")
         if not isinstance(repo.ignore_changes, bool) or not isinstance(repo.force_update, bool):
             raise ValueError(f"{repo.name} 的忽略修改提醒和强制更新选项必须为布尔值")
     if not set(profile.setup.required_repositories) <= ids:

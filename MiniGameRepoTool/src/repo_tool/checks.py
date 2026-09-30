@@ -5,7 +5,7 @@ from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from pathlib import Path
 
 from .git_ops import GitClient, Inspector
-from .models import Profile, Snapshot, canonical, dependency_order
+from .models import Profile, Snapshot, canonical
 from .process import ProcessRunner, redact
 
 
@@ -56,7 +56,7 @@ class ParallelChecks:
 
     def run(self, profile: Profile, selected: list[str], remote: bool) -> dict[str, Snapshot]:
         chosen = set(selected)
-        ordered = [key for key in dependency_order(profile) if key in chosen]
+        ordered = [repo.id for repo in profile.repositories if repo.id in chosen]
         if not ordered or self.stop.is_set() or self.cancel.is_set():
             return {}
         remaining = iter(ordered)

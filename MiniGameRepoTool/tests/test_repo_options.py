@@ -7,7 +7,7 @@ from repo_tool.models import ProfileDocument, RepoSpec, Snapshot
 from repo_tool.profiles import ProfileStore, parse_document
 from repo_tool.ui.dialogs import ProfilesDialog
 from repo_tool.ui.window import MainWindow
-from test_git_service import git, make_profile, remote
+from test_git_service import commit, git, make_profile, remote
 from test_ui import qapp, wait_job
 
 
@@ -70,7 +70,7 @@ def test_ignored_reminder_does_not_hide_real_changes_or_other_errors(qapp, tmp_p
     window.close()
 
 
-def test_automatic_force_parent_is_not_checked_or_authorized_by_retry(qapp, tmp_path, remote):
+def test_child_sync_and_retry_do_not_select_or_modify_parent(qapp, tmp_path, remote):
     root = tmp_path / "checkout"
     git(tmp_path, "clone", str(remote), str(root))
     git(root, "clone", str(remote), str(root / "Child"))
@@ -80,13 +80,20 @@ def test_automatic_force_parent_is_not_checked_or_authorized_by_retry(qapp, tmp_
     data = tmp_path / "app"
     ProfileStore(data).save(ProfileDocument(1, profile.id, [profile]))
     (root / "file.txt").write_text("keep parent", encoding="utf-8")
+    (root / "Child/file.txt").write_text("child working", encoding="utf-8")
+    updated = commit(remote, "new.txt", "remote update")
     window = MainWindow(data, auto_scan=False)
     window.items["root"].setCheckState(0, Qt.CheckState.Unchecked)
     window.start_job("sync", ["child"])
     wait_job(window, qapp, timeout=120)
     assert window.selected_ids() == ["child"]
+    assert set(window.results) == {"child"}
+    assert window.results["child"].outcome == "blocked"
+    (root / "Child/file.txt").write_text("one", encoding="utf-8")
     window.retry()
     wait_job(window, qapp, timeout=120)
     assert (root / "file.txt").read_text(encoding="utf-8") == "keep parent"
-    assert window.results["root"].outcome == window.results["child"].outcome == "blocked"
+    assert set(window.results) == {"child"}
+    assert window.results["child"].outcome == "success"
+    assert git(root / "Child", "rev-parse", "HEAD") == updated
     window.close()

@@ -55,7 +55,7 @@ class ProfilesDialog(QDialog):
         self.auto_setup = QCheckBox("所需仓库全部就绪后，自动准备构建环境")
         form.addRow(self.auto_setup)
         layout.addLayout(form)
-        note = QLabel("分支组和固定分支二选一；依赖填写仓库 ID，以逗号分隔。未勾选环境必需项时，默认使用全部启用仓库。")
+        note = QLabel("分支组和固定分支二选一；所选仓库独立同步。排序参考填写仓库 ID，以逗号分隔，仅影响列表展示。未勾选环境必需项时，默认使用全部启用仓库。")
         note.setWordWrap(True)
         layout.addWidget(note)
         policy_note = QLabel("忽略修改提醒仅影响显示，文件与 Diff 仍可查看。强制更新在同步时丢弃未提交修改，不备份；保留本地提交，分支分叉时停止。")
@@ -63,7 +63,7 @@ class ProfilesDialog(QDialog):
         layout.addWidget(policy_note)
         self.table = QTableWidget(0, 11)
         self.table.setHorizontalHeaderLabels(["启用", "仓库 ID", "名称", "忽略修改提醒", "强制更新（不备份）",
-                                             "相对目录", "远端地址", "分支组", "固定分支", "额外依赖", "环境必需"])
+                                             "相对目录", "远端地址", "分支组", "固定分支", "排序参考", "环境必需"])
         self.table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         self.table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
         for col, width in enumerate([45, 95, 125, 110, 150, 180, 320, 80, 180, 120, 75]):

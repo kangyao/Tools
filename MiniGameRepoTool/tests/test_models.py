@@ -33,7 +33,7 @@ def test_rejects_paths_outside_workspace(tmp_path, bad_path):
 def test_rejects_duplicate_paths_cycle_unknown_group_and_credentials(tmp_path):
     p = profile(tmp_path)
     p.repositories[0].depends_on = ["child"]
-    with pytest.raises(ValueError, match="依赖"):
+    with pytest.raises(ValueError, match="排序参考.*循环"):
         validate_profile(p)
     p.repositories[0].depends_on = []
     p.repositories[1].path = "."

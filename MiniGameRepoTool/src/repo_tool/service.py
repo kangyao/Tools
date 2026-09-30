@@ -6,8 +6,8 @@ from typing import Callable
 
 from .checks import ParallelChecks
 from .force_update import ForceUpdate
-from .git_ops import GitClient, Inspector, remote_failure
-from .models import Profile, RepoResult, Snapshot, dependencies, dependency_order, validate_profile
+from .git_ops import GitClient, Inspector
+from .models import Profile, RepoResult, Snapshot, validate_profile
 from .process import ProcessRunner, redact
 from .setup import SetupRunner
 from .storage import RunJournal, RunLock
@@ -82,7 +82,7 @@ class RepoService:
                 return RepoResult(repo_id, "blocked", fresh.message, fresh)
             if fresh.action == "force_update":
                 if not allow_force:
-                    return RepoResult(repo_id, "blocked", "前置仓库需要强制更新；请明确勾选该仓库后同步", fresh)
+                    return RepoResult(repo_id, "blocked", "该仓库未被选择，不执行强制更新", fresh)
                 self._log("按仓库配置执行强制更新：丢弃未提交修改，不备份，保留本地提交")
                 try:
                     count = ForceUpdate(self.data_dir, self.git).discard(profile, repo_id)
@@ -132,35 +132,14 @@ class RepoService:
             self.emit("journal", str(self.journal.log_path))
             results: dict[str, RepoResult] = {}
             try:
-                deps = dependencies(profile)
                 chosen = set(selected)
-                required = set(chosen)
-
-                def include(key):
-                    for parent in deps[key]:
-                        if parent not in required:
-                            required.add(parent)
-                            include(parent)
-
-                for key in selected:
-                    include(key)
-                local = {}
-                for key in dependency_order(profile):
-                    if key not in required:
-                        continue
-                    if self.stop.is_set() or self.cancel.is_set():
-                        break
-                    local[key] = self._inspect(profile, key, False)
-                    if key not in chosen and not local[key].usable_parent:
-                        chosen.add(key)
-                        self.emit("included", key)
-                for key in dependency_order(profile):
+                # Folder nesting is for display and path protection, never a prerequisite.
+                for repo in profile.repositories:
+                    key = repo.id
                     if key not in chosen:
                         continue
                     if self.stop.is_set() or self.cancel.is_set():
                         result = RepoResult(key, "cancelled", "队列已停止，未执行此仓库")
-                    elif any(parent in results and results[parent].outcome != "success" for parent in deps[key]):
-                        result = RepoResult(key, "blocked", "前置仓库未完成，处理前置仓库后重试")
                     else:
                         self.current = key
                         self.emit("started", key)

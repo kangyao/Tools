@@ -193,19 +193,32 @@ def test_switch_compares_target_branch_not_current(tmp_path, remote):
     assert "local-only" in git(Path(p.root), "branch", "--list")
 
 
-def test_parent_dependency_autoinclusion_and_untracked_nested_repo(tmp_path, remote):
+def test_child_clone_does_not_include_or_clone_missing_parent(tmp_path, remote):
+    p = make_profile(tmp_path / "checkout", remote)
+    p.repositories.append(RepoSpec("child", "Child", "Assets", str(remote), "game"))
+    events = []
+    svc = service(tmp_path, emit=lambda kind, payload: events.append((kind, payload)))
+    result = svc.sync(p, ["child"])
+    assert list(result) == ["child"]
+    assert result["child"].outcome == "success"
+    assert not (Path(p.root) / ".git").exists()
+    assert (Path(p.root) / "Assets/.git").exists()
+    assert {payload.repo_id for kind, payload in events if kind == "snapshot"} == {"child"}
+    assert not any(kind == "included" for kind, _ in events)
+
+
+def test_untracked_configured_nested_repo_is_not_parent_dirt(tmp_path, remote):
     p = make_profile(tmp_path / "checkout", remote)
     p.repositories.append(RepoSpec("child", "Child", "Assets", str(remote), "game"))
     svc = service(tmp_path)
-    result = svc.sync(p, ["child"])
-    assert list(result) == ["root", "child"]
+    result = svc.sync(p, ["root", "child"])
     assert all(r.outcome == "success" for r in result.values())
     assert svc.check(p, ["root"], remote=False)["root"].status == "up_to_date"
     (Path(p.root) / "own-untracked.txt").write_text("keep")
     assert svc.check(p, ["root"], remote=False)["root"].status == "dirty"
 
 
-def test_parent_failure_blocks_child_and_keeps_independent_repo(tmp_path, remote):
+def test_parent_failure_does_not_block_child_or_other_selected_repo(tmp_path, remote):
     root = tmp_path / "checkout"
     root.mkdir()
     p = Profile("p", "Local", str(root), {"game":"main"}, [
@@ -215,9 +228,39 @@ def test_parent_failure_blocks_child_and_keeps_independent_repo(tmp_path, remote
     ])
     result = service(tmp_path).sync(p, ["a", "child", "b"])
     assert result["a"].outcome == "failed"
-    assert result["child"].outcome == "blocked"
+    assert result["child"].outcome == "success"
     assert result["b"].outcome == "success"
-    assert not (root / "A" / "child").exists()
+    assert (root / "A" / "child" / ".git").exists()
+
+
+def test_explicit_dependency_does_not_expand_selection_or_block_sync(tmp_path, remote):
+    p = make_profile(tmp_path / "checkout", remote)
+    p.repo("root").path = "A"
+    p.repo("root").branch_group = ""
+    p.repo("root").branch = "missing"
+    p.repositories.append(RepoSpec("other", "Other", "Sibling", str(remote), "game", depends_on=["root"]))
+    result = service(tmp_path).sync(p, ["other"])
+    assert list(result) == ["other"]
+    assert result["other"].outcome == "success"
+    assert not (Path(p.root) / "A/.git").exists()
+
+
+def test_dirty_selected_parent_does_not_stop_child_fast_forward(tmp_path, remote):
+    root = tmp_path / "checkout"
+    git(tmp_path, "clone", str(remote), str(root))
+    git(root, "clone", str(remote), str(root / "Child"))
+    p = make_profile(root, remote)
+    p.repositories.append(RepoSpec("child", "Child", "Child", str(remote), "game"))
+    parent_head = git(root, "rev-parse", "HEAD")
+    (root / "file.txt").write_text("keep parent work", encoding="utf-8")
+    updated = commit(remote, "new.txt", "remote update")
+    result = service(tmp_path).sync(p, ["root", "child"])
+    assert result["root"].outcome == "blocked"
+    assert result["root"].snapshot.status == "dirty"
+    assert result["child"].outcome == "success"
+    assert git(root / "Child", "rev-parse", "HEAD") == updated
+    assert git(root, "rev-parse", "HEAD") == parent_head
+    assert (root / "file.txt").read_text(encoding="utf-8") == "keep parent work"
 
 
 def test_stop_queue_finishes_current_then_stops(tmp_path, remote):

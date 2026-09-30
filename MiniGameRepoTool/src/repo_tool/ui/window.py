@@ -12,7 +12,7 @@ from PySide6.QtWidgets import (
     QTreeWidgetItem, QVBoxLayout, QWidget,
 )
 
-from ..models import ACTION_NAMES, OUTCOME_NAMES, STATUS_NAMES, dependencies, dependency_order, validate_profile
+from ..models import ACTION_NAMES, OUTCOME_NAMES, STATUS_NAMES, dependency_order, validate_profile
 from ..process import redact
 from ..profiles import ProfileStore
 from ..storage import RunLock
@@ -212,7 +212,6 @@ class MainWindow(QMainWindow):
         self.tree.blockSignals(True)
         self.tree.clear()
         self.items = {}
-        deps = dependencies(self.profile)
         for key in dependency_order(self.profile):
             repo = self.profile.repo(key)
             path = self.profile.directory(repo)
@@ -323,18 +322,16 @@ class MainWindow(QMainWindow):
     def refresh_plan(self):
         chosen = set(self.selected_ids())
         lines = []
-        deps = dependencies(self.profile)
-        for key in dependency_order(self.profile):
+        for repo in self.profile.repositories:
+            key = repo.id
             if key not in chosen:
                 continue
-            repo = self.profile.repo(key)
             snap = self.snapshots.get(key)
             operation = ACTION_NAMES.get(snap.action, "检查") if snap else "检查后决定"
-            dependency = ", ".join(self.profile.repo(p).name for p in deps[key]) or "无"
-            lines.append(f"{repo.name}  →  {operation}\n    目标：{self.profile.target(repo)}；前置：{dependency}")
+            lines.append(f"{repo.name}  →  {operation}\n    目标：{self.profile.target(repo)}；独立同步")
             if repo.force_update:
                 lines.append("    更新策略：强制更新；丢弃未提交修改，不备份；保留本地提交，分叉时停止")
-        lines.append("\n缺失或未就绪的必要前置仓库会加入队列；已可用的未选父仓库不会被更新。")
+        lines.append("\n只执行所选仓库，不等待前置仓库，不自动勾选其他仓库；每项按自身状态决定操作。")
         self.plan.setPlainText("\n".join(lines))
         self.selection_label.setText(f"已选 {len(chosen)} / {len(self.items)}")
 
@@ -459,13 +456,6 @@ class MainWindow(QMainWindow):
                                               "blocked": "#b45309", "cancelled": "#697586"}[payload.outcome]))
                 node.setToolTip(5, payload.message)
             self.show_detail()
-        elif kind == "included":
-            if self.profile.repo(payload).force_update:
-                self.append_log(payload, "已检查必要前置仓库；强制更新需要手动勾选，不自动加入勾选范围")
-            else:
-                self.items[payload].setCheckState(0, Qt.CheckState.Checked)
-                self.append_log(payload, "已加入必要的前置仓库")
-            self.refresh_plan()
         elif kind == "check_progress":
             self.progress.setRange(0, payload["total"])
             self.progress.setValue(payload["completed"])
