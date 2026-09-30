@@ -183,6 +183,23 @@ def test_successful_ib_run_keeps_complete_logs_and_monitor_parameter(build_profi
     assert "ValidateOnly" not in request["Parameters"]
 
 
+def test_compile_ignores_command_timeout_while_check_keeps_it(build_profile, tmp_path, monkeypatch):
+    from repo_tool.process import ProcessRunner
+    existing_solution(build_profile)
+    build_profile.build.timeout_minutes = 1
+    seen = []
+    original = ProcessRunner.run
+
+    def run(self, program, arguments, *args, **kwargs):
+        seen.append((Path(str(arguments[-1])).name, kwargs.get("timeout")))
+        return original(self, program, arguments, *args, **kwargs)
+
+    monkeypatch.setattr(ProcessRunner, "run", run)
+    result = BuildService(tmp_path / "app").run(build_profile)["compile"]
+    assert result.outcome == "success"
+    assert [timeout for name, timeout in seen if name == "invoke-mini-ib-build.ps1.request.json"] == [60, None]
+
+
 def test_engine_library_download_failure_does_not_generate_solution(build_profile, tmp_path):
     root = Path(build_profile.root)
     (root / "Tools/Setup/PullEngine.py").write_text("raise SystemExit(8)\n")

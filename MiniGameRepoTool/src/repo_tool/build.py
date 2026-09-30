@@ -107,7 +107,8 @@ class BuildService:
         if not path.is_file():
             raise ValueError(f"找不到{description}：{path}")
 
-    def _skill(self, profile: Profile, name: str, parameters: dict, *, cleanup=False, on_terminate=None):
+    def _skill(self, profile: Profile, name: str, parameters: dict, *, cleanup=False, on_terminate=None,
+               unbounded=False):
         root = Path(profile.root).resolve()
         script = resolve_build_path(root, profile.build.ib_skill_dir) / "scripts" / name
         self._require(script, "IB 技能脚本")
@@ -117,7 +118,12 @@ class BuildService:
         request = self.run_dir / (name + ".request.json")
         atomic_json(request, {"Script": str(script), "Parameters": parameters})
         runner = ProcessRunner(self._log) if cleanup else self.runner
-        timeout = 30 if cleanup else profile.build.timeout_minutes * 60 or None
+        if cleanup:
+            timeout = 30
+        elif unbounded:
+            timeout = None
+        else:
+            timeout = profile.build.timeout_minutes * 60 or None
         return runner.run(powershell, ["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File",
                                       str(HELPERS / "invoke_skill.ps1"), "-RequestFile", str(request)],
                           root, timeout=timeout, on_terminate=on_terminate,
@@ -215,7 +221,9 @@ class BuildService:
                 if stopped.returncode:
                     raise RuntimeError("IB 会话停止脚本失败，请查看本次会话日志")
 
-        process = self._skill(profile, "invoke-mini-ib-build.ps1", parameters, on_terminate=stop_owned_session)
+        # A full build routinely outlasts any per-command limit; only cancel stops it.
+        process = self._skill(profile, "invoke-mini-ib-build.ps1", parameters, on_terminate=stop_owned_session,
+                              unbounded=True)
         result = self._process_result("compile", process, "IB 编译")
         result.log_path, result.session_file = str(log), str(session)
         if not process.cancelled and not process.timed_out:
