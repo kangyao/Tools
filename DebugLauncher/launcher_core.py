@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import ctypes
 from ctypes import wintypes
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from enum import Enum
 import json
 import os
@@ -15,25 +15,20 @@ from typing import Callable, Mapping, Protocol, Sequence
 import xml.etree.ElementTree as ET
 
 
-DEFAULT_EXECUTABLE = r"C:\MiniGame\Bin64\AIFramework_d.exe"
-DEFAULT_ARGUMENTS = ("-MGFTopBattle", "-script-debug-wait-client")
-CONFIG_VERSION = 1
+DEFAULT_EXECUTABLE = r"C:\MiniGame\Bin64\AICore_profile.exe"
+DEFAULT_ARGUMENTS = ("-script-debug-wait-client",)
+CONFIG_VERSION = 2
 WINDOW_GEOMETRY_PATTERN = re.compile(r"^[1-9]\d*x[1-9]\d*[+-]\d+[+-]\d+$")
-APP_CONFIGS_START_PATTERN = re.compile(
-    r"^\s*Games\.AppConfigs\s*=\s*\{\s*(?:--.*)?$"
-)
-APP_CONFIGS_END_PATTERN = re.compile(r"^\s*\}\s*(?:--.*)?$")
-APP_CONFIG_ARGUMENT_PATTERN = re.compile(
-    r"^\s*\{\s*(?P<quote>[\"'])(?P<name>[^\"']+)(?P=quote)"
-    r"\s*,\s*function\s*\(\s*\)"
-)
-MGF_ARGUMENT_PREFIX = "-MGF"
-TOP_BATTLE_ARGUMENT = "-MGFTopBattle"
 DEBUG_WAIT_ARGUMENT = "-script-debug-wait-client"
 LUA_DEBUG_PORT_ARGUMENT = "-lua-debug-port"
 MCP_CLIENT_NAME_ENVIRONMENT_VARIABLE = "MINIGAME_MCP_CLIENT_NAME"
 DEFAULT_NETWORK_HOST = "127.0.0.1"
-DEFAULT_NETWORK_PORT = 19120
+DEFAULT_NETWORK_PORT = 7000
+DEFAULT_NETWORK_ROOM_ID = 1
+DEFAULT_NETWORK_UIN = 10001
+NETWORK_ARGUMENTS = (
+    "-MGFNetRole", "-MGFNetHost", "-MGFNetPort", "-MGFNetRoomId", "-MGFNetUin",
+)
 DEFAULT_SCRIPT_DEBUG_PORT = 3382
 DEFAULT_BRIDGE_PORT = 3383
 DEFAULT_DAP_PORT = 4711
@@ -98,16 +93,6 @@ def load_attach_configuration(path: Path) -> AttachConfiguration:
         return fallback
 
 
-def get_file_revision(path: Path) -> tuple[int, int] | None:
-    """Return a cheap revision token that changes when a watched file is replaced."""
-
-    try:
-        stat = path.stat()
-    except OSError:
-        return None
-    return stat.st_mtime_ns, stat.st_size
-
-
 class LauncherError(RuntimeError):
     """Base error shown by the launcher UI."""
 
@@ -118,9 +103,91 @@ class ConfigurationError(LauncherError):
 
 class NetworkRole(str, Enum):
     STANDALONE = "standalone"
-    LOGIN = "login"
     HOST = "host"
     CLIENT = "client"
+
+
+@dataclass(frozen=True)
+class NetworkOptions:
+    role: NetworkRole = NetworkRole.STANDALONE
+    host: str = DEFAULT_NETWORK_HOST
+    port: int = DEFAULT_NETWORK_PORT
+    room_id: int = DEFAULT_NETWORK_ROOM_ID
+    uin: int = DEFAULT_NETWORK_UIN
+
+    def arguments(self) -> tuple[str, ...]:
+        """Match StartAICoreHost.bat / StartAICoreClient.bat argument order."""
+        if self.role is NetworkRole.STANDALONE:
+            return ()
+        arguments = ["-MGFNetRole", self.role.value.title()]
+        if self.role is NetworkRole.CLIENT:
+            arguments.extend(("-MGFNetHost", self.host))
+        arguments.extend((
+            "-MGFNetPort", str(self.port), "-MGFNetRoomId", str(self.room_id),
+        ))
+        if self.role is NetworkRole.CLIENT:
+            arguments.extend(("-MGFNetUin", str(self.uin)))
+        return tuple(arguments)
+
+
+def parse_network_arguments(arguments: Sequence[str]) -> NetworkOptions:
+    """Read network metadata from the same argv that is passed to the App."""
+    values: dict[str, str] = {}
+    index = 0
+    while index < len(arguments):
+        argument = arguments[index]
+        index += 1
+        if argument not in NETWORK_ARGUMENTS:
+            continue
+        if argument in values:
+            raise ConfigurationError(f"网络参数 {argument} 不能重复。")
+        if index == len(arguments) or arguments[index].startswith("-"):
+            raise ConfigurationError(f"网络参数 {argument} 缺少值。")
+        values[argument] = arguments[index]
+        index += 1
+
+    try:
+        role = NetworkRole(values.get("-MGFNetRole", "standalone").casefold())
+    except ValueError as exc:
+        raise ConfigurationError("-MGFNetRole 必须是 Host、Client 或 Standalone。") from exc
+    host = values.get("-MGFNetHost", DEFAULT_NETWORK_HOST).strip()
+    if not host:
+        raise ConfigurationError("-MGFNetHost 必须是非空地址。")
+
+    def positive_integer(argument: str, default: int) -> int:
+        try:
+            value = int(values.get(argument, str(default)))
+        except ValueError as exc:
+            raise ConfigurationError(f"{argument} 必须是正整数。") from exc
+        if value <= 0:
+            raise ConfigurationError(f"{argument} 必须是正整数。")
+        return value
+
+    port = positive_integer("-MGFNetPort", DEFAULT_NETWORK_PORT)
+    if port > MAX_PORT:
+        raise ConfigurationError(f"-MGFNetPort 必须是 1 到 {MAX_PORT} 之间的整数。")
+    room_id = positive_integer("-MGFNetRoomId", DEFAULT_NETWORK_ROOM_ID)
+    uin = positive_integer("-MGFNetUin", DEFAULT_NETWORK_UIN)
+    if role is NetworkRole.CLIENT and uin == 1:
+        raise ConfigurationError("Client 的 -MGFNetUin 不能为 1（主机本地玩家 ID）。")
+    return NetworkOptions(role, host, port, room_id, uin)
+
+
+def apply_network_preset(
+    arguments: Sequence[str], role: NetworkRole,
+) -> tuple[str, ...]:
+    """Replace network flags with a script preset while preserving App options."""
+    remaining: list[str] = []
+    index = 0
+    while index < len(arguments):
+        argument = arguments[index]
+        index += 1
+        if argument in NETWORK_ARGUMENTS:
+            if index < len(arguments) and not arguments[index].startswith("-"):
+                index += 1
+        else:
+            remaining.append(argument)
+    return NetworkOptions(role=role).arguments() + tuple(remaining)
 
 
 @dataclass(frozen=True)
@@ -130,27 +197,9 @@ class LauncherSettings:
     show_console: bool = True
     window_geometry: str = ""
     argument_enabled: tuple[bool, ...] | None = None
-    network_role: NetworkRole = NetworkRole.STANDALONE
-    network_host: str = DEFAULT_NETWORK_HOST
-    network_port: int = DEFAULT_NETWORK_PORT
+    network: NetworkOptions = field(init=False, repr=False, compare=False)
 
     def __post_init__(self) -> None:
-        try:
-            role = NetworkRole(self.network_role)
-        except (TypeError, ValueError) as exc:
-            raise ConfigurationError(
-                "网络角色必须是 standalone、login、host 或 client。"
-            ) from exc
-        object.__setattr__(self, "network_role", role)
-        if not isinstance(self.network_host, str) or not self.network_host.strip():
-            raise ConfigurationError("网络主机地址必须是非空字符串。")
-        if (
-            isinstance(self.network_port, bool)
-            or not isinstance(self.network_port, int)
-            or not 1 <= self.network_port <= MAX_PORT
-        ):
-            raise ConfigurationError(f"网络端口必须是 1 到 {MAX_PORT} 之间的整数。")
-
         states = self.argument_enabled
         if states is None:
             object.__setattr__(
@@ -158,13 +207,15 @@ class LauncherSettings:
                 "argument_enabled",
                 tuple(True for _argument in self.arguments),
             )
-            return
-        if len(states) != len(self.arguments) or not all(
+        elif len(states) != len(self.arguments) or not all(
             isinstance(state, bool) for state in states
         ):
             raise ConfigurationError(
                 "启动参数的启用状态必须是与参数列表等长的布尔值数组。"
             )
+        if LUA_DEBUG_PORT_ARGUMENT in self.enabled_arguments:
+            raise ConfigurationError("-lua-debug-port 由启动器自动分配，请从 App 参数中删除。")
+        object.__setattr__(self, "network", parse_network_arguments(self.enabled_arguments))
 
     @property
     def enabled_arguments(self) -> tuple[str, ...]:
@@ -199,7 +250,7 @@ class ConfigStore:
 
         if not isinstance(raw, dict):
             raise ConfigurationError("配置文件根节点必须是 JSON 对象。")
-        if raw.get("version") != CONFIG_VERSION:
+        if raw.get("version") not in (1, CONFIG_VERSION):
             raise ConfigurationError(
                 f"不支持的配置版本：{raw.get('version')!r}，当前版本为 {CONFIG_VERSION}。"
             )
@@ -209,9 +260,6 @@ class ConfigStore:
         argument_enabled = raw.get("argument_enabled")
         show_console = raw.get("show_console", True)
         window_geometry = raw.get("window_geometry", "")
-        network_role = raw.get("network_role", NetworkRole.STANDALONE.value)
-        network_host = raw.get("network_host", DEFAULT_NETWORK_HOST)
-        network_port = raw.get("network_port", DEFAULT_NETWORK_PORT)
         if not isinstance(executable, str) or not executable.strip():
             raise ConfigurationError("配置项 executable 必须是非空字符串。")
         if not isinstance(arguments, list) or not all(
@@ -237,15 +285,44 @@ class ConfigStore:
                 "配置项 window_geometry 必须是“宽x高+X+Y”格式的字符串。"
             )
 
+        if raw["version"] == 1:
+            # Version 1 stored a fixed gameplay radio list. Only the debugger
+            # option survives; network presets now use the App-level protocol.
+            debug_enabled = any(
+                argument == DEBUG_WAIT_ARGUMENT and enabled
+                for argument, enabled in zip(arguments, argument_enabled)
+            )
+            role = raw.get("network_role", "standalone")
+            if role not in ("standalone", "login", "host", "client"):
+                raise ConfigurationError(f"旧配置的网络角色无效：{role!r}。")
+            network_arguments: tuple[str, ...] = ()
+            if role in ("host", "client"):
+                port = raw.get("network_port", DEFAULT_NETWORK_PORT)
+                host = raw.get("network_host", DEFAULT_NETWORK_HOST)
+                if isinstance(port, bool) or not isinstance(port, int):
+                    raise ConfigurationError("旧配置的网络端口必须是整数。")
+                if not isinstance(host, str) or not host.strip():
+                    raise ConfigurationError("旧配置的网络主机地址必须是非空字符串。")
+                if port == 19120:
+                    port = DEFAULT_NETWORK_PORT
+                network_arguments = NetworkOptions(
+                    role=NetworkRole(role),
+                    host=host,
+                    port=port,
+                ).arguments()
+            arguments = [*network_arguments, DEBUG_WAIT_ARGUMENT]
+            argument_enabled = [True] * len(network_arguments) + [debug_enabled]
+            if executable.replace("/", "\\").casefold() == (
+                r"C:\MiniGame\Bin64\AIFramework_d.exe".casefold()
+            ):
+                executable = DEFAULT_EXECUTABLE
+
         return LauncherSettings(
             executable=executable,
             arguments=tuple(arguments),
             argument_enabled=tuple(argument_enabled),
             show_console=show_console,
             window_geometry=window_geometry,
-            network_role=network_role,
-            network_host=network_host,
-            network_port=network_port,
         )
 
     def save(self, settings: LauncherSettings) -> None:
@@ -256,9 +333,6 @@ class ConfigStore:
             "argument_enabled": list(settings.argument_enabled or ()),
             "show_console": settings.show_console,
             "window_geometry": settings.window_geometry,
-            "network_role": settings.network_role.value,
-            "network_host": settings.network_host,
-            "network_port": settings.network_port,
         }
         if not is_valid_window_geometry(settings.window_geometry):
             raise ConfigurationError(
@@ -322,131 +396,17 @@ def format_argument_text(arguments: Sequence[str]) -> str:
     return subprocess.list2cmdline(list(arguments)) if arguments else ""
 
 
-def try_discover_argument_suggestions(
-    games_init_path: Path,
-) -> tuple[str, ...] | None:
-    """Read ordered game routes, returning None when the source is unavailable."""
-
-    try:
-        source = games_init_path.read_text(encoding="utf-8")
-    except (OSError, UnicodeError):
-        return None
-
-    suggestions: list[str] = []
-    in_app_configs = False
-    for line in source.splitlines():
-        if not in_app_configs:
-            in_app_configs = APP_CONFIGS_START_PATTERN.fullmatch(line) is not None
-            continue
-        if APP_CONFIGS_END_PATTERN.fullmatch(line) is not None:
-            break
-        match = APP_CONFIG_ARGUMENT_PATTERN.match(line)
-        if match is None:
-            continue
-        name = match.group("name").strip()
-        if name:
-            suggestions.append(name if name.startswith("-") else f"-{name}")
-
-    suggestions.append(DEBUG_WAIT_ARGUMENT)
-    return tuple(dict.fromkeys(suggestions))
-
-
-def discover_argument_suggestions(games_init_path: Path) -> tuple[str, ...]:
-    """Read game routes, falling back to defaults when init.lua is unavailable."""
-
-    suggestions = try_discover_argument_suggestions(games_init_path)
-    return suggestions if suggestions is not None else DEFAULT_ARGUMENTS
-
-
-def is_mgf_argument(argument: str) -> bool:
-    return argument.casefold().startswith(MGF_ARGUMENT_PREFIX.casefold())
-
-
-def normalize_fixed_arguments(
-    available_arguments: Sequence[str],
-    saved_arguments: Sequence[str] = (),
-    saved_enabled: Sequence[bool] | None = None,
-    exclusive_arguments: Sequence[str] | None = None,
-) -> tuple[tuple[str, ...], tuple[bool, ...]]:
-    """Return every fixed argument while allowing one exclusive selection."""
-    fixed_arguments = tuple(dict.fromkeys(available_arguments))
-    states = tuple(saved_enabled) if saved_enabled is not None else tuple(
-        True for _argument in saved_arguments
-    )
-    saved_states = {
-        argument: enabled
-        for argument, enabled in zip(saved_arguments, states)
-    }
-    exclusive_set = set(
-        exclusive_arguments
-        if exclusive_arguments is not None
-        else (
-            argument
-            for argument in fixed_arguments
-            if is_mgf_argument(argument)
-        )
-    )
-    exclusive_options = tuple(
-        argument for argument in fixed_arguments if argument in exclusive_set
-    )
-    selected_exclusive = next(
-        (
-            argument
-            for argument, enabled in zip(saved_arguments, states)
-            if enabled and argument in exclusive_set
-        ),
-        None,
-    )
-    if selected_exclusive is None:
-        selected_exclusive = next(
-            (
-                argument
-                for argument in DEFAULT_ARGUMENTS
-                if argument in exclusive_set
-            ),
-            exclusive_options[0] if exclusive_options else None,
-        )
-
-    enabled_arguments = tuple(
-        argument == selected_exclusive
-        if argument in exclusive_set
-        else saved_states.get(argument, argument in DEFAULT_ARGUMENTS)
-        for argument in fixed_arguments
-    )
-    return fixed_arguments, enabled_arguments
-
-
-def filter_argument_suggestions(
-    value: str, suggestions: Sequence[str]
-) -> tuple[str, ...]:
-    query = value.strip()
-    if not query:
-        return tuple(suggestions)
-    normalized = query if query.startswith("-") else f"-{query}"
-    lowered = normalized.casefold()
-    return tuple(
-        suggestion
-        for suggestion in suggestions
-        if suggestion.casefold().startswith(lowered)
-    )
-
-
-def get_effective_network_role(settings: LauncherSettings) -> NetworkRole:
-    if TOP_BATTLE_ARGUMENT not in settings.enabled_arguments:
-        return NetworkRole.STANDALONE
-    return settings.network_role
-
-
 def build_process_environment_overrides(
     settings: LauncherSettings,
     debug_ports: DebugPortBundle | None = None,
 ) -> dict[str, str]:
     """Give every launched game a stable, selectable MCP identity."""
 
-    role = get_effective_network_role(settings).value.upper()
+    role = settings.network.role.value.upper()
     port_suffix = f"-{debug_ports.target_port}" if debug_ports is not None else ""
+    app_name = Path(settings.executable).stem
     return {
-        MCP_CLIENT_NAME_ENVIRONMENT_VARIABLE: f"AIFramework-{role}{port_suffix}"
+        MCP_CLIENT_NAME_ENVIRONMENT_VARIABLE: f"{app_name}-{role}{port_suffix}"
     }
 
 
@@ -464,23 +424,6 @@ def build_launch_arguments(
     """Build the single argv source used by previews and process launches."""
 
     arguments = list(settings.enabled_arguments)
-    role = get_effective_network_role(settings)
-    if role is NetworkRole.LOGIN:
-        arguments.append("-TopBattleNetworkLogin")
-    elif role is NetworkRole.HOST:
-        arguments.extend(
-            ("-TopBattleNetworkHost", "-TopBattleListenPort", str(settings.network_port))
-        )
-    elif role is NetworkRole.CLIENT:
-        arguments.extend(
-            (
-                "-TopBattleNetworkClient",
-                "-TopBattleHost",
-                settings.network_host.strip(),
-                "-TopBattlePort",
-                str(settings.network_port),
-            )
-        )
     if debug_ports is not None:
         arguments.extend((LUA_DEBUG_PORT_ARGUMENT, str(debug_ports.target_port)))
     return tuple(arguments)
@@ -767,18 +710,18 @@ class WindowsJobProcess:
                 ctypes.byref(startup),
                 ctypes.byref(process_info),
             ):
-                raise _windows_error("启动 AIFramework 失败")
+                raise _windows_error("启动 App 失败")
             process_created = True
 
             if not kernel32.AssignProcessToJobObject(
                 job_handle, process_info.hProcess
             ):
-                raise _windows_error("将 AIFramework 加入 Job Object 失败")
+                raise _windows_error("将 App 加入 Job Object 失败")
             process_assigned = True
 
             resume_result = kernel32.ResumeThread(process_info.hThread)
             if resume_result == 0xFFFFFFFF:
-                raise _windows_error("恢复 AIFramework 主线程失败")
+                raise _windows_error("恢复 App 主线程失败")
 
             kernel32.CloseHandle(process_info.hThread)
             process_info.hThread = None
@@ -822,13 +765,13 @@ class WindowsJobProcess:
             if wait_result == self.WAIT_TIMEOUT:
                 return None
             if wait_result != self.WAIT_OBJECT_0:
-                raise _windows_error("查询 AIFramework 状态失败")
+                raise _windows_error("查询 App 状态失败")
 
             exit_code = wintypes.DWORD()
             if not self._kernel32.GetExitCodeProcess(
                 self._process_handle, ctypes.byref(exit_code)
             ):
-                raise _windows_error("读取 AIFramework 退出码失败")
+                raise _windows_error("读取 App 退出码失败")
             self._exit_code = int(exit_code.value)
             return self._exit_code
 
@@ -837,7 +780,7 @@ class WindowsJobProcess:
             if not self._job_handle or self.poll() is not None:
                 return
             if not self._kernel32.TerminateJobObject(self._job_handle, exit_code):
-                raise _windows_error("关闭 AIFramework 进程树失败")
+                raise _windows_error("关闭 App 进程树失败")
 
     def wait(self, timeout_ms: int) -> bool:
         with self._lock:
@@ -851,7 +794,7 @@ class WindowsJobProcess:
                 return True
             if wait_result == self.WAIT_TIMEOUT:
                 return False
-            raise _windows_error("等待 AIFramework 退出失败")
+            raise _windows_error("等待 App 退出失败")
 
     def close(self) -> None:
         with self._lock:
@@ -1001,7 +944,7 @@ class LauncherController:
         *,
         allow_active_target: bool = False,
     ) -> DebugPortBundle:
-        """Reserve a persistent debugger slot before an AIFramework process starts."""
+        """Reserve a persistent debugger slot before an App process starts."""
 
         with self._lock:
             if self._closed:
@@ -1025,9 +968,9 @@ class LauncherController:
     def start(self, settings: LauncherSettings) -> ControllerSnapshot:
         with self._lock:
             if self._closed:
-                raise LauncherError("启动器正在关闭，不能再启动 AIFramework。")
+                raise LauncherError("启动器正在关闭，不能再启动 App。")
             self._reap_finished_processes()
-            self._validate_host_endpoint(settings)
+            self._validate_network_identity(settings)
             debug_ports = self._acquire_debug_slot()
             arguments = build_launch_arguments(settings, debug_ports)
             try:
@@ -1062,7 +1005,7 @@ class LauncherController:
             process.terminate()
             if not process.wait(timeout_ms):
                 raise LauncherError(
-                    f"等待 AIFramework（PID {process.pid}）退出超时。"
+                    f"等待 App（PID {process.pid}）退出超时。"
                 )
             exit_code = process.poll()
             process.close()
@@ -1080,7 +1023,7 @@ class LauncherController:
     def restart(self, instance_id: int, timeout_ms: int = 5000) -> ControllerSnapshot:
         with self._lock:
             if self._closed:
-                raise LauncherError("启动器正在关闭，不能重新启动 AIFramework。")
+                raise LauncherError("启动器正在关闭，不能重新启动 App。")
             self._reap_finished_processes()
             instance = self._instances.get(instance_id)
             if instance is None:
@@ -1089,7 +1032,7 @@ class LauncherController:
             old_process.terminate()
             if not old_process.wait(timeout_ms):
                 raise LauncherError(
-                    f"等待 AIFramework（PID {old_process.pid}）退出超时。"
+                    f"等待 App（PID {old_process.pid}）退出超时。"
                 )
             old_process.close()
             try:
@@ -1139,17 +1082,23 @@ class LauncherController:
         self._debug_slots.clear()
         self._idle_debug_slots.clear()
 
-    def _validate_host_endpoint(self, settings: LauncherSettings) -> None:
-        if get_effective_network_role(settings) is not NetworkRole.HOST:
-            return
+    def _validate_network_identity(self, settings: LauncherSettings) -> None:
+        network = settings.network
         for instance in self._instances.values():
+            existing = instance.settings.network
             if (
-                get_effective_network_role(instance.settings) is NetworkRole.HOST
-                and instance.settings.network_port == settings.network_port
+                network.role is NetworkRole.HOST
+                and existing.role is NetworkRole.HOST
+                and existing.port == network.port
             ):
                 raise LauncherError(
-                    f"TopBattle Host 端口 {settings.network_port} 已被实例 "
+                    f"Host 端口 {network.port} 已被实例 "
                     f"{instance.instance_id} 使用。"
+                )
+            if network.role is NetworkRole.CLIENT and existing == network:
+                raise LauncherError(
+                    f"Client UIN {network.uin} 已被实例 {instance.instance_id} "
+                    "用于同一房间，请修改 -MGFNetUin 后再启动。"
                 )
 
     def _acquire_debug_slot(self) -> DebugPortBundle:

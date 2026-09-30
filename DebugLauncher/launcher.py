@@ -15,29 +15,24 @@ from launcher_core import (
     ConfigurationError,
     ControllerSnapshot,
     DEBUG_WAIT_ARGUMENT,
-    DEFAULT_NETWORK_HOST,
-    DEFAULT_NETWORK_PORT,
     DEFAULT_SCRIPT_DEBUG_PORT,
     DebugPortBundle,
     LauncherController,
     LauncherError,
     LauncherSettings,
     NetworkRole,
-    TOP_BATTLE_ARGUMENT,
-    discover_argument_suggestions,
+    apply_network_preset,
+    format_argument_text,
     format_command_preview,
-    get_file_revision,
     is_valid_window_geometry,
     load_attach_configuration,
-    normalize_fixed_arguments,
-    try_discover_argument_suggestions,
+    parse_argument_text,
 )
 from persistent_debug_server import PersistentDebugOptions, run_embedded_debug_server
 
 
 TOOL_DIR = Path(__file__).resolve().parent
 CONFIG_PATH = TOOL_DIR / "settings.local.json"
-GAMES_INIT_PATH = TOOL_DIR.parents[1] / "Scripts" / "Games" / "init.lua"
 RUN_CONFIGURATION_PATH = TOOL_DIR.parents[1] / ".run" / "Lua.run.xml"
 
 
@@ -65,35 +60,12 @@ class DebugLauncherApp:
         self.debug_runtime_clients: dict[int, str] = {}
         self.default_debug_port: int | None = None
         self.status_after_id: str | None = None
-        self.game_arguments_after_id: str | None = None
-        self.games_init_revision = get_file_revision(GAMES_INIT_PATH)
         self.normal_window_geometry = ""
-        self.argument_suggestions = discover_argument_suggestions(
-            GAMES_INIT_PATH
-        )
-        self.game_arguments = tuple(
-            argument
-            for argument in self.argument_suggestions
-            if argument != DEBUG_WAIT_ARGUMENT
-        )
-        self.other_arguments = tuple(
-            argument
-            for argument in self.argument_suggestions
-            if argument == DEBUG_WAIT_ARGUMENT
-        )
 
         self.executable_var = tk.StringVar()
-        self.arguments: list[str] = []
-        self.argument_enabled: list[bool] = []
-        self.game_argument_var = tk.StringVar()
-        self.other_argument_vars = {
-            argument: tk.BooleanVar(value=False)
-            for argument in self.other_arguments
-        }
+        self.argument_text_var = tk.StringVar()
+        self.debug_wait_var = tk.BooleanVar(value=True)
         self.show_console_var = tk.BooleanVar(value=True)
-        self.network_role_var = tk.StringVar(value=NetworkRole.STANDALONE.value)
-        self.network_host_var = tk.StringVar(value=DEFAULT_NETWORK_HOST)
-        self.network_port_var = tk.StringVar(value=str(DEFAULT_NETWORK_PORT))
         self.preview_var = tk.StringVar()
         self.status_var = tk.StringVar(value="运行实例：0")
         self.debug_attach_status_var = tk.StringVar(
@@ -110,13 +82,10 @@ class DebugLauncherApp:
         self._refresh_preview()
         self._refresh_status()
         self._drain_events()
-        self.game_arguments_after_id = self.root.after(
-            500, self._watch_game_arguments
-        )
         self.root.after_idle(self._initialize_default_debug_service)
 
     def _configure_window(self) -> None:
-        self.root.title("AIFramework 调试启动器")
+        self.root.title("App 调试启动器")
         self.root.geometry("1100x850")
         self.root.minsize(900, 720)
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
@@ -150,92 +119,59 @@ class DebugLauncherApp:
             row=0, column=2, padx=(8, 0), pady=(0, 10)
         )
 
-        self.game_frame = ttk.LabelFrame(
+        argument_frame = ttk.LabelFrame(
             config_frame,
-            text="玩法参数（单选，来源：Scripts/Games/init.lua）",
-            padding=(10, 7),
+            text="App 启动参数",
+            padding=(10, 10),
         )
-        self.game_frame.grid(
+        argument_frame.grid(
             row=1,
             column=0,
             columnspan=3,
             sticky=tk.EW,
             pady=(0, 8),
         )
-        for column in range(3):
-            self.game_frame.columnconfigure(column, weight=1)
-        self._render_game_arguments()
-
-        network_frame = ttk.LabelFrame(
-            config_frame, text="TopBattle 网络", padding=(10, 7)
+        argument_frame.columnconfigure(0, weight=1)
+        self.arguments_entry = ttk.Entry(
+            argument_frame, textvariable=self.argument_text_var,
         )
-        network_frame.grid(
-            row=2, column=0, columnspan=3, sticky=tk.EW, pady=(0, 8)
+        self.arguments_entry.grid(row=0, column=0, sticky=tk.EW)
+        argument_scrollbar = ttk.Scrollbar(
+            argument_frame, orient=tk.HORIZONTAL, command=self.arguments_entry.xview,
         )
-        for index, (text, role) in enumerate(
-            (
-                ("单机", NetworkRole.STANDALONE),
-                ("登录联机", NetworkRole.LOGIN),
-                ("主机", NetworkRole.HOST),
-                ("客机", NetworkRole.CLIENT),
-            )
+        argument_scrollbar.grid(row=1, column=0, sticky=tk.EW)
+        self.arguments_entry.configure(xscrollcommand=argument_scrollbar.set)
+        presets = ttk.Frame(argument_frame)
+        presets.grid(row=2, column=0, sticky=tk.W, pady=(8, 0))
+        for label, role in (
+            ("填入 Host 参数", NetworkRole.HOST),
+            ("填入 Client 参数", NetworkRole.CLIENT),
+            ("清除网络参数", NetworkRole.STANDALONE),
         ):
-            ttk.Radiobutton(
-                network_frame,
-                text=text,
-                value=role.value,
-                variable=self.network_role_var,
-                command=self._on_network_changed,
-            ).grid(row=0, column=index, sticky=tk.W, padx=(0, 12))
-        ttk.Label(network_frame, text="地址").grid(row=0, column=3, padx=(12, 5))
-        self.network_host_entry = ttk.Entry(
-            network_frame, textvariable=self.network_host_var, width=20
-        )
-        self.network_host_entry.grid(row=0, column=4, padx=(0, 12))
-        ttk.Label(network_frame, text="端口").grid(row=0, column=5, padx=(0, 5))
-        self.network_port_entry = ttk.Entry(
-            network_frame, textvariable=self.network_port_var, width=8
-        )
-        self.network_port_entry.grid(row=0, column=6)
-        self.network_role_buttons = tuple(
-            child
-            for child in network_frame.winfo_children()
-            if isinstance(child, ttk.Radiobutton)
-        )
-
-        other_frame = ttk.LabelFrame(
+            ttk.Button(
+                presets, text=label,
+                command=lambda selected=role: self._apply_network_preset(selected),
+            ).pack(side=tk.LEFT, padx=(0, 8))
+        ttk.Label(
+            argument_frame,
+            text='直接输入参数（不含 exe）；含空格的值请加双引号。预设默认端口 7000、房间 1。',
+        ).grid(row=3, column=0, sticky=tk.W, pady=(8, 0))
+        ttk.Label(
+            argument_frame,
+            text="Client 默认地址 127.0.0.1、UIN 10001；多开时每个 Client 使用不同 UIN，且不能为 1。",
+        ).grid(row=4, column=0, sticky=tk.W, pady=(4, 0))
+        ttk.Checkbutton(
             config_frame,
-            text="其他启动参数（可多选）",
-            padding=(10, 7),
-        )
-        other_frame.grid(
-            row=3,
-            column=0,
-            columnspan=3,
-            sticky=tk.EW,
-            pady=(0, 10),
-        )
-        for column in range(3):
-            other_frame.columnconfigure(column, weight=1)
-        for index, argument in enumerate(self.other_arguments):
-            ttk.Checkbutton(
-                other_frame,
-                text=argument,
-                variable=self.other_argument_vars[argument],
-                command=self._refresh_preview,
-            ).grid(
-                row=index // 3,
-                column=index % 3,
-                sticky=tk.W,
-                padx=(0, 12),
-                pady=3,
-            )
+            text=f"等待 Lua 调试器连接（{DEBUG_WAIT_ARGUMENT}）",
+            variable=self.debug_wait_var,
+            command=self._refresh_preview,
+        ).grid(row=2, column=0, columnspan=3, sticky=tk.W, pady=(0, 10))
 
         ttk.Label(config_frame, text="命令预览").grid(
-            row=4, column=0, sticky=tk.W, padx=(0, 10)
+            row=3, column=0, sticky=tk.W, padx=(0, 10)
         )
         preview_frame = ttk.Frame(config_frame)
-        preview_frame.grid(row=4, column=1, columnspan=2, sticky=tk.EW)
+        preview_frame.grid(row=3, column=1, columnspan=2, sticky=tk.EW)
         preview_frame.columnconfigure(0, weight=1)
         self.preview_entry = ttk.Entry(
             preview_frame,
@@ -251,10 +187,10 @@ class DebugLauncherApp:
         ).grid(row=0, column=1, padx=(8, 0))
 
         options = ttk.Frame(config_frame)
-        options.grid(row=5, column=1, columnspan=2, sticky=tk.W, pady=(10, 0))
+        options.grid(row=4, column=1, columnspan=2, sticky=tk.W, pady=(10, 0))
         ttk.Checkbutton(
             options,
-            text="显示 AIFramework 控制台窗口",
+            text="显示 App 控制台窗口",
             variable=self.show_console_var,
         ).pack(side=tk.LEFT)
         ttk.Button(options, text="保存配置", command=self._save_only).pack(
@@ -408,8 +344,7 @@ class DebugLauncherApp:
         self.log_text.configure(yscrollcommand=scrollbar.set)
 
         self.executable_var.trace_add("write", lambda *_: self._refresh_preview())
-        self.network_host_var.trace_add("write", lambda *_: self._refresh_preview())
-        self.network_port_var.trace_add("write", lambda *_: self._refresh_preview())
+        self.argument_text_var.trace_add("write", lambda *_: self._refresh_preview())
 
     def _load_settings(self) -> None:
         try:
@@ -419,19 +354,19 @@ class DebugLauncherApp:
             self._append_log(f"配置读取失败，已显示默认值：{exc}", error=True)
             self.root.after(
                 50,
-                lambda: messagebox.showwarning(
+                lambda error=exc: messagebox.showwarning(
                     "配置文件无效",
-                    f"{exc}\n\n当前显示默认配置；点击“保存配置”可重新生成本地配置。",
+                    f"{error}\n\n当前显示默认配置；点击“保存配置”可重新生成本地配置。",
                     parent=self.root,
                 ),
             )
         self.executable_var.set(settings.executable)
-        self._set_arguments(settings.arguments, settings.argument_enabled)
+        self.debug_wait_var.set(DEBUG_WAIT_ARGUMENT in settings.enabled_arguments)
+        self.argument_text_var.set(format_argument_text(tuple(
+            argument for argument in settings.enabled_arguments
+            if argument != DEBUG_WAIT_ARGUMENT
+        )))
         self.show_console_var.set(settings.show_console)
-        self.network_role_var.set(settings.network_role.value)
-        self.network_host_var.set(settings.network_host)
-        self.network_port_var.set(str(settings.network_port))
-        self._update_network_controls()
         if settings.window_geometry:
             self.normal_window_geometry = settings.window_geometry
             self.root.geometry(settings.window_geometry)
@@ -440,24 +375,15 @@ class DebugLauncherApp:
     def _collect_settings(self) -> LauncherSettings:
         executable = os.path.expandvars(self.executable_var.get().strip())
         if not executable:
-            raise LauncherError("请选择 AIFramework 可执行文件。")
-        self._sync_argument_state()
-        try:
-            network_port = int(self.network_port_var.get().strip())
-        except ValueError as exc:
-            raise LauncherError("网络端口必须是整数。") from exc
-        role = NetworkRole(self.network_role_var.get())
-        if self.game_argument_var.get() != TOP_BATTLE_ARGUMENT:
-            role = NetworkRole.STANDALONE
+            raise LauncherError("请选择 App 可执行文件。")
+        arguments = parse_argument_text(self.argument_text_var.get())
+        if self.debug_wait_var.get() and DEBUG_WAIT_ARGUMENT not in arguments:
+            arguments += (DEBUG_WAIT_ARGUMENT,)
         return LauncherSettings(
             executable=executable,
-            arguments=tuple(self.arguments),
-            argument_enabled=tuple(self.argument_enabled),
+            arguments=arguments,
             show_console=bool(self.show_console_var.get()),
             window_geometry=self._current_window_geometry(),
-            network_role=role,
-            network_host=self.network_host_var.get().strip() or DEFAULT_NETWORK_HOST,
-            network_port=network_port,
         )
 
     def _save_settings(self) -> LauncherSettings:
@@ -564,7 +490,7 @@ class DebugLauncherApp:
         if snapshot.debug_ports is not None:
             self._start_debug_service(snapshot.debug_ports)
         self._append_log(
-            f"[实例 {snapshot.instance_id}] AIFramework 已启动，PID {snapshot.pid}。"
+            f"[实例 {snapshot.instance_id}] App 已启动，PID {snapshot.pid}。"
         )
 
     def _on_instance_stopped(self, result: object) -> None:
@@ -573,7 +499,7 @@ class DebugLauncherApp:
             return
         self.snapshots_by_id.pop(snapshot.instance_id, None)
         self._append_log(
-            f"[实例 {snapshot.instance_id}] AIFramework 已关闭。"
+            f"[实例 {snapshot.instance_id}] App 已关闭。"
             + (
                 f"退出码 {snapshot.exit_code}。"
                 if snapshot.exit_code is not None
@@ -596,7 +522,7 @@ class DebugLauncherApp:
         snapshots = result if isinstance(result, tuple) else ()
         for snapshot in snapshots:
             if isinstance(snapshot, ControllerSnapshot):
-                self._append_log(f"[实例 {snapshot.instance_id}] AIFramework 已关闭。")
+                self._append_log(f"[实例 {snapshot.instance_id}] App 已关闭。")
         self.snapshots_by_id.clear()
 
     def _initialize_default_debug_service(self) -> None:
@@ -830,7 +756,7 @@ class DebugLauncherApp:
         for instance_id in finished_ids:
             previous = self.snapshots_by_id[instance_id]
             self._append_log(
-                f"[实例 {instance_id}] AIFramework（PID {previous.pid}）已自然退出。"
+                f"[实例 {instance_id}] App（PID {previous.pid}）已自然退出。"
             )
         self.snapshots_by_id = current
         if snapshots:
@@ -865,19 +791,20 @@ class DebugLauncherApp:
             self.instance_tree.delete(item)
         role_labels = {
             NetworkRole.STANDALONE: "单机",
-            NetworkRole.LOGIN: "登录联机",
             NetworkRole.HOST: "主机",
             NetworkRole.CLIENT: "客机",
         }
         for instance_id, snapshot in self.snapshots_by_id.items():
             settings = snapshot.settings or LauncherSettings()
-            role = settings.network_role
-            if TOP_BATTLE_ARGUMENT not in settings.enabled_arguments:
-                role = NetworkRole.STANDALONE
+            network = settings.network
+            role = network.role
             if role is NetworkRole.HOST:
-                endpoint = f"监听 :{settings.network_port}"
+                endpoint = f"监听 :{network.port} / 房间 {network.room_id}"
             elif role is NetworkRole.CLIENT:
-                endpoint = f"{settings.network_host}:{settings.network_port}"
+                endpoint = (
+                    f"{network.host}:{network.port} / 房间 {network.room_id}"
+                    f" / UIN {network.uin}"
+                )
             else:
                 endpoint = "—"
             ports = snapshot.debug_ports
@@ -917,166 +844,32 @@ class DebugLauncherApp:
         if selected is not None and selected in self.snapshots_by_id:
             self.instance_tree.selection_set(str(selected))
 
-    def _render_game_arguments(self) -> None:
-        for child in self.game_frame.winfo_children():
-            child.destroy()
-        for index, argument in enumerate(self.game_arguments):
-            ttk.Radiobutton(
-                self.game_frame,
-                text=argument,
-                value=argument,
-                variable=self.game_argument_var,
-                command=self._on_game_changed,
-            ).grid(
-                row=index // 3,
-                column=index % 3,
-                sticky=tk.W,
-                padx=(0, 12),
-                pady=3,
-            )
-
-    def _watch_game_arguments(self) -> None:
-        if self.closing:
+    def _apply_network_preset(self, role: NetworkRole) -> None:
+        try:
+            arguments = parse_argument_text(self.argument_text_var.get())
+            self.argument_text_var.set(format_argument_text(
+                apply_network_preset(arguments, role)
+            ))
+        except LauncherError as exc:
+            self._show_error("填入参数失败", exc)
             return
-        self.game_arguments_after_id = None
-        revision = get_file_revision(GAMES_INIT_PATH)
-        if revision != self.games_init_revision:
-            self.games_init_revision = revision
-            self._reload_game_arguments()
-        self.game_arguments_after_id = self.root.after(
-            500, self._watch_game_arguments
-        )
-
-    def _reload_game_arguments(self) -> None:
-        suggestions = try_discover_argument_suggestions(GAMES_INIT_PATH)
-        if suggestions is None:
-            self._append_log(
-                "检测到 init.lua 变化，但文件暂时无法读取，已保留当前列表。",
-                error=True,
-            )
-            return
-        game_arguments = tuple(
-            argument
-            for argument in suggestions
-            if argument != DEBUG_WAIT_ARGUMENT
-        )
-        if not game_arguments:
-            self._append_log(
-                "检测到 init.lua 变化，但未解析到玩法参数，已保留当前列表。",
-                error=True,
-            )
-            return
-        if suggestions == self.argument_suggestions:
-            return
-
-        self._sync_argument_state()
-        saved_arguments = tuple(self.arguments)
-        saved_enabled = tuple(self.argument_enabled)
-        previous_game = self.game_argument_var.get()
-        self.argument_suggestions = suggestions
-        self.game_arguments = game_arguments
-        self._render_game_arguments()
-        self._set_arguments(saved_arguments, saved_enabled)
-        self._update_network_controls()
-        selected_game = self.game_argument_var.get()
-        detail = f"，当前选择：{selected_game}" if selected_game else ""
-        if previous_game and previous_game != selected_game:
-            detail = f"，原选择 {previous_game} 已移除，已切换为：{selected_game}"
-        self._append_log(
-            f"已从 init.lua 刷新 {len(self.game_arguments)} 个玩法参数{detail}。"
-        )
+        self.arguments_entry.xview_moveto(0)
+        self.arguments_entry.focus_set()
 
     def _refresh_preview(self) -> None:
-        self._sync_argument_state()
         try:
-            port = int(self.network_port_var.get().strip())
-            role = NetworkRole(self.network_role_var.get())
-            if self.game_argument_var.get() != TOP_BATTLE_ARGUMENT:
-                role = NetworkRole.STANDALONE
-            settings = LauncherSettings(
-                executable=os.path.expandvars(self.executable_var.get().strip()),
-                arguments=tuple(self.arguments),
-                argument_enabled=tuple(self.argument_enabled),
-                show_console=bool(self.show_console_var.get()),
-                network_role=role,
-                network_host=self.network_host_var.get().strip()
-                or DEFAULT_NETWORK_HOST,
-                network_port=port,
-            )
-        except (ConfigurationError, ValueError):
-            self.preview_var.set("网络地址或端口无效")
+            settings = self._collect_settings()
+        except LauncherError as exc:
+            self.preview_var.set(f"参数无效：{exc}")
             return
         self.preview_var.set(format_command_preview(settings))
-
-    def _on_game_changed(self) -> None:
-        self._update_network_controls()
-        self._refresh_preview()
-
-    def _on_network_changed(self) -> None:
-        self._update_network_controls()
-        self._refresh_preview()
-
-    def _update_network_controls(self) -> None:
-        is_top_battle = self.game_argument_var.get() == TOP_BATTLE_ARGUMENT
-        if not is_top_battle:
-            self.network_role_var.set(NetworkRole.STANDALONE.value)
-        role = NetworkRole(self.network_role_var.get())
-        role_state = tk.NORMAL if is_top_battle else tk.DISABLED
-        for button in self.network_role_buttons:
-            button.configure(state=role_state)
-        self.network_host_entry.configure(
-            state=tk.NORMAL
-            if is_top_battle and role is NetworkRole.CLIENT
-            else tk.DISABLED
-        )
-        self.network_port_entry.configure(
-            state=tk.NORMAL
-            if is_top_battle and role in (NetworkRole.HOST, NetworkRole.CLIENT)
-            else tk.DISABLED
-        )
-
-    def _set_arguments(
-        self,
-        arguments: tuple[str, ...],
-        enabled: tuple[bool, ...] | None = None,
-    ) -> None:
-        fixed_arguments, fixed_enabled = normalize_fixed_arguments(
-            self.argument_suggestions,
-            arguments,
-            enabled,
-            exclusive_arguments=self.game_arguments,
-        )
-        states = dict(zip(fixed_arguments, fixed_enabled))
-        selected_game = next(
-            (
-                argument
-                for argument in self.game_arguments
-                if states.get(argument, False)
-            ),
-            "",
-        )
-        self.game_argument_var.set(selected_game)
-        for argument, variable in self.other_argument_vars.items():
-            variable.set(states.get(argument, False))
-        self._sync_argument_state()
-        self._refresh_preview()
-
-    def _sync_argument_state(self) -> None:
-        selected_game = self.game_argument_var.get()
-        self.arguments = list(self.argument_suggestions)
-        self.argument_enabled = [
-            argument == selected_game
-            if argument in self.game_arguments
-            else bool(self.other_argument_vars[argument].get())
-            for argument in self.arguments
-        ]
 
     def _browse_executable(self) -> None:
         current = Path(self.executable_var.get().strip() or r"C:\MiniGame\Bin64")
         initial = current.parent if current.suffix else current
         selected = filedialog.askopenfilename(
             parent=self.root,
-            title="选择 AIFramework 可执行文件",
+            title="选择 App 可执行文件",
             initialdir=str(initial),
             filetypes=(("可执行文件", "*.exe"), ("所有文件", "*.*")),
         )
@@ -1124,9 +917,6 @@ class DebugLauncherApp:
             return
         self.closing = True
         close_errors: list[str] = []
-        if self.game_arguments_after_id is not None:
-            self.root.after_cancel(self.game_arguments_after_id)
-            self.game_arguments_after_id = None
         try:
             self.store.save_window_geometry(self._current_window_geometry())
         except ConfigurationError as exc:

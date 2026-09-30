@@ -16,25 +16,22 @@ from launcher_core import (  # noqa: E402
     ConfigStore,
     ConfigurationError,
     ControllerState,
+    DEFAULT_EXECUTABLE,
     DebugPortAllocator,
     DebugPortBundle,
     LauncherController,
     LauncherError,
     LauncherSettings,
+    NetworkOptions,
     NetworkRole,
     WindowsJobProcess,
+    apply_network_preset,
     build_launch_arguments,
     build_process_environment_overrides,
-    discover_argument_suggestions,
-    filter_argument_suggestions,
     format_argument_text,
     format_command_preview,
-    get_file_revision,
-    is_mgf_argument,
     load_attach_configuration,
-    normalize_fixed_arguments,
     parse_argument_text,
-    try_discover_argument_suggestions,
 )
 
 
@@ -73,72 +70,102 @@ class AttachConfigurationTests(unittest.TestCase):
 
 class ConfigStoreTests(unittest.TestCase):
     def test_missing_file_returns_defaults(self) -> None:
-        with tempfile.TemporaryDirectory(dir=Path(__file__).parent) as directory:
+        with tempfile.TemporaryDirectory() as directory:
             store = ConfigStore(Path(directory) / "settings.json")
             self.assertEqual(store.load(), LauncherSettings())
+            self.assertEqual(store.load().executable, DEFAULT_EXECUTABLE)
 
     def test_settings_round_trip(self) -> None:
+        arguments = (
+            "-MGFNetRole", "Client", "-MGFNetHost", "192.168.1.25",
+            "-MGFNetPort", "7001", "-MGFNetRoomId", "3", "-MGFNetUin", "10002",
+            "-Custom", "value with spaces", "", 'a"b', "-script-debug-wait-client",
+        )
         settings = LauncherSettings(
-            executable=r"C:\Program Files\MiniGame\AIFramework_d.exe",
-            arguments=("-MGFTopBattle", "value with spaces", "", 'a"b'),
-            argument_enabled=(True, False, True, False),
+            executable=r"C:\Program Files\MiniGame\AICore_profile.exe",
+            arguments=arguments,
+            argument_enabled=(*([True] * (len(arguments) - 1)), False),
             show_console=False,
             window_geometry="1024x768+120-40",
-            network_role=NetworkRole.CLIENT,
-            network_host="192.168.1.25",
-            network_port=19121,
         )
-        with tempfile.TemporaryDirectory(dir=Path(__file__).parent) as directory:
+        with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "settings.json"
             store = ConfigStore(path)
             store.save(settings)
             self.assertEqual(store.load(), settings)
+            self.assertEqual(store.load().network, NetworkOptions(
+                NetworkRole.CLIENT, "192.168.1.25", 7001, 3, 10002,
+            ))
             raw = json.loads(path.read_text(encoding="utf-8"))
-            self.assertEqual(raw["version"], 1)
-            self.assertIsInstance(raw["arguments"], list)
-            self.assertEqual(raw["argument_enabled"], [True, False, True, False])
-            self.assertEqual(raw["window_geometry"], "1024x768+120-40")
-            self.assertEqual(raw["network_role"], "client")
-            self.assertEqual(raw["network_host"], "192.168.1.25")
-            self.assertEqual(raw["network_port"], 19121)
+            self.assertEqual(raw["version"], 2)
+            self.assertEqual(raw["arguments"], list(arguments))
+            self.assertNotIn("network_role", raw)
 
-    def test_login_settings_round_trip(self) -> None:
-        settings = LauncherSettings(network_role=NetworkRole.LOGIN)
-        with tempfile.TemporaryDirectory(dir=Path(__file__).parent) as directory:
+    def test_legacy_settings_drop_gameplay_and_keep_window_and_debug_option(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "settings.json"
+            path.write_text(json.dumps({
+                "version": 1,
+                "executable": r"C:\MiniGame\Bin64\AIFramework_d.exe",
+                "arguments": ["-MGFTopBattle", "-OtherGame", "-script-debug-wait-client"],
+                "argument_enabled": [True, False, True],
+                "show_console": False,
+                "window_geometry": "1100x850+120-40",
+                "network_role": "login",
+                "network_port": 19120,
+            }), encoding="utf-8")
             store = ConfigStore(path)
-            store.save(settings)
-            self.assertEqual(store.load(), settings)
-            raw = json.loads(path.read_text(encoding="utf-8"))
-            self.assertEqual(raw["network_role"], "login")
+            loaded = store.load()
+            self.assertEqual(loaded.executable, DEFAULT_EXECUTABLE)
+            self.assertEqual(loaded.enabled_arguments, ("-script-debug-wait-client",))
+            self.assertEqual(loaded.network.role, NetworkRole.STANDALONE)
+            self.assertEqual(loaded.window_geometry, "1100x850+120-40")
+            self.assertFalse(loaded.show_console)
+            store.save(loaded)
+            self.assertEqual(store.load(), loaded)
 
-    def test_legacy_settings_without_geometry_still_load(self) -> None:
-        with tempfile.TemporaryDirectory(dir=Path(__file__).parent) as directory:
+    def test_legacy_network_roles_migrate_to_new_app_arguments(self) -> None:
+        for role, port in (("host", 19120), ("client", 20002)):
+            with self.subTest(role=role), tempfile.TemporaryDirectory() as directory:
+                path = Path(directory) / "settings.json"
+                path.write_text(json.dumps({
+                    "version": 1,
+                    "executable": r"C:\custom\AICore_d.exe",
+                    "arguments": ["-MGFTopBattle", "-script-debug-wait-client"],
+                    "argument_enabled": [True, False],
+                    "network_role": role,
+                    "network_host": "10.0.0.8",
+                    "network_port": port,
+                }), encoding="utf-8")
+                loaded = ConfigStore(path).load()
+                self.assertEqual(loaded.executable, r"C:\custom\AICore_d.exe")
+                self.assertEqual(loaded.network.role, NetworkRole(role))
+                self.assertEqual(loaded.network.port, 7000 if role == "host" else 20002)
+                self.assertEqual(loaded.network.room_id, 1)
+                self.assertNotIn("-script-debug-wait-client", loaded.enabled_arguments)
+                self.assertNotIn("-MGFTopBattle", loaded.arguments)
+                if role == "client":
+                    self.assertEqual(loaded.network.host, "10.0.0.8")
+                    self.assertEqual(loaded.network.uin, 10001)
+
+    def test_legacy_settings_without_optional_fields_still_load(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "settings.json"
-            path.write_text(
-                json.dumps(
-                    {
-                        "version": 1,
-                        "executable": r"C:\MiniGame\Bin64\AIFramework_d.exe",
-                        "arguments": ["-MGFTopBattle"],
-                        "show_console": True,
-                    }
-                ),
-                encoding="utf-8",
-            )
+            path.write_text(json.dumps({
+                "version": 1,
+                "executable": DEFAULT_EXECUTABLE,
+                "arguments": ["-MGFTopBattle"],
+            }), encoding="utf-8")
             loaded = ConfigStore(path).load()
             self.assertEqual(loaded.window_geometry, "")
-            self.assertEqual(loaded.argument_enabled, (True,))
-            self.assertEqual(loaded.network_role, NetworkRole.STANDALONE)
-            self.assertEqual(loaded.network_host, "127.0.0.1")
-            self.assertEqual(loaded.network_port, 19120)
+            self.assertEqual(loaded.enabled_arguments, ())
+            self.assertEqual(loaded.network, NetworkOptions())
 
     def test_save_window_geometry_preserves_other_settings(self) -> None:
-        with tempfile.TemporaryDirectory(dir=Path(__file__).parent) as directory:
-            path = Path(directory) / "settings.json"
-            store = ConfigStore(path)
+        with tempfile.TemporaryDirectory() as directory:
+            store = ConfigStore(Path(directory) / "settings.json")
             original = LauncherSettings(
-                executable=r"C:\custom\AIFramework.exe",
+                executable=r"C:\custom\App.exe",
                 arguments=("-CustomMode",),
                 argument_enabled=(False,),
                 show_console=False,
@@ -153,261 +180,109 @@ class ConfigStoreTests(unittest.TestCase):
             self.assertEqual(loaded.window_geometry, "900x690-1500+80")
 
     def test_invalid_window_geometry_is_rejected(self) -> None:
-        with tempfile.TemporaryDirectory(dir=Path(__file__).parent) as directory:
-            path = Path(directory) / "settings.json"
-            store = ConfigStore(path)
+        with tempfile.TemporaryDirectory() as directory:
+            store = ConfigStore(Path(directory) / "settings.json")
             with self.assertRaises(ConfigurationError):
                 store.save(LauncherSettings(window_geometry="900x690"))
 
     def test_invalid_settings_are_rejected(self) -> None:
-        with tempfile.TemporaryDirectory(dir=Path(__file__).parent) as directory:
+        with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "settings.json"
-            path.write_text('{"version": 1, "arguments": "bad"}', encoding="utf-8")
+            path.write_text('{"version": 2, "arguments": "bad"}', encoding="utf-8")
             with self.assertRaises(ConfigurationError):
                 ConfigStore(path).load()
 
     def test_mismatched_argument_enabled_list_is_rejected(self) -> None:
-        with tempfile.TemporaryDirectory(dir=Path(__file__).parent) as directory:
-            path = Path(directory) / "settings.json"
-            path.write_text(
-                json.dumps(
-                    {
-                        "version": 1,
-                        "executable": r"C:\MiniGame\Bin64\AIFramework_d.exe",
-                        "arguments": ["-MGFTopBattle"],
-                        "argument_enabled": [True, False],
-                    }
-                ),
-                encoding="utf-8",
-            )
-            with self.assertRaises(ConfigurationError):
-                ConfigStore(path).load()
+        for version in (1, 2):
+            with self.subTest(version=version), tempfile.TemporaryDirectory() as directory:
+                path = Path(directory) / "settings.json"
+                path.write_text(json.dumps({
+                    "version": version,
+                    "executable": DEFAULT_EXECUTABLE,
+                    "arguments": ["-Custom"],
+                    "argument_enabled": [True, False],
+                }), encoding="utf-8")
+                with self.assertRaises(ConfigurationError):
+                    ConfigStore(path).load()
 
 
 class ArgumentTests(unittest.TestCase):
-    def test_discovers_ordered_game_arguments_from_app_configs(self) -> None:
-        with tempfile.TemporaryDirectory(dir=Path(__file__).parent) as directory:
-            games_init_path = Path(directory) / "init.lua"
-            games_init_path.write_text(
-                "Games.AppConfigs = {\n"
-                '    { "MGFDebugSandbox", function() return require("A") end },\n'
-                "    -- { \"CommentedOut\", function() return require(\"B\") end },\n"
-                "    { 'MiniguiUI', function() return require('C') end },\n"
-                '    { "MGFTopBattle", function() return require("D") end },\n'
-                "}\n"
-                'if Engine.HasArgs("MGFAutoInput") then end\n',
-                encoding="utf-8",
-            )
+    def test_host_preset_matches_start_aicore_host_bat(self) -> None:
+        expected = ("-MGFNetRole", "Host", "-MGFNetPort", "7000", "-MGFNetRoomId", "1")
+        arguments = apply_network_preset((), NetworkRole.HOST)
+        self.assertEqual(arguments, expected)
+        settings = LauncherSettings(arguments=arguments)
+        self.assertEqual(build_launch_arguments(settings), expected)
+        self.assertEqual(settings.network.role, NetworkRole.HOST)
 
-            suggestions = discover_argument_suggestions(games_init_path)
-            self.assertEqual(
-                suggestions,
-                (
-                    "-MGFDebugSandbox",
-                    "-MiniguiUI",
-                    "-MGFTopBattle",
-                    "-script-debug-wait-client",
-                ),
-            )
+    def test_client_preset_matches_start_aicore_client_bat(self) -> None:
+        expected = (
+            "-MGFNetRole", "Client", "-MGFNetHost", "127.0.0.1",
+            "-MGFNetPort", "7000", "-MGFNetRoomId", "1", "-MGFNetUin", "10001",
+        )
+        arguments = apply_network_preset((), NetworkRole.CLIENT)
+        self.assertEqual(arguments, expected)
+        settings = LauncherSettings(arguments=arguments)
+        self.assertEqual(build_launch_arguments(settings), expected)
+        self.assertEqual(settings.network, NetworkOptions(role=NetworkRole.CLIENT))
 
-    def test_missing_games_init_falls_back_to_default_arguments(self) -> None:
-        with tempfile.TemporaryDirectory(dir=Path(__file__).parent) as directory:
-            missing_path = Path(directory) / "missing.lua"
-            suggestions = discover_argument_suggestions(missing_path)
-            self.assertIsNone(try_discover_argument_suggestions(missing_path))
-            self.assertEqual(
-                suggestions,
-                ("-MGFTopBattle", "-script-debug-wait-client"),
-            )
+    def test_switching_presets_preserves_custom_options_without_stale_network_flags(self) -> None:
+        custom = ("-App", "value with spaces", "-script-debug-wait-client")
+        client = NetworkOptions(NetworkRole.CLIENT, "10.0.0.8", 7002, 5, 10008).arguments()
+        host = apply_network_preset(custom + client, NetworkRole.HOST)
+        self.assertEqual(host, (
+            "-MGFNetRole", "Host", "-MGFNetPort", "7000", "-MGFNetRoomId", "1", *custom,
+        ))
+        self.assertEqual(apply_network_preset(host, NetworkRole.STANDALONE), custom)
 
-    def test_file_revision_tracks_replace_and_removal(self) -> None:
-        with tempfile.TemporaryDirectory(dir=Path(__file__).parent) as directory:
-            path = Path(directory) / "init.lua"
-            self.assertIsNone(get_file_revision(path))
+    def test_custom_app_arguments_are_preserved_without_gameplay_selection(self) -> None:
+        arguments = ("-App", "My App", "-UserData", r"C:\User Data\profile", "", "中文参数")
+        settings = LauncherSettings(arguments=arguments)
+        self.assertEqual(build_launch_arguments(settings), arguments)
+        self.assertEqual(settings.network.role, NetworkRole.STANDALONE)
+        self.assertNotIn("-MGFTopBattle", LauncherSettings().arguments)
 
-            path.write_text("first\n", encoding="utf-8")
-            first_revision = get_file_revision(path)
-            self.assertIsNotNone(first_revision)
-            self.assertEqual(get_file_revision(path), first_revision)
+    def test_edited_network_values_drive_metadata_and_launch(self) -> None:
+        arguments = parse_argument_text(
+            '-MGFNetRole Client -MGFNetHost 10.0.0.8 -MGFNetPort 7002 '
+            '-MGFNetRoomId 12 -MGFNetUin 20002 -App "Custom App"'
+        )
+        settings = LauncherSettings(arguments=arguments)
+        self.assertEqual(settings.network, NetworkOptions(NetworkRole.CLIENT, "10.0.0.8", 7002, 12, 20002))
+        self.assertEqual(build_launch_arguments(settings), arguments)
 
-            replacement = path.with_suffix(".tmp")
-            replacement.write_text("second version\n", encoding="utf-8")
-            replacement.replace(path)
-            self.assertNotEqual(get_file_revision(path), first_revision)
-
-            path.unlink()
-            self.assertIsNone(get_file_revision(path))
-
-    def test_filters_argument_completion_with_or_without_dash(self) -> None:
-        suggestions = (
-            "-MGFAutoInput",
-            "-MGFTopBattle",
-            "-script-debug-wait-client",
+    def test_invalid_network_values_are_rejected(self) -> None:
+        invalid = (
+            ("-MGFNetRole",), ("-MGFNetRole", "invalid"),
+            ("-MGFNetPort", "0"), ("-MGFNetPort", "65536"),
+            ("-MGFNetPort", "abc"), ("-MGFNetPort", "-MGFNetRoomId", "1"),
+            ("-MGFNetHost", ""), ("-MGFNetRoomId", "0"),
+            ("-MGFNetRole", "Client", "-MGFNetUin", "1"),
+            ("-MGFNetUin", "-2"), ("-MGFNetUin", "abc"),
+            ("-MGFNetPort", "7000", "-MGFNetPort", "7001"),
+            ("-lua-debug-port", "3382"),
         )
-        self.assertEqual(
-            filter_argument_suggestions("-MGFT", suggestions),
-            ("-MGFTopBattle",),
-        )
-        self.assertEqual(
-            filter_argument_suggestions("MGFT", suggestions),
-            ("-MGFTopBattle",),
-        )
-        self.assertEqual(filter_argument_suggestions("", suggestions), suggestions)
-
-    def test_fixed_arguments_list_every_option_and_select_one_mgf(self) -> None:
-        available = (
-            "-MGFAutoInput",
-            "-MGFTopBattle",
-            "-script-debug-wait-client",
-            "-TestScene",
-        )
-        arguments, enabled = normalize_fixed_arguments(
-            available,
-            (
-                "-CustomArgument",
-                "-MGFTopBattle",
-                "-MGFAutoInput",
-                "-TestScene",
-            ),
-            (True, True, True, True),
-        )
-
-        self.assertEqual(arguments, available)
-        enabled_arguments = tuple(
-            argument
-            for argument, state in zip(arguments, enabled)
-            if state
-        )
-        self.assertEqual(
-            tuple(filter(is_mgf_argument, enabled_arguments)),
-            ("-MGFTopBattle",),
-        )
-        self.assertIn("-script-debug-wait-client", enabled_arguments)
-        self.assertIn("-TestScene", enabled_arguments)
-        self.assertNotIn("-CustomArgument", arguments)
-
-    def test_all_game_routes_are_exclusive_even_without_mgf_prefix(self) -> None:
-        available = (
-            "-MGFDebugSandbox",
-            "-MiniguiUI",
-            "-PhysicsSmoke",
-            "-script-debug-wait-client",
-        )
-        arguments, enabled = normalize_fixed_arguments(
-            available,
-            ("-MiniguiUI", "-PhysicsSmoke", "-script-debug-wait-client"),
-            (True, True, True),
-            exclusive_arguments=available[:-1],
-        )
-
-        enabled_arguments = tuple(
-            argument
-            for argument, state in zip(arguments, enabled)
-            if state
-        )
-        self.assertEqual(
-            enabled_arguments,
-            ("-MiniguiUI", "-script-debug-wait-client"),
-        )
-
-    def test_fixed_arguments_default_to_top_battle(self) -> None:
-        arguments, enabled = normalize_fixed_arguments(
-            (
-                "-MGFAutoInput",
-                "-MGFTopBattle",
-                "-script-debug-wait-client",
-            )
-        )
-        enabled_arguments = tuple(
-            argument
-            for argument, state in zip(arguments, enabled)
-            if state
-        )
-        self.assertEqual(
-            enabled_arguments,
-            ("-MGFTopBattle", "-script-debug-wait-client"),
-        )
+        for arguments in invalid:
+            with self.subTest(arguments=arguments), self.assertRaises(ConfigurationError):
+                LauncherSettings(arguments=arguments)
 
     def test_disabled_arguments_are_omitted_from_command_preview(self) -> None:
         settings = LauncherSettings(
-            executable=r"C:\MiniGame\Bin64\AIFramework_d.exe",
-            arguments=("-MGFTopBattle", "-script-debug-wait-client"),
+            arguments=("-Custom", "-script-debug-wait-client"),
             argument_enabled=(False, True),
         )
-        self.assertNotIn("-MGFTopBattle", format_command_preview(settings))
+        self.assertNotIn("-Custom", format_command_preview(settings))
         self.assertIn("-script-debug-wait-client", format_command_preview(settings))
 
-    def test_top_battle_host_arguments_are_exact(self) -> None:
-        settings = LauncherSettings(
-            network_role=NetworkRole.HOST,
-            network_port=20001,
-        )
-        self.assertEqual(
-            build_launch_arguments(settings),
-            (
-                "-MGFTopBattle",
-                "-script-debug-wait-client",
-                "-TopBattleNetworkHost",
-                "-TopBattleListenPort",
-                "20001",
-            ),
-        )
-
-    def test_top_battle_client_arguments_are_exact(self) -> None:
-        settings = LauncherSettings(
-            network_role=NetworkRole.CLIENT,
-            network_host="10.0.0.8",
-            network_port=20002,
-        )
-        self.assertEqual(
-            build_launch_arguments(settings),
-            (
-                "-MGFTopBattle",
-                "-script-debug-wait-client",
-                "-TopBattleNetworkClient",
-                "-TopBattleHost",
-                "10.0.0.8",
-                "-TopBattlePort",
-                "20002",
-            ),
-        )
-
-    def test_top_battle_interactive_login_arguments_are_exact(self) -> None:
-        settings = LauncherSettings(network_role=NetworkRole.LOGIN)
-        self.assertEqual(
-            build_launch_arguments(settings),
-            (
-                "-MGFTopBattle",
-                "-script-debug-wait-client",
-                "-TopBattleNetworkLogin",
-            ),
-        )
-
-    def test_non_top_battle_forces_standalone_arguments(self) -> None:
-        settings = LauncherSettings(
-            arguments=("-MGFDebugSandbox",),
-            network_role=NetworkRole.HOST,
-        )
-        self.assertEqual(build_launch_arguments(settings), ("-MGFDebugSandbox",))
-
     def test_preview_and_launch_share_argument_builder(self) -> None:
-        settings = LauncherSettings(network_role=NetworkRole.HOST)
+        settings = LauncherSettings(arguments=("-MGFNetRole", "Host", "-App", "App with spaces"))
         ports = DebugPortBundle(3382, 3383, 4711)
         preview = format_command_preview(settings, ports)
-        for argument in build_launch_arguments(settings, ports):
-            self.assertIn(argument, preview)
+        self.assertEqual(parse_argument_text(preview), (settings.executable, *build_launch_arguments(settings, ports)))
 
     def test_windows_argument_round_trip(self) -> None:
-        expected = (
-            "-MGFTopBattle",
-            "value with spaces",
-            "",
-            'embedded"quote',
-            "trailing\\",
-            "中文参数",
-        )
-        rendered = format_argument_text(expected)
-        self.assertEqual(parse_argument_text(rendered), expected)
+        expected = ("-App", "value with spaces", "", 'embedded"quote', "trailing\\", "中文参数", "&", "%PATH%")
+        self.assertEqual(parse_argument_text(format_argument_text(expected)), expected)
 
     def test_blank_text_is_empty_argument_list(self) -> None:
         self.assertEqual(parse_argument_text("   "), ())
@@ -533,7 +408,6 @@ class LauncherControllerTests(unittest.TestCase):
         self.assertEqual(
             self.factory.calls[0][1],
             (
-                "-MGFTopBattle",
                 "-script-debug-wait-client",
                 "-lua-debug-port",
                 "3382",
@@ -591,7 +465,7 @@ class LauncherControllerTests(unittest.TestCase):
 
     def test_start_passes_only_checked_arguments_plus_debug_port(self) -> None:
         settings = LauncherSettings(
-            arguments=("-MGFTopBattle", "-script-debug-wait-client"),
+            arguments=("-Custom", "-script-debug-wait-client"),
             argument_enabled=(False, True),
         )
         self.controller.start(settings)
@@ -602,9 +476,7 @@ class LauncherControllerTests(unittest.TestCase):
 
     def test_restart_keeps_instance_original_settings_and_ports(self) -> None:
         settings = LauncherSettings(
-            network_role=NetworkRole.CLIENT,
-            network_host="10.0.0.2",
-            network_port=20000,
+            arguments=NetworkOptions(NetworkRole.CLIENT, "10.0.0.2", 20000).arguments(),
         )
         started = self.controller.start(settings)
         restarted = self.controller.restart(started.instance_id)
@@ -625,54 +497,50 @@ class LauncherControllerTests(unittest.TestCase):
         self.assertEqual(replacement.debug_ports, started.debug_ports)
 
     def test_duplicate_host_port_is_rejected(self) -> None:
-        host = LauncherSettings(network_role=NetworkRole.HOST)
+        host = LauncherSettings(arguments=NetworkOptions(role=NetworkRole.HOST).arguments())
         self.controller.start(host)
         with self.assertRaises(LauncherError):
             self.controller.start(host)
         self.assertEqual(len(self.factory.created), 1)
 
     def test_same_port_is_allowed_for_clients(self) -> None:
-        client = LauncherSettings(network_role=NetworkRole.CLIENT)
+        client = LauncherSettings(arguments=NetworkOptions(role=NetworkRole.CLIENT).arguments())
         self.controller.start(client)
-        self.controller.start(client)
+        self.controller.start(LauncherSettings(
+            arguments=NetworkOptions(role=NetworkRole.CLIENT, uin=10002).arguments(),
+        ))
         self.assertEqual(len(self.factory.created), 2)
 
     def test_launched_games_receive_unique_selectable_mcp_names(self) -> None:
-        client = LauncherSettings(network_role=NetworkRole.CLIENT)
-        host = LauncherSettings(network_role=NetworkRole.HOST)
+        client = LauncherSettings(arguments=NetworkOptions(role=NetworkRole.CLIENT).arguments())
+        host = LauncherSettings(arguments=NetworkOptions(role=NetworkRole.HOST).arguments())
         client_ports = DebugPortBundle(3382, 3383, 4711)
         host_ports = DebugPortBundle(3384, 3385, 4712)
 
         self.assertEqual(
             build_process_environment_overrides(client, client_ports),
-            {"MINIGAME_MCP_CLIENT_NAME": "AIFramework-CLIENT-3382"},
+            {"MINIGAME_MCP_CLIENT_NAME": "AICore_profile-CLIENT-3382"},
         )
         self.assertEqual(
             build_process_environment_overrides(host, host_ports),
-            {"MINIGAME_MCP_CLIENT_NAME": "AIFramework-HOST-3384"},
+            {"MINIGAME_MCP_CLIENT_NAME": "AICore_profile-HOST-3384"},
         )
 
         self.controller.start(client)
         self.assertEqual(
             self.factory.calls[0][3],
-            {"MINIGAME_MCP_CLIENT_NAME": "AIFramework-CLIENT-3382"},
+            {"MINIGAME_MCP_CLIENT_NAME": "AICore_profile-CLIENT-3382"},
         )
 
-    def test_login_role_starts_without_direct_network_endpoint(self) -> None:
-        login = LauncherSettings(network_role=NetworkRole.LOGIN)
-        self.controller.start(login)
-        self.controller.start(login)
+    def test_duplicate_client_uin_in_same_room_is_rejected(self) -> None:
+        client = LauncherSettings(arguments=NetworkOptions(role=NetworkRole.CLIENT).arguments())
+        started = self.controller.start(client)
+        with self.assertRaisesRegex(LauncherError, "UIN 10001"):
+            self.controller.start(client)
+        self.assertEqual(len(self.factory.created), 1)
+        self.controller.stop(started.instance_id)
+        self.controller.start(client)
         self.assertEqual(len(self.factory.created), 2)
-        self.assertEqual(
-            self.factory.calls[0][1],
-            (
-                "-MGFTopBattle",
-                "-script-debug-wait-client",
-                "-TopBattleNetworkLogin",
-                "-lua-debug-port",
-                "3382",
-            ),
-        )
 
     def test_stop_all(self) -> None:
         self.controller.start(self.settings)
@@ -712,6 +580,32 @@ class LauncherControllerTests(unittest.TestCase):
 
 @unittest.skipUnless(sys.platform == "win32", "Windows Job Object integration test")
 class WindowsJobProcessTests(unittest.TestCase):
+    def test_app_arguments_reach_windows_process_without_shell_expansion(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "received arguments.json"
+            expected = ["value with spaces", "中文参数", 'embedded"quote', "", "&", "%PATH%", "trailing\\"]
+            arguments = (
+                "-I", "-c",
+                "import json,pathlib,sys; "
+                "pathlib.Path(sys.argv[1]).write_text("
+                "json.dumps(sys.argv[2:],ensure_ascii=False),encoding='utf-8')",
+                str(output), *expected,
+            )
+            settings = LauncherSettings(
+                executable=sys.executable,
+                arguments=parse_argument_text(format_argument_text(arguments)),
+                show_console=False,
+            )
+            process = WindowsJobProcess.launch(
+                settings.executable, build_launch_arguments(settings), show_console=False,
+            )
+            try:
+                self.assertTrue(process.wait(10000))
+                self.assertEqual(process.poll(), 0)
+                self.assertEqual(json.loads(output.read_text(encoding="utf-8")), expected)
+            finally:
+                process.close()
+
     def test_launch_applies_environment_overrides(self) -> None:
         process = WindowsJobProcess.launch(
             sys.executable,
