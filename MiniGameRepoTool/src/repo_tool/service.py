@@ -4,14 +4,17 @@ import threading
 from pathlib import Path
 from typing import Callable
 
-from .acceleration import Initializer, InitPlan, SourceScanner
+from .acceleration import InitFailure, Initializer, InitPlan, SourceScanner
 from .checks import ParallelChecks
 from .force_update import ForceUpdate
 from .git_ops import GitClient, Inspector
 from .models import Profile, RepoResult, Snapshot, validate_profile
-from .process import ProcessRunner, redact
+from .process import ProcessResult, ProcessRunner, redact
 from .setup import SetupRunner
 from .storage import RunJournal, RunLock
+
+# Checkout leaves LFS pointers; one batched `git lfs pull` then downloads them concurrently.
+SKIP_SMUDGE = {"GIT_LFS_SKIP_SMUDGE": "1"}
 
 
 class RepoService:
@@ -26,12 +29,61 @@ class RepoService:
         self.runner = ProcessRunner(self._log, self.cancel)
         self.git = GitClient(self.runner)
         self.inspector = Inspector(self.git)
+        self.journal_lock = threading.Lock()
+        self.lfs_available: bool | None = None
 
     def _log(self, line: str):
         line = redact(line)
-        if self.journal:
-            self.journal.log(self.current, line)
+        self._journal_log(self.current, line)
         self.emit("log", (self.current, line))
+
+    def _journal_log(self, repo_id: str, line: str) -> None:
+        journal = self.journal
+        if journal:
+            with self.journal_lock:
+                journal.log(repo_id, line)
+
+    def _prefetch(self, profile: Profile, selected: list[str]) -> dict[str, Snapshot]:
+        """Fetch every selected repository concurrently before any worktree changes."""
+        def emit(kind, payload):
+            if kind == "log":
+                self._journal_log(*payload)
+            self.emit(kind, payload)
+        return ParallelChecks(emit, self.stop, self.cancel).run(profile, selected, True)
+
+    def _snapshot_for_sync(self, profile: Profile, repo_id: str, prefetched: Snapshot | None) -> Snapshot:
+        if prefetched is not None and prefetched.action == "error":
+            # A failed fetch must not fall back to stale remote-tracking refs.
+            self.current = repo_id
+            return prefetched
+        if prefetched is not None and prefetched.runnable:
+            # Refs are fresh; re-read local state since earlier repositories may have changed disk.
+            snap = self._inspect(profile, repo_id, False)
+            if snap.action != "check":
+                snap.remote_checked = snap.remote_checked or prefetched.remote_checked
+                return snap
+        return self._inspect(profile, repo_id, True)
+
+    def _has_lfs(self) -> bool:
+        if self.lfs_available is None:
+            self.lfs_available = self.git.run(["lfs", "version"]).returncode == 0
+        return self.lfs_available
+
+    def _pull_lfs(self, path: Path) -> tuple[ProcessResult | None, int]:
+        """Batch-download LFS objects for HEAD; return a failed step or the unfilled count."""
+        self._log("批量下载并检出 LFS 文件")
+        result = self.git.run(["lfs", "pull"], path, network=True, stream=True)
+        if result.returncode:
+            return result, 0
+        listing = self.git.run(["lfs", "ls-files", "--json"], path, unbounded=True)
+        if listing.returncode:
+            return listing, 0
+        try:
+            files = Initializer._lfs_files(listing.output)
+        except InitFailure as failure:
+            listing.returncode, listing.output = 1, failure.message
+            return listing, 0
+        return None, sum(1 for item in files if not item.get("checkout"))
 
     def _inspect(self, profile: Profile, repo_id: str, remote: bool) -> Snapshot:
         self.current = repo_id
@@ -90,6 +142,10 @@ class RepoService:
         if snap.action == "none":
             return RepoResult(repo_id, "success", snap.message, snap)
         details, note = {}, ""
+        lfs = self._has_lfs()
+        skip_smudge = SKIP_SMUDGE if lfs else None
+        lfs_failure: ProcessResult | None = None
+        unfilled = 0
         if snap.action == "clone":
             # Git rejects a destination that acquired content after inspection.
             path.parent.mkdir(parents=True, exist_ok=True)
@@ -109,7 +165,9 @@ class RepoService:
                 note = init.message
             command = ["clone", "--progress", "--single-branch", "--branch", snap.target_branch,
                        "--", repo.remote, str(path)]
-            result = self.git.run(command, network=True, stream=True)
+            result = self.git.run(command, network=True, stream=True, environment=skip_smudge)
+            if result.returncode == 0 and lfs:
+                lfs_failure, unfilled = self._pull_lfs(path)
         else:
             # Recheck after fetch, immediately before changing the worktree.
             fresh = self._inspect(profile, repo_id, False)
@@ -142,13 +200,18 @@ class RepoService:
             args = (["switch", "--no-overwrite-ignore", snap.target_branch] if not exists.returncode else
                     ["switch", "--no-overwrite-ignore", "--track", "-c", snap.target_branch,
                      "origin/" + snap.target_branch])
-            result = self.git.run(args, path, stream=True)
+            result = self.git.run(args, path, stream=True, environment=skip_smudge)
             if result.returncode == 0:
                 result = self.git.run(["merge", "--ff-only", "--no-overwrite-ignore", snap.remote_oid],
-                                      path, stream=True)
+                                      path, stream=True, environment=skip_smudge)
             if result.returncode == 0:
                 result = self.git.run(["branch", "--set-upstream-to=origin/" + snap.target_branch,
                                        snap.target_branch], path, stream=True)
+            if result.returncode == 0 and lfs:
+                lfs_failure, unfilled = self._pull_lfs(path)
+        if lfs_failure is not None:
+            note = (note + "。" if note else "") + "Git 数据已就位，LFS 下载失败，可在该仓库执行 git lfs pull 补齐"
+            result = lfs_failure
         if result.returncode:
             message = "操作已中断，请重新检查" if result.cancelled else redact(result.output[-2000:])
             return RepoResult(repo_id, "cancelled" if result.cancelled else "failed",
@@ -156,7 +219,9 @@ class RepoService:
                               snap, details)
         after = self._inspect(profile, repo_id, False)
         message = after.message if after.ready else "操作后需要重新处理：" + after.message
-        return RepoResult(repo_id, "success" if after.ready else "blocked",
+        if unfilled:
+            message += f"；仍有 {unfilled} 个 LFS 文件未填充，请在该仓库执行 git lfs pull"
+        return RepoResult(repo_id, "success" if after.ready and not unfilled else "blocked",
                           (note + "。" if note else "") + message, after, details)
 
     def sync(self, profile: Profile, selected: list[str]) -> dict[str, RepoResult]:
@@ -170,6 +235,8 @@ class RepoService:
             results: dict[str, RepoResult] = {}
             try:
                 chosen = set(selected)
+                # Network is the bottleneck, so fetch everything first; worktrees still change one at a time.
+                prefetched = self._prefetch(profile, selected)
                 # Folder nesting is for display and path protection, never a prerequisite.
                 for repo in profile.repositories:
                     key = repo.id
@@ -180,7 +247,7 @@ class RepoService:
                     else:
                         self.current = key
                         self.emit("started", key)
-                        snap = self._inspect(profile, key, True)
+                        snap = self._snapshot_for_sync(profile, key, prefetched.get(key))
                         result = self._execute(profile, key, snap, allow_force=key in selected)
                     results[key] = result
                     self._record(result)

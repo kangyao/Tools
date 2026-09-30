@@ -324,3 +324,32 @@ def test_child_sync_does_not_update_existing_unselected_parent(tmp_path, remote)
     result = svc.sync(p, ["child"])
     assert list(result) == ["child"]
     assert git(Path(p.root), "rev-parse", "HEAD") == parent_head
+
+
+def test_sync_fetches_all_selected_before_changing_worktrees(tmp_path, remote):
+    p = Profile("p", "Prefetch", str(tmp_path / "checkout"), {"game": "main"}, [
+        RepoSpec("a", "A", "A", str(remote), "game"), RepoSpec("b", "B", "B", str(remote), "game")])
+    events = []
+    result = service(tmp_path, emit=lambda kind, payload: events.append((kind, payload))).sync(p, ["a", "b"])
+    assert all(r.outcome == "success" for r in result.values())
+    first_result = next(i for i, (kind, _) in enumerate(events) if kind == "result")
+    fetched = [i for i, (kind, payload) in enumerate(events)
+               if kind == "check_progress" and payload["completed"] == payload["total"] == 2]
+    assert fetched and fetched[0] < first_result
+
+
+def test_sync_does_not_update_from_cached_refs_when_fetch_fails(tmp_path, remote):
+    p = make_profile(tmp_path / "checkout", remote)
+    svc = service(tmp_path)
+    assert svc.sync(p, ["root"])["root"].outcome == "success"
+    head = git(Path(p.root), "rev-parse", "HEAD")
+    commit(remote, text="cached only")
+    git(Path(p.root), "fetch", "origin")
+    offline = remote.with_name("remote-offline")
+    remote.rename(offline)
+    try:
+        result = svc.sync(p, ["root"])["root"]
+    finally:
+        offline.rename(remote)
+    assert result.outcome == "failed"
+    assert git(Path(p.root), "rev-parse", "HEAD") == head
