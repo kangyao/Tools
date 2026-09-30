@@ -5,6 +5,7 @@ from pathlib import Path
 
 from PySide6.QtCore import QThread, Signal
 
+from ..build import BuildService
 from ..changes import ChangesService
 from ..process import redact
 from ..service import RepoService
@@ -27,6 +28,10 @@ class JobThread(QThread):
 
     def run(self):
         try:
+            if self.operation in {"build", "build-check"}:
+                service = BuildService(self.data_dir, self.event.emit, self.stop_requested, self.cancel_requested)
+                self.completed.emit(service.run(self.profile, validate_only=self.operation == "build-check"))
+                return
             if self.operation in {"changes", "file-diff", "discard"}:
                 changes = ChangesService(self.data_dir, self.event.emit, self.cancel_requested)
                 key = self.selected[0]

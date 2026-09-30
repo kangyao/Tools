@@ -19,6 +19,9 @@ minigame-repo-tool = "repo_tool.app:main"
 [tool.setuptools.packages.find]
 where = ["src"]
 
+[tool.setuptools.package-data]
+repo_tool = ["build_helpers/*.ps1", "build_helpers/*.py"]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 

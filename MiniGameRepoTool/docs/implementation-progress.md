@@ -90,6 +90,20 @@
 - pip check、compileall 和 git diff --check 通过；复核确认同步队列不再扩展选择，目录层级只参与展示与路径保护，强制丢弃入口保留明确选择检查。
 - README、使用说明与设计文档同步更新；早期 HTML 原型和实现计划标为历史规则。本次未操作用户桌面或实际 E:\MiniGame，Git 写操作均使用临时测试仓库。
 
+## 统一编译构建与参数配置（2026-09-30）
+
+- 用户指定 Win_Setup.bat 为构建设置、VS2019_64-MiniGame.bat 为 SLN 生成入口，并指定 W:/git/skills/mini-compile-ib/SKILL.md 的 IB 方法。读取这两个 BAT、底层 Python 入口及技能的 invoke/read/stop 脚本后，实现统一“编译构建”窗口。
+- 三个步骤可单选或顺序执行，默认仅 MiniGame / VS2019 / Debug / x64 的 IB 编译。BuildOptions 随方案保存、复制、导入导出，旧配置自动补默认值；管理仓库时保留构建参数，单独保存构建参数不清空 Git 状态。
+- 构建设置复用 Python39 解压与 SetupWin.py，增加离线依赖包和依赖打包参数。生成使用原脚本的 dev 模式、工作目录和环境变量；支持原 BAT 的 mComplieType 与开关参数，USE_RAINBOW_LIB=1 时先执行 PullEngine.py，跳过 pause。
+- 原生成脚本未传播 os.system 失败；新增 Python 启动器保留原脚本，捕获内部命令非零退出并阻止后续编译，避免旧 SLN 掩盖生成失败。临时工程回归确认失败码 7 与旧 SLN 内容保留。
+- IB 通过 JSON 参数表调用指定技能脚本；先 ValidateOnly 再执行，按独立会话 ExitCode 判定结果，并读取原始日志摘要。中断/超时使用本次会话文件调用停止脚本，再终止调用进程；不传 AllowConcurrent，不回退 MSBuild。
+- 每次构建保存独立 build.log、IB 日志/会话/请求参数以及 runs 中的步骤结果；共用原有运行锁。手动构建不要求 Git 仓库干净或同步，原自动环境准备仍只执行设置并保留必需仓库检查。
+- 首轮专项回归 33 passed / 2 failed（38.03 秒），发现 QDialog.finished 与工作线程结束处理函数重名。改为 job_finished 后，4 项界面回归通过（1.08 秒）。使用离屏 Qt 渲染三个参数页并检查中文、布局与按钮，无实际工程执行。
+- 最终完整回归：135 passed，252.33 秒，0 失败，包含原有 108 项和本次 27 项构建/配置/界面/进程回归。命令：.venv\Scripts\python.exe -m pytest -q --tb=short --junitxml=artifacts\build-final-results.xml。
+- pip check、compileall、示例配置解析和 git diff --check 通过。构建页面截图位于 artifacts/build-compile.png、build-generate.png、build-setup.png。
+- 对真实 E:/MiniGame 只做 ValidateOnly：设置入口与生成预设通过；缺少 Projects/vs2019-win64-MiniGame/MiniGame.sln，编译检查明确提示先生成。测试还调用真实 IB 技能的 ValidateOnly 校验临时 SLN 与不可执行的占位 BuildConsole，未启动实际 IB。
+- README、使用说明、设计、示例配置和 docs/build.md 同步更新。所有设置、生成与编译执行回归使用临时工程及替身脚本；本次没有对实际 MiniGame 执行构建设置、工程生成或编译。
+
 ## 集成裁定
 
 遵照用户“操作完 git commit，不要 push”的约定，仅将本工具目录提交到 codex/minigame-repo-tool，保留现有目录和分支。无合并、远端推送或工作树清理操作。

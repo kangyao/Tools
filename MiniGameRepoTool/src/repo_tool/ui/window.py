@@ -17,6 +17,7 @@ from ..process import redact
 from ..profiles import ProfileStore
 from ..storage import RunLock
 from .changes_dialog import ChangesDialog
+from .build_dialog import BuildDialog
 from .dialogs import ProfilesDialog
 from .native_menu import show_repository_menu
 from .worker import JobThread
@@ -173,8 +174,8 @@ class MainWindow(QMainWindow):
         self.progress.setRange(0, 1)
         self.progress.setValue(0)
         footer.addWidget(self.progress)
-        self.setup_button = QPushButton("准备构建环境")
-        self.setup_button.clicked.connect(lambda: self.start_job("setup", []))
+        self.setup_button = QPushButton("编译构建")
+        self.setup_button.clicked.connect(self.open_build)
         footer.addWidget(self.setup_button)
         layout.addLayout(footer)
         self.profile_combo.currentIndexChanged.connect(self.change_profile)
@@ -256,7 +257,7 @@ class MainWindow(QMainWindow):
         updated.branch_groups = {name: edit.text().strip() for name, edit in self.branch_edits.items()}
         return self.save_profile(updated)
 
-    def save_profile(self, updated) -> bool:
+    def save_profile(self, updated, *, invalidate_status=True) -> bool:
         if self.worker is not None:
             return False
         try:
@@ -268,7 +269,7 @@ class MainWindow(QMainWindow):
             self.store.save(new_document)
             self.document = new_document
             self.profile = new_document.profiles[index]
-            if changed:
+            if changed and invalidate_status:
                 self.snapshots.clear()
                 self.results.clear()
                 for key, node in self.items.items():
@@ -388,7 +389,7 @@ class MainWindow(QMainWindow):
         snap = self.snapshots.get(key)
         self.changes_button.setEnabled(not busy and bool(key))
         self.adopt_button.setEnabled(not busy and snap is not None and snap.status == "remote_mismatch" and bool(snap.origin))
-        # Setup performs its own complete prerequisite check in the worker.
+        # The build dialog checks each selected step using its saved parameters.
         self.setup_button.setEnabled(not busy)
 
     def open_changes(self):
@@ -399,6 +400,18 @@ class MainWindow(QMainWindow):
         dialog.exec()
         if dialog.mutated:
             self.start_job("local", [repo.id for repo in self.profile.repositories])
+
+    def open_build(self):
+        if self.worker is not None or self.native_menu_open or self.closing_requested or not self.save_branch_edits():
+            return
+
+        def save_options(options):
+            updated = deepcopy(self.profile)
+            updated.build = options
+            return self.save_profile(updated, invalidate_status=False)
+
+        dialog = BuildDialog(self.data_dir, self.profile, save_options, self)
+        dialog.exec()
 
     def start_job(self, operation: str, selected: list[str], extra=None):
         if self.worker is not None or self.native_menu_open or self.closing_requested:

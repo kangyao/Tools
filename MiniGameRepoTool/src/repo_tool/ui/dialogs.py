@@ -170,7 +170,7 @@ class ProfilesDialog(QDialog):
             if self.table.item(row, 10).checkState() == Qt.CheckState.Checked:
                 required.append(repo_id)
         updated = Profile(old.id, self.name_edit.text().strip(), self.root_edit.text().strip(),
-                          groups, repositories, SetupOptions(self.auto_setup.isChecked(), required))
+                          groups, repositories, SetupOptions(self.auto_setup.isChecked(), required), deepcopy(old.build))
         validate_profile(updated)
         self.document.profiles[self.current_index] = updated
         self.list.item(self.current_index).setText(updated.name)

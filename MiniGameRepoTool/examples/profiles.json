@@ -92,6 +92,16 @@
           "depends_on": []
         }
       ],
+      "build": {
+        "steps": ["compile"],
+        "python_path": "Tools/buildtools/Python39/python.exe",
+        "target": "MiniGame",
+        "configuration": "Debug",
+        "platform": "x64",
+        "visual_studio_version": "2019",
+        "action": "Build",
+        "ib_skill_dir": "W:/git/skills/mini-compile-ib"
+      },
       "setup": {
         "auto_run": false,
         "required_repositories": [

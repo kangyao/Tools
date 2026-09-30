@@ -67,6 +67,22 @@ def test_process_does_not_inherit_git_repository_scope(tmp_path, monkeypatch):
     assert result.output.splitlines() == ["None", "None"]
 
 
+def test_per_process_environment_and_cancel_callback(tmp_path, monkeypatch):
+    monkeypatch.setenv("BUILD_TEST_VALUE", "original")
+    cancel = threading.Event()
+    callbacks = []
+    def output(line):
+        if line == "changed":
+            cancel.set()
+    result = ProcessRunner(output, cancel).run(sys.executable, ["-u", "-c",
+        "import os, time; print(os.environ['BUILD_TEST_VALUE'], flush=True); time.sleep(20)"], tmp_path,
+        environment={"BUILD_TEST_VALUE": "changed"}, on_terminate=lambda: callbacks.append("stopped"))
+    assert result.cancelled
+    assert callbacks == ["stopped"]
+    import os
+    assert os.environ["BUILD_TEST_VALUE"] == "original"
+
+
 def test_cancel_stops_running_process_and_its_child(tmp_path):
     cancel = threading.Event()
     child_code = ("import time; from pathlib import Path; print('ARMED', flush=True); "

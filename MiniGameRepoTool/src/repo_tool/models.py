@@ -6,6 +6,8 @@ from dataclasses import dataclass, field
 from pathlib import Path, PureWindowsPath
 from urllib.parse import urlsplit
 
+from .build_config import BuildOptions, validate_build_options
+
 
 @dataclass
 class RepoSpec:
@@ -35,6 +37,7 @@ class Profile:
     branch_groups: dict[str, str]
     repositories: list[RepoSpec]
     setup: SetupOptions = field(default_factory=SetupOptions)
+    build: BuildOptions = field(default_factory=BuildOptions)
 
     def repo(self, repo_id: str) -> RepoSpec:
         return next(r for r in self.repositories if r.id == repo_id)
@@ -148,6 +151,7 @@ def dependency_order(profile: Profile) -> list[str]:
 
 
 def validate_profile(profile: Profile) -> None:
+    validate_build_options(profile.build)
     if not all(isinstance(value, str) for value in (profile.id, profile.name, profile.root)):
         raise ValueError("方案 ID、名称和根目录必须是文本")
     if not profile.id.strip() or not profile.name.strip():

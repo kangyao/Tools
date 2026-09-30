@@ -56,11 +56,18 @@ class ProcessRunner:
             process.kill()
 
     def run(self, program: str, arguments: list[str], cwd: Path | None = None,
-            timeout: float | None = None, stream: bool = True) -> ProcessResult:
+            timeout: float | None = None, stream: bool = True,
+            environment: dict[str, str | None] | None = None,
+            on_terminate: Callable[[], None] | None = None) -> ProcessResult:
         if self.cancel.is_set():
             return ProcessResult(-1, "操作已取消", 0, cancelled=True)
         started = time.monotonic()
         env = os.environ.copy()
+        for key, value in (environment or {}).items():
+            if value is None:
+                env.pop(key, None)
+            else:
+                env[key] = value
         # A launcher may itself run inside another repository. Scope always comes from cwd.
         for key in ("GIT_DIR", "GIT_WORK_TREE", "GIT_COMMON_DIR", "GIT_INDEX_FILE",
                     "GIT_OBJECT_DIRECTORY", "GIT_ALTERNATE_OBJECT_DIRECTORIES",
@@ -92,10 +99,17 @@ class ProcessRunner:
         cancelled = False
         timed_out = False
         exit_seen: float | None = None
+        termination_requested = False
         while not ended or process.poll() is None:
             cancelled = self.cancel.is_set()
             timed_out = timeout is not None and time.monotonic() - started > timeout
-            if cancelled or timed_out:
+            if (cancelled or timed_out) and not termination_requested:
+                termination_requested = True
+                if on_terminate and process.poll() is None:
+                    try:
+                        on_terminate()
+                    except Exception as error:
+                        self.output("停止当前会话失败：" + redact(str(error)))
                 self._terminate(process)
             try:
                 data = chunks.get(timeout=0.05)
