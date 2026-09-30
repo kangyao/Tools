@@ -66,14 +66,15 @@ def test_remote_identity_merges_only_matching_host_and_path(left, right, same):
     assert (remote_identity(left) == remote_identity(right)) is same
 
 
-def test_old_profiles_keep_network_clone_and_new_fields_round_trip(tmp_path):
+def test_old_profiles_default_to_auto_and_new_fields_round_trip(tmp_path):
     profile = make_profile(tmp_path / "checkout", tmp_path / "remote")
     payload = asdict(ProfileDocument(1, profile.id, [profile]))
     payload["profiles"][0].pop("init")
     payload["profiles"][0]["repositories"][0].pop("init_source")
     loaded = parse_document(payload).profiles[0]
     assert loaded.init == InitOptions()
-    assert loaded.init.mode == "network"
+    assert loaded.init.mode == "auto"
+    assert loaded.init.sources == []
     assert loaded.repo("root").init_source == ""
     assert default_profile().init.mode == "auto"
 

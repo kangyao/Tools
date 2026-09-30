@@ -35,8 +35,8 @@ INIT_MODES = {"auto": "自动复用本地工程", "specified": "指定源工程"
 
 @dataclass
 class InitOptions:
-    # A profile saved before this option existed keeps the original network clone.
-    mode: str = "network"
+    # Without sources, auto finds no candidate and falls back to a network clone.
+    mode: str = "auto"
     sources: list[str] = field(default_factory=list)
     reuse_git: bool = True
     reuse_lfs: bool = True

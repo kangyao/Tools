@@ -17,7 +17,7 @@ def test_dialog_edits_init_options_and_scans_sources(tmp_path, qapp, remote):
     git(tmp_path, "clone", str(remote), str(source))
     profile = make_profile(tmp_path / "checkout", remote)
     dialog = ProfilesDialog(ProfileDocument(1, profile.id, [profile]), data_dir=tmp_path / "app")
-    assert dialog.init_mode.currentData() == "network"
+    assert dialog.init_mode.currentData() == "auto"
 
     dialog.init_mode.setCurrentIndex(dialog.init_mode.findData("auto"))
     dialog.init_fallback.setCurrentIndex(1)

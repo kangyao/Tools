@@ -150,7 +150,7 @@ BuildService 与 Git 服务共用配置目录 RunLock，通过 JobThread 执行�
 
 **初始化加速**
 
-InitOptions 随方案保存：初始化方式（auto / specified / network）、按优先级排列的本地工程来源、复用 Git、复用 LFS，以及无法复用时回退或停止。RepoSpec.init_source 为单个仓库指定源仓库目录。旧配置缺少 init 时为 network，行为与原克隆一致；默认模板和“新建”方案为 auto，并预填本机存在的 D:/MiniGame、D:/AIMiniGame、D:/MiniGameProfiler。
+InitOptions 随方案保存：初始化方式（auto / specified / network）、按优先级排列的本地工程来源、复用 Git、复用 LFS，以及无法复用时回退或停止。RepoSpec.init_source 为单个仓库指定源仓库目录。init 缺省为 auto：旧配置缺少 init 时来源为空，找不到可复用仓库，按回退执行普通网络克隆；默认模板和“新建”方案为 auto，并预填本机存在的 D:/MiniGame、D:/AIMiniGame、D:/MiniGameProfiler。
 
 只有状态为“未克隆 / 空目录”的所选仓库进入初始化流程，已有仓库继续走原同步规则。SourceScanner 只读探测候选目录：自身必须是工作树根（拒绝 Git 向上找到的父仓库），按远端身份匹配（主机 + 仓库路径，忽略用户、端口与 .git 后缀，SSH/HTTPS 同路径视为同一仓库），读取真实 common dir 与 lfs.storage。浅克隆、部分克隆、对象目录缺失或存在 gc.pid 的仓库不作 Git 来源，但其 LFS 对象仍可按哈希复用。auto 在每个来源根目录下先查同一相对路径，再按远端身份查找方案中其他相对路径；specified 只用第一个来源根目录，或仓库行指定的来源，不会改用其他工程。
 
@@ -237,7 +237,7 @@ Initializer 在目标同级创建本次独有的 .repotool-init-<仓库>-<随机
 }
 ~~~
 
-仓库条目可选 "init_source"，填写该仓库专用的本地源仓库绝对路径；缺省为空。缺少 init 的旧方案按 {"mode": "network"} 读取。
+仓库条目可选 "init_source"，填写该仓库专用的本地源仓库绝对路径；缺省为空。缺少 init 的旧方案按 {"mode": "auto"} 读取，来源为空时回退网络克隆。
 
 上述 JSON 是两仓库最小格式示例；内置方案实际包含前表全部 8 个仓库，并将这 8 个仓库列为环境准备的必需项。分支使用 branch_group 或固定 branch 二选一，不使用任意字符串模板。depends_on 保留为列表排序参考；目录父级用于树形展示，二者均不参与同步等待或自动扩展选择。
 
