@@ -123,6 +123,9 @@ class Inspector:
         def state(status: str, action: str, message: str) -> Snapshot:
             if self.git.runner.cancel.is_set():
                 status, action, message = "cancelled", "error", "操作已中断，请重新检查"
+            elif repo.force_update and snap.changes and action in {"none", "update", "switch"}:
+                status, action = "force_update", "force_update"
+                message = "同步时丢弃未提交修改，不备份，保留本地提交；" + message
             snap.status, snap.action, snap.message = status, action, redact(message)
             return snap
 
@@ -184,7 +187,7 @@ class Inspector:
             if code == "??" and entry_path in children and self.is_own_repository(entry_path):
                 continue
             snap.changes.append(f"{code} {name}")
-        if snap.changes:
+        if snap.changes and not repo.force_update:
             return state("dirty", "block", f"有 {len(snap.changes)} 项工作区变更，请处理后重试")
         ref = "refs/remotes/origin/" + snap.target_branch
         if remote:

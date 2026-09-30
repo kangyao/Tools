@@ -58,12 +58,15 @@ class ProfilesDialog(QDialog):
         note = QLabel("分支组和固定分支二选一；依赖填写仓库 ID，以逗号分隔。未勾选环境必需项时，默认使用全部启用仓库。")
         note.setWordWrap(True)
         layout.addWidget(note)
-        self.table = QTableWidget(0, 9)
-        self.table.setHorizontalHeaderLabels(["启用", "仓库 ID", "名称", "相对目录", "远端地址",
-                                             "分支组", "固定分支", "额外依赖", "环境必需"])
+        policy_note = QLabel("忽略修改提醒仅影响显示，文件与 Diff 仍可查看。强制更新在同步时丢弃未提交修改，不备份；保留本地提交，分支分叉时停止。")
+        policy_note.setWordWrap(True)
+        layout.addWidget(policy_note)
+        self.table = QTableWidget(0, 11)
+        self.table.setHorizontalHeaderLabels(["启用", "仓库 ID", "名称", "忽略修改提醒", "强制更新（不备份）",
+                                             "相对目录", "远端地址", "分支组", "固定分支", "额外依赖", "环境必需"])
         self.table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         self.table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
-        for col, width in enumerate([45, 95, 125, 180, 320, 80, 180, 120, 75]):
+        for col, width in enumerate([45, 95, 125, 110, 150, 180, 320, 80, 180, 120, 75]):
             self.table.setColumnWidth(col, width)
         layout.addWidget(self.table)
         row_buttons = QHBoxLayout()
@@ -137,9 +140,13 @@ class ProfilesDialog(QDialog):
         self.table.insertRow(row)
         self.table.setItem(row, 0, self.check_item(repo.enabled))
         values = [repo.id, repo.name, repo.path, repo.remote, repo.branch_group, repo.branch, ", ".join(repo.depends_on)]
-        for col, value in enumerate(values, 1):
+        for col, value in zip((1, 2, 5, 6, 7, 8, 9), values):
             self.table.setItem(row, col, QTableWidgetItem(value))
-        self.table.setItem(row, 8, self.check_item(required))
+        self.table.setItem(row, 10, self.check_item(required))
+        self.table.setItem(row, 3, self.check_item(repo.ignore_changes))
+        self.table.item(row, 3).setToolTip("不在主窗口强调本地修改；不改写 Git 状态，不自动丢弃文件。文件列表和 Diff 照常可用。")
+        self.table.setItem(row, 4, self.check_item(repo.force_update))
+        self.table.item(row, 4).setToolTip("同步时丢弃暂存、未暂存及普通未跟踪文件，不备份；保留本地提交，分叉时停止。被忽略文件和子仓库不清理。仅保存配置或检查状态不会丢弃文件。")
 
     def save_current(self):
         old = self.document.profiles[self.current_index]
@@ -153,12 +160,14 @@ class ProfilesDialog(QDialog):
             groups[key.strip()] = value.strip()
         repositories, required = [], []
         for row in range(self.table.rowCount()):
-            cells = [self.table.item(row, col).text().strip() for col in range(1, 8)]
+            cells = [self.table.item(row, col).text().strip() for col in (1, 2, 5, 6, 7, 8, 9)]
             repo_id, name, relative, remote, group, branch, deps = cells
             repositories.append(RepoSpec(repo_id, name, relative, remote, group, branch,
                                          self.table.item(row, 0).checkState() == Qt.CheckState.Checked,
-                                         [s.strip() for s in deps.split(",") if s.strip()]))
-            if self.table.item(row, 8).checkState() == Qt.CheckState.Checked:
+                                         [s.strip() for s in deps.split(",") if s.strip()],
+                                         self.table.item(row, 3).checkState() == Qt.CheckState.Checked,
+                                         self.table.item(row, 4).checkState() == Qt.CheckState.Checked))
+            if self.table.item(row, 10).checkState() == Qt.CheckState.Checked:
                 required.append(repo_id)
         updated = Profile(old.id, self.name_edit.text().strip(), self.root_edit.text().strip(),
                           groups, repositories, SetupOptions(self.auto_setup.isChecked(), required))

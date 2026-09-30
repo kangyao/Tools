@@ -332,6 +332,8 @@ class MainWindow(QMainWindow):
             operation = ACTION_NAMES.get(snap.action, "检查") if snap else "检查后决定"
             dependency = ", ".join(self.profile.repo(p).name for p in deps[key]) or "无"
             lines.append(f"{repo.name}  →  {operation}\n    目标：{self.profile.target(repo)}；前置：{dependency}")
+            if repo.force_update:
+                lines.append("    更新策略：强制更新；丢弃未提交修改，不备份；保留本地提交，分叉时停止")
         lines.append("\n缺失或未就绪的必要前置仓库会加入队列；已可用的未选父仓库不会被更新。")
         self.plan.setPlainText("\n".join(lines))
         self.selection_label.setText(f"已选 {len(chosen)} / {len(self.items)}")
@@ -345,12 +347,18 @@ class MainWindow(QMainWindow):
         self.detail_title.setText(repo.name)
         parts = [f"本地目录\n{self.profile.directory(repo)}", f"配置远端\n{repo.remote}",
                  f"目标分支\n{self.profile.target(repo)}"]
+        if repo.ignore_changes:
+            parts.append("修改提醒\n已忽略；可打开“文件改动 / Discard”查看实际文件和 Diff")
+        if repo.force_update:
+            parts.append("更新策略\n强制更新：同步时丢弃未提交修改，不备份；保留本地提交，分叉时停止")
         if snap:
+            muted = repo.ignore_changes and snap.status == "dirty"
             parts.extend([f"当前分支\n{snap.current_branch or '尚未创建'}",
                           f"实际 origin\n{snap.origin or '未检测到'}",
-                          f"状态\n{STATUS_NAMES.get(snap.status, snap.status)}：{snap.message}",
+                          ("状态\n修改提醒已忽略；同步仍按更新策略检查工作区" if muted else
+                           f"状态\n{STATUS_NAMES.get(snap.status, snap.status)}：{snap.message}"),
                           f"检测时间\n{snap.checked_at or '—'}（{'已获取远端' if snap.remote_checked else '本地 / 缓存'}）"])
-            if snap.changes:
+            if snap.changes and not repo.ignore_changes:
                 parts.append("工作区变更\n" + "\n".join(snap.changes[:100]))
         if key in self.results:
             parts.append("本次结果\n" + self.results[key].message)
@@ -429,15 +437,17 @@ class MainWindow(QMainWindow):
             self.snapshots[payload.repo_id] = payload
             node = self.items.get(payload.repo_id)
             if node:
+                muted = self.profile.repo(payload.repo_id).ignore_changes and payload.status == "dirty"
                 node.setText(1, payload.current_branch or "—")
                 node.setToolTip(1, node.text(1))
-                node.setText(3, STATUS_NAMES.get(payload.status, payload.status))
-                color = ("#188153" if payload.ready else "#b45309" if payload.action == "block"
+                node.setText(3, "修改提醒已忽略" if muted else STATUS_NAMES.get(payload.status, payload.status))
+                color = ("#697586" if muted else "#188153" if payload.ready else "#b45309" if payload.action == "block"
                          else "#b42318" if payload.action == "error" else "#2563eb")
                 node.setForeground(3, QColor(color))
                 node.setText(4, ACTION_NAMES.get(payload.action, payload.action))
-                node.setText(6, payload.message.splitlines()[0] if payload.message else "")
-                node.setToolTip(6, payload.message)
+                note = "可打开文件改动查看；同步仍按更新策略检查" if muted else payload.message
+                node.setText(6, note.splitlines()[0] if note else "")
+                node.setToolTip(6, note)
             self.refresh_plan()
             self.show_detail()
         elif kind == "result":
@@ -450,8 +460,11 @@ class MainWindow(QMainWindow):
                 node.setToolTip(5, payload.message)
             self.show_detail()
         elif kind == "included":
-            self.items[payload].setCheckState(0, Qt.CheckState.Checked)
-            self.append_log(payload, "已加入必要的前置仓库")
+            if self.profile.repo(payload).force_update:
+                self.append_log(payload, "已检查必要前置仓库；强制更新需要手动勾选，不自动加入勾选范围")
+            else:
+                self.items[payload].setCheckState(0, Qt.CheckState.Checked)
+                self.append_log(payload, "已加入必要的前置仓库")
             self.refresh_plan()
         elif kind == "check_progress":
             self.progress.setRange(0, payload["total"])
@@ -527,8 +540,10 @@ class MainWindow(QMainWindow):
                         self.save_profile(updated)
 
     def retry(self):
+        checked = set(self.selected_ids())
         ids = [key for key, result in self.results.items()
-               if key in self.items and result.outcome in {"failed", "blocked"}]
+               if key in self.items and result.outcome in {"failed", "blocked"}
+               and (not self.profile.repo(key).force_update or key in checked)]
         if ids:
             self.start_job("sync", ids)
         elif "__setup__" in self.results:

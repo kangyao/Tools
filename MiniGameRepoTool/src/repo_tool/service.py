@@ -5,6 +5,7 @@ from pathlib import Path
 from typing import Callable
 
 from .checks import ParallelChecks
+from .force_update import ForceUpdate
 from .git_ops import GitClient, Inspector, remote_failure
 from .models import Profile, RepoResult, Snapshot, dependencies, dependency_order, validate_profile
 from .process import ProcessRunner, redact
@@ -58,7 +59,7 @@ class RepoService:
         with RunLock(self.data_dir):
             return self.git.branches(remote)
 
-    def _execute(self, profile: Profile, repo_id: str, snap: Snapshot) -> RepoResult:
+    def _execute(self, profile: Profile, repo_id: str, snap: Snapshot, *, allow_force: bool = False) -> RepoResult:
         repo = profile.repo(repo_id)
         path = profile.directory(repo)
         if not snap.runnable:
@@ -79,6 +80,21 @@ class RepoService:
             fresh = self._inspect(profile, repo_id, False)
             if not fresh.runnable:
                 return RepoResult(repo_id, "blocked", fresh.message, fresh)
+            if fresh.action == "force_update":
+                if not allow_force:
+                    return RepoResult(repo_id, "blocked", "前置仓库需要强制更新；请明确勾选该仓库后同步", fresh)
+                self._log("按仓库配置执行强制更新：丢弃未提交修改，不备份，保留本地提交")
+                try:
+                    count = ForceUpdate(self.data_dir, self.git).discard(profile, repo_id)
+                except (OSError, ValueError) as error:
+                    return RepoResult(repo_id, "cancelled" if self.cancel.is_set() else "blocked",
+                                      "强制更新未完成，不生成备份；请重新检查：" + redact(str(error)), fresh)
+                self._log(f"已丢弃 {count} 项未提交修改，未生成备份")
+                fresh = self._inspect(profile, repo_id, False)
+                if fresh.changes or not fresh.runnable:
+                    return RepoResult(repo_id, "blocked", "丢弃后状态仍需处理：" + fresh.message, fresh)
+                if fresh.action == "none":
+                    return RepoResult(repo_id, "success", fresh.message, fresh)
             # A single-branch clone does not yet map other origin branches.
             # Register this exact mapping before asking Git to set up tracking.
             mapping = "+refs/heads/" + snap.target_branch + ":refs/remotes/origin/" + snap.target_branch
@@ -149,7 +165,7 @@ class RepoService:
                         self.current = key
                         self.emit("started", key)
                         snap = self._inspect(profile, key, True)
-                        result = self._execute(profile, key, snap)
+                        result = self._execute(profile, key, snap, allow_force=key in selected)
                     results[key] = result
                     self._record(result)
                 if profile.setup.auto_run and not self.stop.is_set() and not self.cancel.is_set():

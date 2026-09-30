@@ -17,6 +17,8 @@ class RepoSpec:
     branch: str = ""
     enabled: bool = True
     depends_on: list[str] = field(default_factory=list)
+    ignore_changes: bool = False
+    force_update: bool = False
 
 
 @dataclass
@@ -69,7 +71,7 @@ class Snapshot:
 
     @property
     def runnable(self) -> bool:
-        return self.action in {"clone", "update", "switch", "none"}
+        return self.action in {"clone", "update", "switch", "none", "force_update"}
 
     @property
     def ready(self) -> bool:
@@ -94,12 +96,14 @@ STATUS_NAMES = {
     "incomplete": "仓库不完整", "up_to_date": "已是最新", "ahead": "本地领先",
     "behind": "待快进更新", "switch": "待切换分支", "unchecked": "待远端检查",
     "dirty": "有本地修改", "diverged": "分支已分叉", "operation": "Git 操作未完成",
+    "force_update": "待强制更新",
     "detached": "分离 HEAD", "remote_mismatch": "远端不一致", "submodule": "Git 子模块",
     "branch_missing": "目标分支不存在", "auth_error": "认证失败", "remote_error": "远端访问失败",
     "blocked": "依赖未就绪", "layout_conflict": "目录布局冲突", "cancelled": "已取消",
     "error": "检查失败", "running": "执行中",
 }
 ACTION_NAMES = {"clone": "克隆", "switch": "切换并更新", "update": "快进更新",
+                "force_update": "强制更新（不备份）",
                 "none": "无需更新", "check": "检查远端", "block": "待处理", "error": "失败"}
 OUTCOME_NAMES = {"success": "完成", "failed": "失败", "blocked": "待处理", "cancelled": "未执行 / 取消"}
 
@@ -205,6 +209,8 @@ def validate_profile(profile: Profile) -> None:
         if (not isinstance(repo.enabled, bool) or not isinstance(repo.depends_on, list)
                 or not all(isinstance(x, str) for x in repo.depends_on)):
             raise ValueError(f"{repo.name} 的启用状态或依赖格式无效")
+        if not isinstance(repo.ignore_changes, bool) or not isinstance(repo.force_update, bool):
+            raise ValueError(f"{repo.name} 的忽略修改提醒和强制更新选项必须为布尔值")
     if not set(profile.setup.required_repositories) <= ids:
         raise ValueError("环境准备引用了不存在的仓库")
     dependency_order(profile)
