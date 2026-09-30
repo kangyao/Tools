@@ -26,15 +26,42 @@ def normalized_remote(remote: str) -> str:
     return remote
 
 
+def remote_identity(remote: str) -> str:
+    """Host plus repository path, so SSH and HTTPS forms of one project compare equal.
+
+    Users, ports and a trailing .git are ignored. Host aliases are not resolved.
+    """
+    remote = remote.strip().rstrip("/")
+    if remote.startswith("file://") or Path(remote).is_absolute():
+        return "file:" + normalized_remote(remote)
+    if "://" in remote:
+        parts = urlsplit(remote)
+        if parts.scheme.lower() not in {"ssh", "git+ssh", "http", "https", "git"}:
+            return remote
+        host, path = (parts.hostname or "").lower(), unquote(parts.path)
+    else:
+        match = re.fullmatch(r"(?:[^/@:]+@)?([^/:]+):(.+)", remote)
+        if not match:
+            return remote
+        host, path = match[1].lower(), match[2]
+    path = path.strip("/")
+    if path.lower().endswith(".git"):
+        path = path[:-4]
+    return host + "/" + path.casefold()
+
+
 class GitClient:
     def __init__(self, runner: ProcessRunner):
         self.runner = runner
         self.program = shutil.which("git") or "git"
 
     def run(self, args: list[str], cwd: Path | None = None, network: bool = False,
-            stream: bool = False) -> ProcessResult:
+            stream: bool = False, environment: dict[str, str | None] | None = None,
+            unbounded: bool = False) -> ProcessResult:
+        # Network and bulk local work (checkout, object copy) have no fixed time limit.
         return self.runner.run(self.program, ["-c", "core.quotepath=false", *args], cwd,
-                               timeout=None if network else 60, stream=stream)
+                               timeout=None if network or unbounded else 60, stream=stream,
+                               environment=environment)
 
     def branches(self, remote: str) -> list[str]:
         result = self.run(["ls-remote", "--heads", remote], network=True)

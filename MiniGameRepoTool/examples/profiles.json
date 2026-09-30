@@ -114,6 +114,17 @@
           "rainbow",
           "editor"
         ]
+      },
+      "init": {
+        "mode": "auto",
+        "sources": [
+          "D:/MiniGame",
+          "D:/AIMiniGame",
+          "D:/MiniGameProfiler"
+        ],
+        "reuse_git": true,
+        "reuse_lfs": true,
+        "fallback": true
       }
     }
   ]

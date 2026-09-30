@@ -6,21 +6,26 @@ from pathlib import Path
 
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
-    QAbstractItemView, QCheckBox, QDialog, QDialogButtonBox, QFileDialog, QFormLayout,
-    QHBoxLayout, QHeaderView, QLabel, QLineEdit, QListWidget, QMessageBox, QPlainTextEdit,
-    QPushButton, QSplitter, QTableWidget, QTableWidgetItem, QVBoxLayout, QWidget,
+    QAbstractItemView, QCheckBox, QComboBox, QDialog, QDialogButtonBox, QFileDialog, QFormLayout,
+    QGridLayout, QGroupBox, QHBoxLayout, QHeaderView, QLabel, QLineEdit, QListWidget, QMessageBox,
+    QPlainTextEdit, QPushButton, QSplitter, QTableWidget, QTableWidgetItem, QVBoxLayout, QWidget,
 )
 
-from ..models import Profile, RepoSpec, SetupOptions, validate_profile
-from ..profiles import ProfileStore, default_profile
+from ..acceleration import describe_plan
+from ..models import INIT_MODES, InitOptions, Profile, RepoSpec, SetupOptions, validate_profile
+from ..profiles import ProfileStore, default_data_dir, default_profile
+from .worker import JobThread
 
 
 class ProfilesDialog(QDialog):
-    def __init__(self, document, parent=None, focus_repo: str | None = None):
+    def __init__(self, document, parent=None, focus_repo: str | None = None, data_dir: Path | None = None):
         super().__init__(parent)
         self.setWindowTitle("管理方案与仓库")
-        self.resize(1220, 760)
+        self.resize(1260, 880)
         self.document = deepcopy(document)
+        self.data_dir = Path(data_dir) if data_dir else default_data_dir()
+        self.scan_thread: JobThread | None = None
+        self.scan_report = ""
         self.current_index = -1
         outer = QVBoxLayout(self)
         split = QSplitter()
@@ -55,20 +60,57 @@ class ProfilesDialog(QDialog):
         self.auto_setup = QCheckBox("所需仓库全部就绪后，自动准备构建环境")
         form.addRow(self.auto_setup)
         layout.addLayout(form)
+        init_box = QGroupBox("初始化加速（仅用于新建仓库）")
+        grid = QGridLayout(init_box)
+        self.init_mode = QComboBox()
+        for key, text in INIT_MODES.items():
+            self.init_mode.addItem(text, key)
+        self.init_fallback = QComboBox()
+        self.init_fallback.addItem("回退远端下载", True)
+        self.init_fallback.addItem("停止该仓库", False)
+        self.reuse_git = QCheckBox("复用 Git 数据")
+        self.reuse_lfs = QCheckBox("复用 LFS 大文件")
+        self.sources_edit = QPlainTextEdit()
+        self.sources_edit.setMaximumHeight(70)
+        self.sources_edit.setPlaceholderText("D:/MiniGame\nD:/AIMiniGame")
+        add_source = QPushButton("添加来源")
+        add_source.clicked.connect(self.browse_source)
+        self.scan_button = QPushButton("扫描本地工程")
+        self.scan_button.setToolTip("只读检查各来源目录能为本方案哪些仓库提供 Git/LFS 数据；不访问远端")
+        self.scan_button.clicked.connect(lambda: self.guard(self.scan_sources))
+        grid.addWidget(QLabel("初始化方式"), 0, 0)
+        grid.addWidget(self.init_mode, 0, 1)
+        grid.addWidget(QLabel("无法复用时"), 0, 2)
+        grid.addWidget(self.init_fallback, 0, 3)
+        grid.addWidget(self.reuse_git, 0, 4)
+        grid.addWidget(self.reuse_lfs, 0, 5)
+        grid.addWidget(QLabel("本地工程来源\n（按优先级，每行一个）"), 1, 0)
+        grid.addWidget(self.sources_edit, 1, 1, 1, 5)
+        source_buttons = QVBoxLayout()
+        source_buttons.addWidget(add_source)
+        source_buttons.addWidget(self.scan_button)
+        grid.addLayout(source_buttons, 1, 6)
+        init_note = QLabel("自动复用按来源顺序为每个仓库选择远端一致、对象完整的本地仓库；指定源工程只使用第一个来源目录，"
+                           "或仓库行中填写的“初始化来源”，无效时按“无法复用时”处理。复用 Git 数据后仍从原始远端获取目标分支，"
+                           "LFS 对象按哈希复制并校验。已有仓库沿用现有同步规则。")
+        init_note.setWordWrap(True)
+        grid.addWidget(init_note, 2, 0, 1, 7)
+        layout.addWidget(init_box)
         note = QLabel("分支组和固定分支二选一；所选仓库独立同步。排序参考填写仓库 ID，以逗号分隔，仅影响列表展示。未勾选环境必需项时，默认使用全部启用仓库。")
         note.setWordWrap(True)
         layout.addWidget(note)
         policy_note = QLabel("忽略修改提醒仅影响显示，文件与 Diff 仍可查看。强制更新在同步时丢弃未提交修改，不备份；保留本地提交，分支分叉时停止。")
         policy_note.setWordWrap(True)
         layout.addWidget(policy_note)
-        self.table = QTableWidget(0, 11)
+        self.table = QTableWidget(0, 12)
         self.table.setHorizontalHeaderLabels(["启用", "仓库 ID", "名称", "忽略修改提醒", "强制更新（不备份）",
-                                             "相对目录", "远端地址", "分支组", "固定分支", "排序参考", "环境必需"])
+                                             "相对目录", "远端地址", "分支组", "固定分支", "排序参考", "环境必需",
+                                             "初始化来源（可选）"])
         self.table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         self.table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
-        for col, width in enumerate([45, 95, 125, 110, 150, 180, 320, 80, 180, 120, 75]):
+        for col, width in enumerate([45, 95, 125, 110, 150, 180, 320, 80, 180, 120, 75, 220]):
             self.table.setColumnWidth(col, width)
-        layout.addWidget(self.table)
+        layout.addWidget(self.table, 1)
         row_buttons = QHBoxLayout()
         add = QPushButton("添加仓库")
         add.clicked.connect(self.add_repo)
@@ -131,6 +173,11 @@ class ProfilesDialog(QDialog):
         self.root_edit.setText(p.root)
         self.groups_edit.setPlainText("\n".join(f"{k}={v}" for k, v in p.branch_groups.items()))
         self.auto_setup.setChecked(p.setup.auto_run)
+        self.init_mode.setCurrentIndex(self.init_mode.findData(p.init.mode))
+        self.init_fallback.setCurrentIndex(0 if p.init.fallback else 1)
+        self.reuse_git.setChecked(p.init.reuse_git)
+        self.reuse_lfs.setChecked(p.init.reuse_lfs)
+        self.sources_edit.setPlainText("\n".join(p.init.sources))
         self.table.setRowCount(0)
         for repo in p.repositories:
             self.insert_repo(repo, repo.id in p.setup.required_repositories)
@@ -147,6 +194,8 @@ class ProfilesDialog(QDialog):
         self.table.item(row, 3).setToolTip("不在主窗口强调本地修改；不改写 Git 状态，不自动丢弃文件。文件列表和 Diff 照常可用。")
         self.table.setItem(row, 4, self.check_item(repo.force_update))
         self.table.item(row, 4).setToolTip("同步时丢弃暂存、未暂存及普通未跟踪文件，不备份；保留本地提交，分叉时停止。被忽略文件和子仓库不清理。仅保存配置或检查状态不会丢弃文件。")
+        self.table.setItem(row, 11, QTableWidgetItem(repo.init_source))
+        self.table.item(row, 11).setToolTip("新建此仓库时优先使用的本地源仓库目录（绝对路径），例如 D:/AIMiniGame/AssetRuntime；留空按方案来源自动选择。")
 
     def save_current(self):
         old = self.document.profiles[self.current_index]
@@ -166,11 +215,16 @@ class ProfilesDialog(QDialog):
                                          self.table.item(row, 0).checkState() == Qt.CheckState.Checked,
                                          [s.strip() for s in deps.split(",") if s.strip()],
                                          self.table.item(row, 3).checkState() == Qt.CheckState.Checked,
-                                         self.table.item(row, 4).checkState() == Qt.CheckState.Checked))
+                                         self.table.item(row, 4).checkState() == Qt.CheckState.Checked,
+                                         self.table.item(row, 11).text().strip()))
             if self.table.item(row, 10).checkState() == Qt.CheckState.Checked:
                 required.append(repo_id)
+        init = InitOptions(self.init_mode.currentData(),
+                           [line.strip() for line in self.sources_edit.toPlainText().splitlines() if line.strip()],
+                           self.reuse_git.isChecked(), self.reuse_lfs.isChecked(), self.init_fallback.currentData())
         updated = Profile(old.id, self.name_edit.text().strip(), self.root_edit.text().strip(),
-                          groups, repositories, SetupOptions(self.auto_setup.isChecked(), required), deepcopy(old.build))
+                          groups, repositories, SetupOptions(self.auto_setup.isChecked(), required),
+                          deepcopy(old.build), init)
         validate_profile(updated)
         self.document.profiles[self.current_index] = updated
         self.list.item(self.current_index).setText(updated.name)
@@ -225,6 +279,59 @@ class ProfilesDialog(QDialog):
         chosen = QFileDialog.getExistingDirectory(self, "选择工程根目录", self.root_edit.text())
         if chosen:
             self.root_edit.setText(chosen)
+
+    def browse_source(self):
+        chosen = QFileDialog.getExistingDirectory(self, "添加本地工程来源", "")
+        if chosen:
+            text = self.sources_edit.toPlainText().rstrip()
+            self.sources_edit.setPlainText((text + "\n" if text else "") + chosen)
+
+    def scan_sources(self):
+        if self.scan_thread is not None:
+            return
+        self.save_current()
+        profile = deepcopy(self.document.profiles[self.current_index])
+        thread = JobThread(self.data_dir, profile, "init-plan", [r.id for r in profile.repositories], parent=self)
+        thread.completed.connect(lambda plans: self.show_scan(profile, plans))
+        thread.failed.connect(lambda text: QMessageBox.warning(self, "扫描失败", text.strip().splitlines()[-1]))
+        thread.finished.connect(self.scan_finished)
+        self.scan_thread = thread
+        self.scan_button.setEnabled(False)
+        self.scan_button.setText("扫描中…")
+        thread.start()
+
+    def scan_finished(self):
+        thread, self.scan_thread = self.scan_thread, None
+        if thread:
+            thread.deleteLater()
+        self.scan_button.setEnabled(True)
+        self.scan_button.setText("扫描本地工程")
+
+    def show_scan(self, profile, plans):
+        lines = [f"方案：{profile.name}；初始化方式：{INIT_MODES[profile.init.mode]}；只读扫描，未访问远端", ""]
+        for plan in plans.values():
+            lines.extend(describe_plan(profile, plan))
+            lines.append("")
+        self.scan_report = "\n".join(lines)
+        report = QDialog(self)
+        report.setWindowTitle("本地工程扫描结果")
+        report.resize(960, 620)
+        box = QVBoxLayout(report)
+        text = QPlainTextEdit(self.scan_report)
+        text.setReadOnly(True)
+        box.addWidget(text)
+        close = QDialogButtonBox(QDialogButtonBox.StandardButton.Close)
+        close.rejected.connect(report.reject)
+        box.addWidget(close)
+        report.open()
+
+    def done(self, result):
+        # Never leave a scan thread running behind a closed dialog.
+        if self.scan_thread is not None:
+            self.scan_thread.stop_requested.set()
+            self.scan_thread.cancel_requested.set()
+            self.scan_thread.wait()
+        super().done(result)
 
     def import_file(self):
         path, _ = QFileDialog.getOpenFileName(self, "导入方案", "", "JSON (*.json *.bak)")

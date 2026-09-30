@@ -146,6 +146,18 @@ BuildService 与 Git 服务共用配置目录 RunLock，通过 JobThread 执行�
 
 同步后的自动准备继续只执行设置，并检查全部环境必需仓库；不连带生成或编译。完整参数与操作流程见 build.md。
 
+**初始化加速**
+
+InitOptions 随方案保存：初始化方式（auto / specified / network）、按优先级排列的本地工程来源、复用 Git、复用 LFS，以及无法复用时回退或停止。RepoSpec.init_source 为单个仓库指定源仓库目录。旧配置缺少 init 时为 network，行为与原克隆一致；默认模板和“新建”方案为 auto，并预填本机存在的 D:/MiniGame、D:/AIMiniGame、D:/MiniGameProfiler。
+
+只有状态为“未克隆 / 空目录”的所选仓库进入初始化流程，已有仓库继续走原同步规则。SourceScanner 只读探测候选目录：自身必须是工作树根（拒绝 Git 向上找到的父仓库），按远端身份匹配（主机 + 仓库路径，忽略用户、端口与 .git 后缀，SSH/HTTPS 同路径视为同一仓库），读取真实 common dir 与 lfs.storage。浅克隆、部分克隆、对象目录缺失或存在 gc.pid 的仓库不作 Git 来源，但其 LFS 对象仍可按哈希复用。auto 在每个来源根目录下先查同一相对路径，再按远端身份查找方案中其他相对路径；specified 只用第一个来源根目录，或仓库行指定的来源，不会改用其他工程。
+
+Initializer 在目标同级创建本次独有的 .repotool-init-<仓库>-<随机> 临时目录，阶段依次为：检查来源 → 复用 Git 数据（clone --no-checkout --single-branch --reference-if-able … --dissociate，原始远端，GIT_LFS_SKIP_SMUDGE=1）→ 复用 LFS（git lfs ls-files --json 目标提交，逐对象按大小筛选、边复制边计算 SHA-256，校验通过才原子移入目标自己的 LFS 存储）→ 下载缺失数据（git lfs fetch origin 目标提交）→ 检出（reset --hard 目标提交，再 git lfs checkout）→ 验证完成（分支、提交、origin、无 alternates，LFS 未填充数量）。验证后目标仍不存在或为空才同盘改名就位，否则报告占用、不覆盖。
+
+失败处理：远端认证失败、分支不存在、磁盘空间不足、LFS 下载、检出、验证或就位失败直接报告；其他 Git 数据阶段的失败按“回退远端下载”执行一次普通网络克隆。中断或失败时只删除登记为本次创建、名称前缀匹配的临时目录；删除不了时在日志中给出路径。源仓库只被读取，LFS 复制不写源缓存，也不建立多个工程共用的 LFS 存储。RepoResult.details 记录来源、候选原因、目标提交、各阶段耗时及 LFS 需要/已有/复制/字节数/校验失败/下载/未填充数量，写入运行记录。
+
+“初始化计划”（主窗口）和“扫描本地工程”（管理方案）调用 RepoService.init_plan：持运行锁，只读本地状态与来源，不 fetch、不改配置，并列出遗留的临时目录。UGit/LFS 缓存加速、P2P、Setup 依赖包复用和整目录复制属于第二阶段及以后，当前版本不包含。
+
 **模块边界**
 
 | 模块 | 责任 | 主要输出 |
@@ -159,6 +171,7 @@ BuildService 与 Git 服务共用配置目录 RunLock，通过 JobThread 执行�
 | windows_shell_menu.py / ui/native_menu.py | Windows Shell 菜单、消息转发、资源释放与 Qt 坐标适配 | 是否调用了菜单命令 |
 | process.py | Popen、输出解码、退出码、超时与进程树中断 | ProcessResult |
 | service.py | 所选仓库独立调度、互斥、重新检查与执行 | RepoResult、结构化事件 |
+| acceleration.py | 只读来源扫描、初始化计划、Git reference+dissociate、LFS 复制校验与临时目录就位 | InitPlan、InitOutcome、RepoResult.details |
 | setup.py | 环境准备及实际退出码 | RepoResult |
 | build_config.py / build.py | 构建参数、计划、三步执行与 IB 会话调用 | BuildOptions、BuildResult |
 | ui/build_dialog.py | 参数编辑、步骤选择、检查、执行日志与中断 | 构建操作意图 |
@@ -210,10 +223,19 @@ BuildService 与 Git 服务共用配置目录 RunLock，通过 JobThread 执行�
     "setup": {
       "auto_run": false,
       "required_repositories": ["main", "assets"]
+    },
+    "init": {
+      "mode": "auto",
+      "sources": ["D:/MiniGame", "D:/AIMiniGame", "D:/MiniGameProfiler"],
+      "reuse_git": true,
+      "reuse_lfs": true,
+      "fallback": true
     }
   }]
 }
 ~~~
+
+仓库条目可选 "init_source"，填写该仓库专用的本地源仓库绝对路径；缺省为空。缺少 init 的旧方案按 {"mode": "network"} 读取。
 
 上述 JSON 是两仓库最小格式示例；内置方案实际包含前表全部 8 个仓库，并将这 8 个仓库列为环境准备的必需项。分支使用 branch_group 或固定 branch 二选一，不使用任意字符串模板。depends_on 保留为列表排序参考；目录父级用于树形展示，二者均不参与同步等待或自动扩展选择。
 
@@ -233,6 +255,7 @@ BuildService 与 Git 服务共用配置目录 RunLock，通过 JobThread 执行�
 - 中止和重试后状态真实，原有文件与本地提交保留。
 - 配置增删改、导入导出、保存恢复、中文与空格路径均可用。
 - 环境准备失败不覆盖 Git 成功记录，必需仓库未就绪时不会自动执行。
+- 初始化加速：同源不同分支可复用，源工程的修改与本地分支不进入目标；完成后删除源仍可用且无 alternates；父仓库误识别、浅克隆、远端不同、缺失来源各有原因；LFS 对象按哈希复用，损坏对象被拒绝后下载，源缓存不变；目标在就位前被占用时不覆盖；中断与失败只清理本次临时目录；旧配置保持网络克隆。
 - 构建参数按方案往返保存，管理方案和复制保留参数；配置检查不启动构建；失败、停止、中断正确终止后续步骤。生成失败不能被旧 SLN 掩盖；IB 使用独立会话的实际退出码与日志。
 
 界面示意是保留的早期 HTML 原型，包含已取消的前置等待规则；当前行为以本文和桌面程序为准。示意中的状态是演示数据，所有交互只改变示意内容，不调用本机 Git。

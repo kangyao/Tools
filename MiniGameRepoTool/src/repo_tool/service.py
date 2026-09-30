@@ -4,6 +4,7 @@ import threading
 from pathlib import Path
 from typing import Callable
 
+from .acceleration import Initializer, InitPlan, SourceScanner
 from .checks import ParallelChecks
 from .force_update import ForceUpdate
 from .git_ops import GitClient, Inspector
@@ -55,6 +56,25 @@ class RepoService:
         with RunLock(self.data_dir):
             return ParallelChecks(self.emit, self.stop, self.cancel).run(profile, selected, remote)
 
+    def init_plan(self, profile: Profile, selected: list[str]) -> dict[str, InitPlan]:
+        """Read-only: local repository state plus usable sources. Nothing is fetched."""
+        validate_profile(profile)
+        if set(selected) - {repo.id for repo in profile.repositories}:
+            raise ValueError("所选仓库不存在")
+        plans: dict[str, InitPlan] = {}
+        with RunLock(self.data_dir):
+            scanner = SourceScanner(self.git)
+            for repo in profile.repositories:
+                if repo.id not in selected:
+                    continue
+                if self.stop.is_set() or self.cancel.is_set():
+                    break
+                self.emit("started", repo.id)
+                snap = self._inspect(profile, repo.id, False)
+                plans[repo.id] = scanner.plan(profile, repo, snap)
+                self.emit("init_plan", plans[repo.id])
+        return plans
+
     def branch_list(self, remote: str) -> list[str]:
         with RunLock(self.data_dir):
             return self.git.branches(remote)
@@ -69,9 +89,24 @@ class RepoService:
             return RepoResult(repo_id, outcome, snap.message, snap)
         if snap.action == "none":
             return RepoResult(repo_id, "success", snap.message, snap)
+        details, note = {}, ""
         if snap.action == "clone":
             # Git rejects a destination that acquired content after inspection.
             path.parent.mkdir(parents=True, exist_ok=True)
+            if profile.init.mode != "network":
+                init = Initializer(self.git, self._log, self.cancel).clone(profile, repo, snap)
+                details = init.details
+                if init.outcome in {"failed", "blocked", "cancelled"}:
+                    return RepoResult(repo_id, init.outcome, init.message, snap, details)
+                if init.outcome == "done":
+                    after = self._inspect(profile, repo_id, False)
+                    unfilled = details.get("lfs", {}).get("unfilled", 0)
+                    if after.ready and not unfilled:
+                        return RepoResult(repo_id, "success", init.message + "。" + after.message, after, details)
+                    reason = f"仍有 {unfilled} 个 LFS 文件未填充" if unfilled else after.message
+                    return RepoResult(repo_id, "blocked", init.message + "。完成前需要处理：" + reason,
+                                      after, details)
+                note = init.message
             command = ["clone", "--progress", "--single-branch", "--branch", snap.target_branch,
                        "--", repo.remote, str(path)]
             result = self.git.run(command, network=True, stream=True)
@@ -117,10 +152,12 @@ class RepoService:
         if result.returncode:
             message = "操作已中断，请重新检查" if result.cancelled else redact(result.output[-2000:])
             return RepoResult(repo_id, "cancelled" if result.cancelled else "failed",
-                              message or f"Git 退出码 {result.returncode}", snap)
+                              (note + "。" if note else "") + (message or f"Git 退出码 {result.returncode}"),
+                              snap, details)
         after = self._inspect(profile, repo_id, False)
+        message = after.message if after.ready else "操作后需要重新处理：" + after.message
         return RepoResult(repo_id, "success" if after.ready else "blocked",
-                          after.message if after.ready else "操作后需要重新处理：" + after.message, after)
+                          (note + "。" if note else "") + message, after, details)
 
     def sync(self, profile: Profile, selected: list[str]) -> dict[str, RepoResult]:
         validate_profile(profile)

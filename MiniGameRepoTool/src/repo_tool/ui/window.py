@@ -12,7 +12,8 @@ from PySide6.QtWidgets import (
     QTreeWidgetItem, QVBoxLayout, QWidget,
 )
 
-from ..models import ACTION_NAMES, OUTCOME_NAMES, STATUS_NAMES, dependency_order, validate_profile
+from ..acceleration import describe_plan
+from ..models import ACTION_NAMES, INIT_MODES, OUTCOME_NAMES, STATUS_NAMES, dependency_order, validate_profile
 from ..process import redact
 from ..profiles import ProfileStore
 from ..storage import RunLock
@@ -34,6 +35,7 @@ class MainWindow(QMainWindow):
         self.native_menu_open = False
         self.snapshots = {}
         self.results = {}
+        self.init_plans = {}
         self.items = {}
         self.log_entries: list[tuple[str, str]] = []
         self.log_path = ""
@@ -74,13 +76,17 @@ class MainWindow(QMainWindow):
         self.sync_button.setObjectName("primary")
         self.sync_button.setDefault(True)
         self.sync_button.clicked.connect(lambda: self.start_job("sync", self.selected_ids()))
+        self.init_button = QPushButton("初始化计划")
+        self.init_button.setToolTip("只读扫描本地工程，查看未克隆仓库可复用的 Git/LFS 来源；不访问远端")
+        self.init_button.clicked.connect(lambda: self.start_job("init-plan", self.selected_ids()))
         self.retry_button = QPushButton("重试失败")
         self.retry_button.clicked.connect(self.retry)
         self.stop_button = QPushButton("停止队列")
         self.stop_button.clicked.connect(self.stop_queue)
         self.cancel_button = QPushButton("中断当前操作")
         self.cancel_button.clicked.connect(self.cancel_current)
-        for button in [self.check_button, self.sync_button, self.retry_button, self.stop_button, self.cancel_button]:
+        for button in [self.check_button, self.sync_button, self.init_button, self.retry_button,
+                       self.stop_button, self.cancel_button]:
             tools.addWidget(button)
         self.selection_label = QLabel()
         tools.addStretch()
@@ -208,6 +214,7 @@ class MainWindow(QMainWindow):
             self.branch_layout.addWidget(edit, row, column + 1)
         self.snapshots = {}
         self.results = {}
+        self.init_plans = {}
         self.log_entries = []
         self.log_path = ""
         self.tree.blockSignals(True)
@@ -272,6 +279,7 @@ class MainWindow(QMainWindow):
             if changed and invalidate_status:
                 self.snapshots.clear()
                 self.results.clear()
+                self.init_plans.clear()
                 for key, node in self.items.items():
                     node.setText(2, self.profile.target(self.profile.repo(key)))
                     node.setToolTip(2, node.text(2))
@@ -306,7 +314,8 @@ class MainWindow(QMainWindow):
     def manage_profiles(self, focus_repo=None):
         if self.worker is not None or not self.save_branch_edits():
             return
-        dialog = ProfilesDialog(self.document, self, focus_repo if isinstance(focus_repo, str) else None)
+        dialog = ProfilesDialog(self.document, self, focus_repo if isinstance(focus_repo, str) else None,
+                                data_dir=self.data_dir)
         if dialog.exec() != QDialog.DialogCode.Accepted:
             return
         try:
@@ -332,6 +341,10 @@ class MainWindow(QMainWindow):
             lines.append(f"{repo.name}  →  {operation}\n    目标：{self.profile.target(repo)}；独立同步")
             if repo.force_update:
                 lines.append("    更新策略：强制更新；丢弃未提交修改，不备份；保留本地提交，分叉时停止")
+            if key in self.init_plans:
+                lines.extend(describe_plan(self.profile, self.init_plans[key])[1:])
+            elif snap and snap.action == "clone" and self.profile.init.mode != "network":
+                lines.append(f"    初始化：{INIT_MODES[self.profile.init.mode]}；点击“初始化计划”查看可复用来源")
         lines.append("\n只执行所选仓库，不等待前置仓库，不自动勾选其他仓库；每项按自身状态决定操作。")
         self.plan.setPlainText("\n".join(lines))
         self.selection_label.setText(f"已选 {len(chosen)} / {len(self.items)}")
@@ -373,7 +386,7 @@ class MainWindow(QMainWindow):
         self.profile_combo.setEnabled(not busy)
         self.branch_group.setEnabled(not busy)
         self.tree.setEnabled(not self.native_menu_open and
-                             (not running or self.operation in {"sync", "check", "local", "setup"}))
+                             (not running or self.operation in {"sync", "check", "local", "setup", "init-plan"}))
         self.tree.blockSignals(True)
         for node in self.items.values():
             flags = node.flags()
@@ -382,6 +395,7 @@ class MainWindow(QMainWindow):
         self.tree.blockSignals(False)
         self.sync_button.setEnabled(not busy and bool(self.selected_ids()))
         self.check_button.setEnabled(not busy and bool(self.selected_ids()))
+        self.init_button.setEnabled(not busy and bool(self.selected_ids()))
         self.retry_button.setEnabled(not busy and any(r.outcome in {"failed", "blocked"} for r in self.results.values()))
         self.stop_button.setEnabled(running and self.operation != "branches" and not self.worker.stop_requested.is_set())
         self.cancel_button.setEnabled(running and not self.worker.cancel_requested.is_set())
@@ -438,6 +452,7 @@ class MainWindow(QMainWindow):
         self.progress.setRange(0, 0)
         self.message.setText({"local": "读取本地仓库状态…", "check": "检查本地与远端状态…",
                               "sync": "正在同步仓库…", "branches": "读取远端分支…",
+                              "init-plan": "扫描本地来源并生成初始化计划…",
                               "setup": "检查所需仓库并准备环境…"}.get(operation, "执行中…"))
         self.update_controls()
         self.worker.start()
@@ -469,6 +484,9 @@ class MainWindow(QMainWindow):
                                               "blocked": "#b45309", "cancelled": "#697586"}[payload.outcome]))
                 node.setToolTip(5, payload.message)
             self.show_detail()
+        elif kind == "init_plan":
+            self.init_plans[payload.repo_id] = payload
+            self.refresh_plan()
         elif kind == "check_progress":
             self.progress.setRange(0, payload["total"])
             self.progress.setValue(payload["completed"])
@@ -505,8 +523,11 @@ class MainWindow(QMainWindow):
         if self.operation == "branches":
             self.pending_branches = result
             self.message.setText(f"已读取 {len(result)} 个远端分支")
+        elif self.operation == "init-plan":
+            self.tabs.setCurrentIndex(0)
+            self.message.setText(f"初始化计划已生成：{len(result)} 个仓库，详见“执行计划”；未访问远端")
         elif self.operation in {"sync", "setup"}:
-            counts = {s: sum(r.outcome == s for r in result.values()) for s in OUTCOME_NAMES}
+            counts ={s: sum(r.outcome == s for r in result.values()) for s in OUTCOME_NAMES}
             self.message.setText("执行结束：" + " · ".join(f"{OUTCOME_NAMES[s]} {n}" for s, n in counts.items() if n))
         else:
             stopped = self.worker and (self.worker.stop_requested.is_set() or self.worker.cancel_requested.is_set())

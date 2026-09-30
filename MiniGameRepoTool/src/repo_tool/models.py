@@ -21,12 +21,26 @@ class RepoSpec:
     depends_on: list[str] = field(default_factory=list)
     ignore_changes: bool = False
     force_update: bool = False
+    init_source: str = ""
 
 
 @dataclass
 class SetupOptions:
     auto_run: bool = False
     required_repositories: list[str] = field(default_factory=list)
+
+
+INIT_MODES = {"auto": "自动复用本地工程", "specified": "指定源工程", "network": "纯网络下载"}
+
+
+@dataclass
+class InitOptions:
+    # A profile saved before this option existed keeps the original network clone.
+    mode: str = "network"
+    sources: list[str] = field(default_factory=list)
+    reuse_git: bool = True
+    reuse_lfs: bool = True
+    fallback: bool = True
 
 
 @dataclass
@@ -38,6 +52,7 @@ class Profile:
     repositories: list[RepoSpec]
     setup: SetupOptions = field(default_factory=SetupOptions)
     build: BuildOptions = field(default_factory=BuildOptions)
+    init: InitOptions = field(default_factory=InitOptions)
 
     def repo(self, repo_id: str) -> RepoSpec:
         return next(r for r in self.repositories if r.id == repo_id)
@@ -87,6 +102,7 @@ class RepoResult:
     outcome: str
     message: str
     snapshot: Snapshot | None = None
+    details: dict = field(default_factory=dict)
 
 
 STATUS_NAMES = {
@@ -211,6 +227,27 @@ def validate_profile(profile: Profile) -> None:
             raise ValueError(f"{repo.name} 的启用状态或排序参考格式无效")
         if not isinstance(repo.ignore_changes, bool) or not isinstance(repo.force_update, bool):
             raise ValueError(f"{repo.name} 的忽略修改提醒和强制更新选项必须为布尔值")
+        if not isinstance(repo.init_source, str) or (repo.init_source and not _absolute_line(repo.init_source)):
+            raise ValueError(f"{repo.name} 的初始化来源必须为空或绝对路径")
     if not set(profile.setup.required_repositories) <= ids:
         raise ValueError("环境准备引用了不存在的仓库")
+    validate_init_options(profile)
     dependency_order(profile)
+
+
+def _absolute_line(value: str) -> bool:
+    return bool(value.strip()) and not any(c in value for c in "\r\n\0") and Path(value).is_absolute()
+
+
+def validate_init_options(profile: Profile) -> None:
+    init = profile.init
+    if not isinstance(init, InitOptions) or init.mode not in INIT_MODES:
+        raise ValueError("初始化方式无效")
+    if not all(isinstance(value, bool) for value in (init.reuse_git, init.reuse_lfs, init.fallback)):
+        raise ValueError("初始化加速的复用和回退选项必须为布尔值")
+    if not isinstance(init.sources, list) or not all(isinstance(s, str) and _absolute_line(s) for s in init.sources):
+        raise ValueError("本地工程来源必须是绝对路径，每行一个")
+    if len({canonical(Path(s)) for s in init.sources}) != len(init.sources):
+        raise ValueError("本地工程来源不能重复")
+    if init.mode == "specified" and not init.sources and not any(r.init_source for r in profile.repositories):
+        raise ValueError("指定源工程方式需要填写来源目录，或为仓库指定初始化来源")

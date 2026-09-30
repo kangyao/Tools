@@ -48,6 +48,8 @@ class JobThread(QThread):
                 result = service.sync(self.profile, self.selected)
             elif self.operation == "setup":
                 result = service.setup(self.profile)
+            elif self.operation == "init-plan":
+                result = service.init_plan(self.profile, self.selected)
             elif self.operation == "branches":
                 result = service.branch_list(self.extra)
             else:

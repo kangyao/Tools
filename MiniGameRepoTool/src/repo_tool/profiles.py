@@ -8,11 +8,18 @@ from dataclasses import asdict
 from pathlib import Path
 
 from .build_config import BuildOptions
-from .models import Profile, ProfileDocument, RepoSpec, SetupOptions, validate_profile
+from .models import InitOptions, Profile, ProfileDocument, RepoSpec, SetupOptions, validate_profile
 
 
 def default_data_dir() -> Path:
     return Path(os.environ.get("LOCALAPPDATA", str(Path.home() / ".local" / "share"))) / "MiniGameRepoTool"
+
+
+SUGGESTED_SOURCES = ("D:/MiniGame", "D:/AIMiniGame", "D:/MiniGameProfiler")
+
+
+def suggested_sources() -> list[str]:
+    return [path for path in SUGGESTED_SOURCES if Path(path).is_dir()]
 
 
 def default_profile() -> Profile:
@@ -31,7 +38,8 @@ def default_profile() -> Profile:
     return Profile("minigame-e", "MiniGame 开发", "E:/MiniGame", {
         "game": "miniw/release/v1.55.50_ai_framework_V2",
         "engine": "Engine/Release_v6.2.9_ai_framework_V2",
-    }, [RepoSpec(*row) for row in rows], SetupOptions(False, [row[0] for row in rows]))
+    }, [RepoSpec(*row) for row in rows], SetupOptions(False, [row[0] for row in rows]),
+        init=InitOptions("auto", suggested_sources()))
 
 
 def parse_document(data: dict) -> ProfileDocument:
@@ -43,7 +51,8 @@ def parse_document(data: dict) -> ProfileDocument:
             repos = [RepoSpec(**r) for r in item["repositories"]]
             setup = SetupOptions(**item.get("setup", {}))
             build = BuildOptions(**item.get("build", {}))
-            profile = Profile(item["id"], item["name"], item["root"], item["branch_groups"], repos, setup, build)
+            init = InitOptions(**item.get("init", {}))
+            profile = Profile(item["id"], item["name"], item["root"], item["branch_groups"], repos, setup, build, init)
             validate_profile(profile)
             profiles.append(profile)
         ids = [p.id for p in profiles]

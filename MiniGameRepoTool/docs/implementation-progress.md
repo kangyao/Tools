@@ -104,6 +104,16 @@
 - 对真实 E:/MiniGame 只做 ValidateOnly：设置入口与生成预设通过；缺少 Projects/vs2019-win64-MiniGame/MiniGame.sln，编译检查明确提示先生成。测试还调用真实 IB 技能的 ValidateOnly 校验临时 SLN 与不可执行的占位 BuildConsole，未启动实际 IB。
 - README、使用说明、设计、示例配置和 docs/build.md 同步更新。所有设置、生成与编译执行回归使用临时工程及替身脚本；本次没有对实际 MiniGame 执行构建设置、工程生成或编译。
 
+## 初始化加速第一版（2026-09-30）
+
+- 按 docs/initialization-acceleration-plan.md 实现第一版：InitOptions 与仓库级 init_source 随方案保存、复制、导入导出；旧配置读取为纯网络下载，默认模板与新建方案为自动复用并预填本机存在的 D 盘工程。
+- 新增 acceleration.py：SourceScanner 只读探测来源（真实工作树根、远端身份、common dir、lfs.storage、浅克隆/部分克隆/gc.pid）；Initializer 在目标同级临时目录中执行 no-checkout + reference-if-able + dissociate 克隆，按目标提交复制并 SHA-256 校验 LFS 对象，补齐下载、检出、验证后同盘改名就位。service.py 的克隆分支接入，失败按配置回退一次网络克隆或停止。
+- 界面：主窗口“初始化计划”、管理方案“初始化加速”区域、“扫描本地工程”和仓库表“初始化来源”列；执行计划页展示来源、排除原因和执行方式，日志输出六个阶段，RepoResult.details 写入运行记录。
+- 调试中发现并处理：取消时扫描失败被误判为“无来源”（改为先判断中断）；git-lfs 退出码 2 被归类为“分支不存在”（LFS 阶段改用原始输出）；git-lfs 本地文件传输会硬链接对象，测试改为替换文件而非原地改写；本机 Git 2.45.1 在带 LFS hook 的 clone 检出阶段报错，测试源仓库改为先无检出克隆再检出，加速流程本身不受影响。
+- 新增 25 项回归（test_acceleration.py 23 项、test_acceleration_ui.py 2 项），覆盖远端身份、配置兼容与校验、跨分支复用并解除借用（删除源后 fsck 通过）、源工作区修改不进入目标、父仓库误识别/浅克隆/远端不同/目录缺失、停止策略、指定源工程不改用其他工程、其他相对路径按身份发现、分支不存在不回退并清理临时目录、就位前目标被占用不覆盖、中断、父失败子仍初始化、LFS 无需下载的本地复用、损坏对象拒绝后下载且源缓存不变、浅克隆仅供 LFS，以及对话框与主窗口流程。
+- 最终完整回归：160 passed，321.95 秒，0 失败。命令：.venv\Scripts\python.exe -m pytest -q。布局微调后复跑界面相关 11 项通过。compileall、git diff --check、示例配置解析通过。管理方案对话框离屏截图：artifacts/init-acceleration-dialog.png。
+- 真实环境只读核对：以默认方案和草稿区不存在的根目录执行初始化计划，只对 D:\MiniGame、D:\AIMiniGame、D:\MiniGameProfiler 运行 rev-parse / config 读取，结果见方案文档“第一版实现情况”。没有对真实工程执行克隆、fetch、复制或配置修改；磁盘不足与 UGit 场景未测试。
+
 ## 集成裁定
 
 遵照用户“操作完 git commit，不要 push”的约定，仅将本工具目录提交到 codex/minigame-repo-tool，保留现有目录和分支。无合并、远端推送或工作树清理操作。
