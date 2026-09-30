@@ -2,16 +2,18 @@ from __future__ import annotations
 
 import uuid
 from copy import deepcopy
+from dataclasses import replace
 from pathlib import Path
 
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
-    QAbstractItemView, QCheckBox, QComboBox, QDialog, QDialogButtonBox, QFileDialog, QFormLayout,
+    QAbstractItemView, QApplication, QCheckBox, QComboBox, QDialog, QDialogButtonBox, QFileDialog, QFormLayout,
     QGridLayout, QGroupBox, QHBoxLayout, QHeaderView, QLabel, QLineEdit, QListWidget, QMessageBox,
     QPlainTextEdit, QPushButton, QSplitter, QTableWidget, QTableWidgetItem, QVBoxLayout, QWidget,
 )
 
 from ..acceleration import describe_plan
+from ..discovery import discover_profile, find_repositories
 from ..models import INIT_MODES, InitOptions, Profile, RepoSpec, SetupOptions, validate_profile
 from ..profiles import ProfileStore, default_data_dir, default_profile
 from .worker import JobThread
@@ -51,6 +53,10 @@ class ProfilesDialog(QDialog):
         browse = QPushButton("选择目录")
         browse.clicked.connect(self.browse_root)
         root_row.addWidget(browse)
+        discover = QPushButton("从目录识别")
+        discover.setToolTip("扫描工程根目录下已有的 Git 仓库，按远端与当前分支生成仓库列表和分支组；只读，不访问远端")
+        discover.clicked.connect(lambda: self.guard(self.discover_from_root))
+        root_row.addWidget(discover)
         self.groups_edit = QPlainTextEdit()
         self.groups_edit.setMaximumHeight(86)
         self.groups_edit.setPlaceholderText("game=miniw/release/...\nengine=Engine/Release_...")
@@ -279,6 +285,40 @@ class ProfilesDialog(QDialog):
         chosen = QFileDialog.getExistingDirectory(self, "选择工程根目录", self.root_edit.text())
         if chosen:
             self.root_edit.setText(chosen)
+            if find_repositories(Path(chosen)):
+                self.guard(self.discover_from_root)
+
+    def discover_from_root(self):
+        root = Path(self.root_edit.text().strip())
+        if not root.is_absolute() or not root.is_dir():
+            raise ValueError("请先填写已存在的工程根目录（绝对路径）")
+        self.save_current()
+        profile = self.document.profiles[self.current_index]
+        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+        try:
+            result = discover_profile(root, profile)
+        finally:
+            QApplication.restoreOverrideCursor()
+        if not result.found:
+            QMessageBox.information(self, "从目录识别", f"{root} 下没有找到带 origin 的 Git 仓库，方案未改变。"
+                                    + ("\n\n" + "\n".join(result.notes) if result.notes else ""))
+            return
+        enabled = [r for r in result.repositories if r.enabled]
+        lines = [f"识别到 {result.found} 个仓库："]
+        lines += [f"  {r.name}  ({r.path})  → {r.branch or r.branch_group + '=' + result.branch_groups[r.branch_group]}"
+                  for r in enabled]
+        lines += ["", "分支组：" + "；".join(f"{k}={v}" for k, v in result.branch_groups.items())]
+        if result.notes:
+            lines += ["", "说明："] + ["  " + note for note in result.notes]
+        lines += ["", "用识别结果替换当前方案的仓库列表、分支组和环境必需项？其他设置保持不变。"]
+        answer = QMessageBox.question(self, "从目录识别", "\n".join(lines))
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+        updated = replace(profile, branch_groups=result.branch_groups, repositories=result.repositories,
+                          setup=SetupOptions(profile.setup.auto_run, result.required))
+        validate_profile(updated)
+        self.document.profiles[self.current_index] = updated
+        self.load_profile(self.current_index)
 
     def browse_source(self):
         chosen = QFileDialog.getExistingDirectory(self, "添加本地工程来源", "")
