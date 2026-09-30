@@ -198,6 +198,22 @@ def test_specified_mode_does_not_fall_through_to_other_projects(tmp_path, remote
     assert result.details["git_source"] == str(good.resolve())
 
 
+def test_auto_mode_borrows_from_other_managed_projects(tmp_path, remote):
+    managed_root = tmp_path / "已管理工程"
+    git(tmp_path, "clone", str(remote), str(managed_root))
+    managed = make_profile(managed_root, remote)
+    managed.id = "managed"
+    target = accelerated(tmp_path / "checkout", remote, [])
+    ProfileStore(tmp_path / "app").save(ProfileDocument(1, target.id, [managed, target]))
+    plan = service(tmp_path).init_plan(target, ["root"])["root"]
+    assert [Path(c.path) for c in plan.candidates if c.git_usable] == [managed_root.resolve()]
+    result = service(tmp_path).sync(target, ["root"])["root"]
+    assert result.outcome == "success"
+    assert result.details["git_source"] == str(managed_root.resolve())
+    target.init = InitOptions("network")
+    assert service(tmp_path)._with_managed_sources(target).init.sources == []
+
+
 def test_source_found_under_other_configured_path_by_remote_identity(tmp_path, remote):
     projects = tmp_path / "projects"
     git(tmp_path, "clone", str(remote), str(projects / "Elsewhere"))

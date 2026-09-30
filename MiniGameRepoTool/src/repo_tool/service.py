@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import threading
+from dataclasses import replace
 from pathlib import Path
 from typing import Callable
 
@@ -8,7 +9,8 @@ from .acceleration import InitFailure, Initializer, InitPlan, SourceScanner
 from .checks import ParallelChecks
 from .force_update import ForceUpdate
 from .git_ops import GitClient, Inspector
-from .models import Profile, RepoResult, Snapshot, validate_profile
+from .models import Profile, RepoResult, Snapshot, canonical, validate_profile
+from .profiles import ProfileStore
 from .process import ProcessResult, ProcessRunner, redact
 from .setup import SetupRunner
 from .storage import RunJournal, RunLock
@@ -64,6 +66,31 @@ class RepoService:
                 return snap
         return self._inspect(profile, repo_id, True)
 
+    def _with_managed_sources(self, profile: Profile) -> Profile:
+        """In auto mode, also borrow from every other project this tool manages, after explicit sources."""
+        if profile.init.mode != "auto":
+            return profile
+        store = ProfileStore(self.data_dir)
+        if not store.path.is_file():
+            return profile
+        try:
+            others = [p.root for p in store.read(store.path).profiles if p.id != profile.id]
+        except ValueError:
+            return profile
+        seen = {canonical(Path(profile.root))}
+        sources = []
+        for source in [*profile.init.sources, *others]:
+            key = canonical(Path(source))
+            if key in seen or not Path(source).is_dir():
+                continue
+            seen.add(key)
+            sources.append(source)
+        added = [s for s in sources if s not in profile.init.sources]
+        if not added:
+            return profile
+        self._log("自动复用仓库管理中的其他工程：" + "、".join(added))
+        return replace(profile, init=replace(profile.init, sources=sources))
+
     def _has_lfs(self) -> bool:
         if self.lfs_available is None:
             self.lfs_available = self.git.run(["lfs", "version"]).returncode == 0
@@ -116,6 +143,7 @@ class RepoService:
         plans: dict[str, InitPlan] = {}
         with RunLock(self.data_dir):
             scanner = SourceScanner(self.git)
+            sourced = self._with_managed_sources(profile)
             for repo in profile.repositories:
                 if repo.id not in selected:
                     continue
@@ -123,7 +151,7 @@ class RepoService:
                     break
                 self.emit("started", repo.id)
                 snap = self._inspect(profile, repo.id, False)
-                plans[repo.id] = scanner.plan(profile, repo, snap)
+                plans[repo.id] = scanner.plan(sourced, repo, snap)
                 self.emit("init_plan", plans[repo.id])
         return plans
 
@@ -150,7 +178,7 @@ class RepoService:
             # Git rejects a destination that acquired content after inspection.
             path.parent.mkdir(parents=True, exist_ok=True)
             if profile.init.mode != "network":
-                init = Initializer(self.git, self._log, self.cancel).clone(profile, repo, snap)
+                init = Initializer(self.git, self._log, self.cancel).clone(self._with_managed_sources(profile), repo, snap)
                 details = init.details
                 if init.outcome in {"failed", "blocked", "cancelled"}:
                     return RepoResult(repo_id, init.outcome, init.message, snap, details)
