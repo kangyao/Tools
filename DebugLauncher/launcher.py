@@ -1,34 +1,41 @@
 from __future__ import annotations
 
 from datetime import datetime
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import os
 from pathlib import Path
 import queue
+import subprocess
 import threading
 import tkinter as tk
-from tkinter import filedialog, messagebox, ttk
+from tkinter import messagebox, ttk
 from typing import Callable
 
 from launcher_core import (
-    ConfigStore,
-    ConfigurationError,
     ControllerSnapshot,
     DEBUG_WAIT_ARGUMENT,
     DEFAULT_SCRIPT_DEBUG_PORT,
     DebugPortBundle,
+    ClientLaunchResult,
     LauncherController,
     LauncherError,
+    MAX_CLIENT_COUNT,
     LauncherSettings,
     NetworkRole,
-    apply_network_preset,
-    format_argument_text,
-    format_command_preview,
+    PairLaunchResult,
     is_valid_window_geometry,
     load_attach_configuration,
-    parse_argument_text,
+    validate_client_count,
+)
+from launch_profiles import (
+    LAUNCH_ROLES,
+    ROLE_TITLES,
+    LauncherConfig,
+    ProfileStore,
+    pair_mismatches,
 )
 from persistent_debug_server import PersistentDebugOptions, run_embedded_debug_server
+from profile_manager import ProfileManagerWindow
 
 
 TOOL_DIR = Path(__file__).resolve().parent
@@ -42,10 +49,18 @@ class _DebugService:
     thread: threading.Thread
 
 
+@dataclass
+class _RoleControls:
+    name: tk.StringVar
+    summary: tk.StringVar
+    start_button: ttk.Button
+
+
 class DebugLauncherApp:
     def __init__(self, root: tk.Tk) -> None:
         self.root = root
-        self.store = ConfigStore(CONFIG_PATH)
+        self.store = ProfileStore(CONFIG_PATH)
+        self.config = LauncherConfig.default()
         self.controller = LauncherController()
         self.attach_configuration = load_attach_configuration(
             RUN_CONFIGURATION_PATH
@@ -58,15 +73,15 @@ class DebugLauncherApp:
         self.debug_states: dict[int, str] = {}
         self.debug_attach_clients: dict[int, str] = {}
         self.debug_runtime_clients: dict[int, str] = {}
+        self.debug_component_missing_reported = False
         self.default_debug_port: int | None = None
         self.status_after_id: str | None = None
         self.normal_window_geometry = ""
-
-        self.executable_var = tk.StringVar()
-        self.argument_text_var = tk.StringVar()
-        self.debug_wait_var = tk.BooleanVar(value=True)
-        self.show_console_var = tk.BooleanVar(value=True)
-        self.preview_var = tk.StringVar()
+        self.launch_cancel = threading.Event()
+        self.profile_manager: ProfileManagerWindow | None = None
+        self.role_controls: dict[NetworkRole, _RoleControls] = {}
+        self.client_delay_var = tk.StringVar(value="2")
+        self.client_count_var = tk.StringVar(value="1")
         self.status_var = tk.StringVar(value="运行实例：0")
         self.debug_attach_status_var = tk.StringVar(
             value=f"Attach {self.attach_configuration.name}：启动中…"
@@ -79,15 +94,14 @@ class DebugLauncherApp:
         self._configure_window()
         self._build_ui()
         self._load_settings()
-        self._refresh_preview()
         self._refresh_status()
         self._drain_events()
         self.root.after_idle(self._initialize_default_debug_service)
 
     def _configure_window(self) -> None:
-        self.root.title("App 调试启动器")
-        self.root.geometry("1100x850")
-        self.root.minsize(900, 720)
+        self.root.title("Host / Client 启动器")
+        self.root.geometry("1100x820")
+        self.root.minsize(960, 720)
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
         self.root.bind("<Configure>", self._remember_window_geometry, add="+")
 
@@ -97,166 +111,114 @@ class DebugLauncherApp:
             style.theme_use("vista")
         style.configure("Section.TLabelframe.Label", font=("Microsoft YaHei UI", 10, "bold"))
         style.configure("Primary.TButton", font=("Microsoft YaHei UI", 10, "bold"))
+        style.configure("Title.TLabel", font=("Microsoft YaHei UI", 12, "bold"))
+        style.configure("Summary.TLabel", foreground="#4b5563")
+        style.configure("Profile.TLabel", font=("Microsoft YaHei UI", 10, "bold"))
 
     def _build_ui(self) -> None:
-        outer = ttk.Frame(self.root, padding=(22, 18, 22, 16))
+        outer = ttk.Frame(self.root, padding=(22, 16, 22, 16))
         outer.pack(fill=tk.BOTH, expand=True)
         outer.columnconfigure(0, weight=1)
         outer.rowconfigure(3, weight=1)
 
-        config_frame = ttk.Frame(outer, padding=14)
-        config_frame.grid(row=0, column=0, sticky=tk.EW)
-        config_frame.columnconfigure(1, weight=1)
-
-        ttk.Label(config_frame, text="程序").grid(
-            row=0, column=0, sticky=tk.W, padx=(0, 10), pady=(0, 10)
+        launch_frame = ttk.Frame(outer)
+        launch_frame.grid(row=0, column=0, sticky=tk.EW)
+        launch_frame.columnconfigure(1, weight=1)
+        ttk.Label(launch_frame, text="Host / Client 启动器", style="Title.TLabel").grid(
+            row=0, column=0, columnspan=3, sticky=tk.W, pady=(0, 10),
         )
-        executable_entry = ttk.Entry(
-            config_frame, textvariable=self.executable_var
+        ttk.Button(launch_frame, text="配置管理", command=self._open_profile_manager).grid(
+            row=0, column=3, sticky=tk.E, pady=(0, 10),
         )
-        executable_entry.grid(row=0, column=1, sticky=tk.EW, pady=(0, 10))
-        ttk.Button(config_frame, text="浏览…", command=self._browse_executable).grid(
-            row=0, column=2, padx=(8, 0), pady=(0, 10)
-        )
-
-        argument_frame = ttk.LabelFrame(
-            config_frame,
-            text="App 启动参数",
-            padding=(10, 10),
-        )
-        argument_frame.grid(
-            row=1,
-            column=0,
-            columnspan=3,
-            sticky=tk.EW,
-            pady=(0, 8),
-        )
-        argument_frame.columnconfigure(0, weight=1)
-        self.arguments_entry = ttk.Entry(
-            argument_frame, textvariable=self.argument_text_var,
-        )
-        self.arguments_entry.grid(row=0, column=0, sticky=tk.EW)
-        argument_scrollbar = ttk.Scrollbar(
-            argument_frame, orient=tk.HORIZONTAL, command=self.arguments_entry.xview,
-        )
-        argument_scrollbar.grid(row=1, column=0, sticky=tk.EW)
-        self.arguments_entry.configure(xscrollcommand=argument_scrollbar.set)
-        presets = ttk.Frame(argument_frame)
-        presets.grid(row=2, column=0, sticky=tk.W, pady=(8, 0))
-        for label, role in (
-            ("填入 Host 参数", NetworkRole.HOST),
-            ("填入 Client 参数", NetworkRole.CLIENT),
-            ("清除网络参数", NetworkRole.STANDALONE),
-        ):
-            ttk.Button(
-                presets, text=label,
-                command=lambda selected=role: self._apply_network_preset(selected),
-            ).pack(side=tk.LEFT, padx=(0, 8))
-        ttk.Label(
-            argument_frame,
-            text='直接输入参数（不含 exe）；含空格的值请加双引号。预设默认端口 7000、房间 1。',
-        ).grid(row=3, column=0, sticky=tk.W, pady=(8, 0))
-        ttk.Label(
-            argument_frame,
-            text="Client 默认地址 127.0.0.1、UIN 10001；多开时每个 Client 使用不同 UIN，且不能为 1。",
-        ).grid(row=4, column=0, sticky=tk.W, pady=(4, 0))
-        ttk.Checkbutton(
-            config_frame,
-            text=f"等待 Lua 调试器连接（{DEBUG_WAIT_ARGUMENT}）",
-            variable=self.debug_wait_var,
-            command=self._refresh_preview,
-        ).grid(row=2, column=0, columnspan=3, sticky=tk.W, pady=(0, 10))
-
-        ttk.Label(config_frame, text="命令预览").grid(
-            row=3, column=0, sticky=tk.W, padx=(0, 10)
-        )
-        preview_frame = ttk.Frame(config_frame)
-        preview_frame.grid(row=3, column=1, columnspan=2, sticky=tk.EW)
-        preview_frame.columnconfigure(0, weight=1)
-        self.preview_entry = ttk.Entry(
-            preview_frame,
-            textvariable=self.preview_var,
-            state="readonly",
-        )
-        self.preview_entry.grid(row=0, column=0, sticky=tk.EW)
-        ttk.Button(
-            preview_frame,
-            text="复制",
-            command=self._copy_preview,
-            width=8,
-        ).grid(row=0, column=1, padx=(8, 0))
-
-        options = ttk.Frame(config_frame)
-        options.grid(row=4, column=1, columnspan=2, sticky=tk.W, pady=(10, 0))
-        ttk.Checkbutton(
-            options,
-            text="显示 App 控制台窗口",
-            variable=self.show_console_var,
+        client_count = ttk.Frame(launch_frame)
+        client_count.grid(row=3, column=2, sticky=tk.E, padx=8)
+        ttk.Label(client_count, text="数量").pack(side=tk.LEFT, padx=(0, 5))
+        ttk.Spinbox(
+            client_count, textvariable=self.client_count_var,
+            from_=1, to=MAX_CLIENT_COUNT, increment=1, width=4,
         ).pack(side=tk.LEFT)
-        ttk.Button(options, text="保存配置", command=self._save_only).pack(
-            side=tk.LEFT, padx=(16, 0)
+        self._build_role_row(launch_frame, NetworkRole.HOST, 1)
+        self._build_role_row(launch_frame, NetworkRole.CLIENT, 3)
+
+        pair_bar = ttk.Frame(launch_frame)
+        pair_bar.grid(row=5, column=0, columnspan=4, sticky=tk.EW, pady=(14, 0))
+        self.start_pair_button = ttk.Button(
+            pair_bar, text="一键启动 Host + Client", style="Primary.TButton",
+            command=self._start_pair, padding=(12, 6),
         )
+        self.start_pair_button.pack(side=tk.LEFT)
+        ttk.Label(pair_bar, text="Host 启动后").pack(side=tk.LEFT, padx=(18, 5))
+        ttk.Spinbox(
+            pair_bar, textvariable=self.client_delay_var,
+            from_=0, to=60, increment=0.5, width=5,
+        ).pack(side=tk.LEFT)
+        ttk.Label(pair_bar, text="秒启动 Client").pack(side=tk.LEFT, padx=(5, 0))
+        self.stop_all_button = ttk.Button(
+            pair_bar, text="关闭全部", command=self._stop_all, width=12
+        )
+        self.stop_all_button.pack(side=tk.RIGHT)
 
         instance_frame = ttk.LabelFrame(
             outer, text="运行实例", style="Section.TLabelframe", padding=(10, 8)
         )
-        instance_frame.grid(row=1, column=0, sticky=tk.EW, pady=(12, 0))
+        instance_frame.grid(row=1, column=0, sticky=tk.EW, pady=(14, 0))
         instance_frame.columnconfigure(0, weight=1)
         columns = (
-            "id",
-            "role",
-            "pid",
-            "endpoint",
-            "target",
-            "dap",
-            "attach",
-            "runtime",
-            "status",
+            "id", "name", "role", "pid", "endpoint", "room", "account", "state",
+            "target", "dap", "attach", "runtime", "debug",
         )
         self.instance_tree = ttk.Treeview(
             instance_frame, columns=columns, show="headings", height=5, selectmode="browse"
         )
         headings = {
-            "id": ("ID", 55),
-            "role": ("角色", 80),
-            "pid": ("PID", 80),
-            "endpoint": ("网络端点", 210),
-            "target": ("ScriptDebugger", 120),
-            "dap": ("DAP", 80),
-            "attach": (f"Attach {self.attach_configuration.name}", 170),
-            "runtime": (self.attach_configuration.session_name, 170),
-            "status": ("状态", 110),
+            "id": ("ID", 45),
+            "name": ("配置名称", 140),
+            "role": ("角色", 60),
+            "pid": ("PID", 70),
+            "endpoint": ("网络端点", 150),
+            "room": ("房间", 55),
+            "account": ("开发账号", 70),
+            "state": ("状态", 70),
+            "target": ("ScriptDebugger", 110),
+            "dap": ("DAP", 60),
+            "attach": (f"Attach {self.attach_configuration.name}", 150),
+            "runtime": (self.attach_configuration.session_name, 150),
+            "debug": ("调试服务", 150),
         }
         for column, (text, width) in headings.items():
             self.instance_tree.heading(column, text=text)
-            self.instance_tree.column(column, width=width, anchor=tk.CENTER)
+            self.instance_tree.column(column, width=width, anchor=tk.CENTER, stretch=False)
         self.instance_tree.grid(row=0, column=0, sticky=tk.EW)
         self.instance_tree.bind("<<TreeviewSelect>>", lambda _event: self._update_buttons())
+        instance_y_scrollbar = ttk.Scrollbar(
+            instance_frame, orient=tk.VERTICAL, command=self.instance_tree.yview,
+        )
+        instance_y_scrollbar.grid(row=0, column=1, sticky=tk.NS)
+        instance_x_scrollbar = ttk.Scrollbar(
+            instance_frame, orient=tk.HORIZONTAL, command=self.instance_tree.xview,
+        )
+        instance_x_scrollbar.grid(row=1, column=0, sticky=tk.EW)
+        self.instance_tree.configure(
+            xscrollcommand=instance_x_scrollbar.set,
+            yscrollcommand=instance_y_scrollbar.set,
+        )
 
         action_frame = ttk.Frame(outer, padding=(0, 12, 0, 12))
         action_frame.grid(row=2, column=0, sticky=tk.EW)
         action_frame.columnconfigure(4, weight=1)
 
-        self.start_button = ttk.Button(
-            action_frame,
-            text="启动新实例",
-            style="Primary.TButton",
-            command=self._start,
-            width=12,
-        )
-        self.start_button.grid(row=0, column=0, padx=(0, 8))
         self.stop_button = ttk.Button(
-            action_frame, text="关闭", command=self._stop, width=12
+            action_frame, text="关闭选中实例", command=self._stop, width=12
         )
-        self.stop_button.grid(row=0, column=1, padx=8)
+        self.stop_button.grid(row=0, column=0, padx=(0, 8))
         self.restart_button = ttk.Button(
-            action_frame, text="重新启动", command=self._restart, width=12
+            action_frame, text="重启选中实例", command=self._restart, width=12
         )
-        self.restart_button.grid(row=0, column=2, padx=8)
-        self.stop_all_button = ttk.Button(
-            action_frame, text="关闭全部", command=self._stop_all, width=12
+        self.restart_button.grid(row=0, column=1, padx=8)
+        self.command_button = ttk.Button(
+            action_frame, text="查看启动命令", command=self._show_instance_command, width=12
         )
-        self.stop_all_button.grid(row=0, column=3, padx=8)
+        self.command_button.grid(row=0, column=2, padx=8)
 
         status_box = ttk.Frame(action_frame)
         status_box.grid(row=0, column=5, sticky=tk.E)
@@ -300,6 +262,27 @@ class DebugLauncherApp:
             textvariable=self.debug_service_status_var,
         ).pack(side=tk.LEFT)
         self._build_log_ui(outer)
+        self.client_count_var.trace_add("write", lambda *_: self._update_launch_labels())
+        self._update_launch_labels()
+
+    def _build_role_row(self, parent: ttk.Frame, role: NetworkRole, row: int) -> None:
+        """Show the active profile of a role; choosing profiles happens in 配置管理."""
+        title = ROLE_TITLES[role]
+        name = tk.StringVar()
+        summary = tk.StringVar()
+        ttk.Label(parent, text=title, style="Profile.TLabel").grid(
+            row=row, column=0, sticky=tk.W, padx=(0, 16),
+        )
+        ttk.Label(parent, textvariable=name, style="Profile.TLabel").grid(row=row, column=1, sticky=tk.W)
+        start_button = ttk.Button(
+            parent, text=f"启动 {title}", style="Primary.TButton", width=16,
+            command=lambda: self._start_role(role),
+        )
+        start_button.grid(row=row, column=3, sticky=tk.E)
+        ttk.Label(parent, textvariable=summary, style="Summary.TLabel").grid(
+            row=row + 1, column=1, columnspan=3, sticky=tk.W, pady=(3, 10),
+        )
+        self.role_controls[role] = _RoleControls(name, summary, start_button)
 
     def _create_status_image(self, color: str) -> tk.PhotoImage:
         image = tk.PhotoImage(master=self.root, width=14, height=14)
@@ -343,85 +326,231 @@ class DebugLauncherApp:
         scrollbar.grid(row=0, column=1, sticky=tk.NS)
         self.log_text.configure(yscrollcommand=scrollbar.set)
 
-        self.executable_var.trace_add("write", lambda *_: self._refresh_preview())
-        self.argument_text_var.trace_add("write", lambda *_: self._refresh_preview())
+    # ----- saved configuration ------------------------------------------------------------------
 
     def _load_settings(self) -> None:
         try:
-            settings = self.store.load()
-        except ConfigurationError as exc:
-            settings = LauncherSettings()
-            self._append_log(f"配置读取失败，已显示默认值：{exc}", error=True)
-            self.root.after(
-                50,
-                lambda error=exc: messagebox.showwarning(
-                    "配置文件无效",
-                    f"{error}\n\n当前显示默认配置；点击“保存配置”可重新生成本地配置。",
-                    parent=self.root,
-                ),
-            )
-        self.executable_var.set(settings.executable)
-        self.debug_wait_var.set(DEBUG_WAIT_ARGUMENT in settings.enabled_arguments)
-        self.argument_text_var.set(format_argument_text(tuple(
-            argument for argument in settings.enabled_arguments
-            if argument != DEBUG_WAIT_ARGUMENT
-        )))
-        self.show_console_var.set(settings.show_console)
-        if settings.window_geometry:
-            self.normal_window_geometry = settings.window_geometry
-            self.root.geometry(settings.window_geometry)
-        self._append_log("启动器已就绪。")
-
-    def _collect_settings(self) -> LauncherSettings:
-        executable = os.path.expandvars(self.executable_var.get().strip())
-        if not executable:
-            raise LauncherError("请选择 App 可执行文件。")
-        arguments = parse_argument_text(self.argument_text_var.get())
-        if self.debug_wait_var.get() and DEBUG_WAIT_ARGUMENT not in arguments:
-            arguments += (DEBUG_WAIT_ARGUMENT,)
-        return LauncherSettings(
-            executable=executable,
-            arguments=arguments,
-            show_console=bool(self.show_console_var.get()),
-            window_geometry=self._current_window_geometry(),
-        )
-
-    def _save_settings(self) -> LauncherSettings:
-        settings = self._collect_settings()
-        self.store.save(settings)
-        return settings
-
-    def _save_only(self) -> None:
-        try:
-            settings = self._save_settings()
+            self.config = self.store.load()
         except LauncherError as exc:
-            self._show_error("保存配置失败", exc)
-            return
-        self._append_log(f"已保存配置：{format_command_preview(settings)}")
+            self.config = LauncherConfig.default()
+            self._append_log(f"配置读取失败，已显示默认配置：{exc}", error=True)
+            self.root.after(50, lambda error=exc: messagebox.showwarning(
+                "配置文件无效", str(error), parent=self.root,
+            ))
+        self.client_delay_var.set(f"{self.config.client_delay_seconds:g}")
+        self.client_count_var.set(str(self.config.client_count))
+        if self.config.window_geometry:
+            self.normal_window_geometry = self.config.window_geometry
+            self.root.geometry(self.config.window_geometry)
+        self._refresh_profile_choices()
+        self._append_log(f"已加载 {len(self.config.profiles)} 份启动配置。")
 
-    def _copy_preview(self) -> None:
-        command = self.preview_var.get()
-        if not command:
+    def _save_config(self, config: LauncherConfig) -> None:
+        """Persist profiles and selection together with the current window state."""
+        try:
+            delay = float(self.client_delay_var.get())
+            config = replace(config, client_delay_seconds=delay)
+        except (ValueError, LauncherError):
+            pass  # An unfinished delay edit must not block saving profiles.
+        count = self._client_count()
+        if count is not None:
+            config = replace(config, client_count=count)
+        config = replace(config, window_geometry=self._current_window_geometry())
+        self.store.save(config)
+        self.config = config
+
+    def _commit_profiles(self, config: LauncherConfig) -> None:
+        self._save_config(config)
+        self._refresh_profile_choices()
+
+    def _refresh_profile_choices(self) -> None:
+        for role, controls in self.role_controls.items():
+            active = self.config.selected(role)
+            controls.name.set(active.name if active else "未激活")
+            controls.summary.set(
+                active.summary() if active
+                else f"请在“配置管理”中勾选一份 {ROLE_TITLES[role]} 配置的“激活”。"
+            )
+        self._update_buttons()
+
+    def _client_count(self) -> int | None:
+        try:
+            count = int(self.client_count_var.get())
+            validate_client_count(count, True)
+        except (ValueError, LauncherError):
+            return None
+        return count
+
+    def _validated_client_count(self, auto_dev_account: bool) -> int:
+        try:
+            count = int(self.client_count_var.get())
+        except ValueError:
+            count = 0
+        validate_client_count(count, auto_dev_account)
+        return count
+
+    def _update_launch_labels(self) -> None:
+        count = self._client_count()
+        clients = "Client" if count in (None, 1) else f"{count} 个 Client"
+        self.role_controls[NetworkRole.CLIENT].start_button.configure(text=f"启动 {clients}")
+        self.start_pair_button.configure(text=f"一键启动 Host + {clients}")
+
+    def _open_profile_manager(self) -> None:
+        if self.profile_manager is None:
+            self.profile_manager = ProfileManagerWindow(
+                self.root, lambda: self.config, self._commit_profiles, self._on_profile_manager_closed,
+            )
+        else:
+            self.profile_manager.window.deiconify()
+            self.profile_manager.window.lift()
+
+    def _on_profile_manager_closed(self) -> None:
+        self.profile_manager = None
+
+    # ----- launching ----------------------------------------------------------------------------
+
+    def _start_role(self, role: NetworkRole) -> None:
+        if self.busy or self.closing:
+            return
+        profile = self.config.selected(role)
+        if profile is None:
             return
         try:
-            self.root.clipboard_clear()
-            self.root.clipboard_append(command)
-            self.root.update_idletasks()
-        except tk.TclError as exc:
-            self._show_error("复制命令失败", exc)
-            return
-        self._append_log("命令预览已复制到剪贴板。")
-
-    def _start(self) -> None:
-        try:
-            settings = self._save_settings()
+            settings = profile.settings()
+            count = 1
+            if role is NetworkRole.CLIENT:
+                count = self._validated_client_count(profile.auto_dev_account)
+                self._save_config(replace(self.config, client_count=count))
         except LauncherError as exc:
             self._show_error("启动失败", exc)
             return
+        if role is NetworkRole.HOST:
+            self._run_async(
+                "正在启动 Host…", lambda: self.controller.ensure_host(settings, profile.name),
+                lambda result: self._on_host_started(*result),
+            )
+        else:
+            self.launch_cancel.clear()
+            self._run_async(
+                f"正在启动 {count} 个 Client…",
+                lambda: self.controller.start_clients(
+                    settings, count, auto_dev_account=profile.auto_dev_account,
+                    label=profile.name, cancel=self.launch_cancel,
+                ),
+                self._on_clients_started,
+            )
+
+    def _start_pair(self) -> None:
+        if self.busy or self.closing:
+            return
+        host, client = self.config.selected(NetworkRole.HOST), self.config.selected(NetworkRole.CLIENT)
+        if host is None or client is None:
+            return
+        mismatches = pair_mismatches(host, client)
+        if mismatches:
+            self._show_error("Client 与 Host 不匹配", LauncherError(
+                f"Client 配置「{client.name}」无法连接 Host 配置「{host.name}」：\n- "
+                + "\n- ".join(mismatches)
+                + "\n\n请在“配置管理”中修改对应字段，或激活其他配置。"
+            ))
+            return
+        try:
+            count = self._validated_client_count(client.auto_dev_account)
+            delay = float(self.client_delay_var.get())
+            self._save_config(replace(self.config, client_delay_seconds=delay, client_count=count))
+            host_settings, client_settings = host.settings(), client.settings()
+        except ValueError:
+            self._show_error("启动失败", LauncherError("Client 启动间隔必须是 0 到 60 之间的数字。"))
+            return
+        except LauncherError as exc:
+            self._show_error("启动失败", exc)
+            return
+        self.launch_cancel.clear()
         self._run_async(
-            "正在启动…",
-            lambda: self.controller.start(settings),
-            self._on_instance_started,
+            f"正在启动 Host + {count} 个 Client…",
+            lambda: self.controller.start_pair(
+                host_settings, client_settings, delay_seconds=delay,
+                auto_dev_account=client.auto_dev_account, client_count=count,
+                cancel=self.launch_cancel,
+                on_host_started=lambda snapshot, reused: self.events.put(("pair_host", (snapshot, reused))),
+                host_label=host.name, client_label=client.name,
+            ),
+            self._on_pair_started,
+        )
+
+    def _on_host_started(self, snapshot: ControllerSnapshot, reused: bool) -> None:
+        if reused:
+            self.snapshots_by_id[snapshot.instance_id] = snapshot
+            self._append_log(
+                f"[{snapshot.display_name}] 复用已运行的相同配置 Host，PID {snapshot.pid}。"
+            )
+        else:
+            self._on_instance_started(snapshot)
+        self._render_instances()
+        self.instance_tree.selection_set(str(snapshot.instance_id))
+
+    def _on_client_started(self, result: object) -> None:
+        if not isinstance(result, ControllerSnapshot):
+            return
+        self._on_instance_started(result)
+        self._render_instances()
+        self.instance_tree.selection_set(str(result.instance_id))
+
+    def _on_clients_started(self, result: object) -> None:
+        if not isinstance(result, ClientLaunchResult):
+            return
+        for client in result.clients:
+            self._on_client_started(client)
+        if result.error and not self.closing:
+            self._show_error("部分 Client 未启动", LauncherError(
+                f"已启动 {len(result.clients)} / {result.requested} 个 Client。\n{result.error}"
+            ))
+
+    def _on_pair_started(self, result: object) -> None:
+        if not isinstance(result, PairLaunchResult):
+            return
+        for client in result.clients:
+            self._on_client_started(client)
+        if result.error and not self.closing:
+            self._show_error("Client 未全部启动", LauncherError(
+                f"已启动 {len(result.clients)} / {result.requested_clients} 个 Client。\n{result.error}"
+                f"\n\nHost（{result.host.display_name}）仍由启动器管理，"
+                "可单独重试“启动 Client”，或在实例列表中关闭 Host。"
+            ))
+
+    def _instance_command(self, instance_id: int | None) -> str | None:
+        """The exact command line of a running instance, including its debug port."""
+        snapshot = self.snapshots_by_id.get(instance_id) if instance_id is not None else None
+        if snapshot is None or snapshot.settings is None:
+            return None
+        return subprocess.list2cmdline([snapshot.settings.executable, *snapshot.arguments])
+
+    def _show_instance_command(self) -> None:
+        instance_id = self._selected_instance_id()
+        command = self._instance_command(instance_id)
+        if instance_id is None or command is None:
+            return
+        snapshot = self.snapshots_by_id[instance_id]
+        dialog = tk.Toplevel(self.root)
+        dialog.title(f"启动命令 - {snapshot.display_name}")
+        dialog.transient(self.root)
+        frame = ttk.Frame(dialog, padding=12)
+        frame.pack(fill=tk.BOTH, expand=True)
+        frame.columnconfigure(0, weight=1)
+        frame.rowconfigure(0, weight=1)
+        text = tk.Text(frame, width=100, height=5, wrap=tk.WORD, font=("Cascadia Mono", 9))
+        text.insert("1.0", command)
+        text.configure(state=tk.DISABLED)
+        text.grid(row=0, column=0, columnspan=2, sticky=tk.NSEW)
+
+        def copy() -> None:
+            dialog.clipboard_clear()
+            dialog.clipboard_append(command)
+            self._append_log(f"[{snapshot.display_name}] 启动命令已复制。")
+
+        ttk.Button(frame, text="复制", command=copy).grid(row=1, column=0, sticky=tk.E, pady=(10, 0))
+        ttk.Button(frame, text="关闭", command=dialog.destroy).grid(
+            row=1, column=1, sticky=tk.E, padx=(8, 0), pady=(10, 0),
         )
 
     def _stop(self) -> None:
@@ -490,8 +619,13 @@ class DebugLauncherApp:
         if snapshot.debug_ports is not None:
             self._start_debug_service(snapshot.debug_ports)
         self._append_log(
-            f"[实例 {snapshot.instance_id}] App 已启动，PID {snapshot.pid}。"
+            f"[{snapshot.display_name}] App 已启动，PID {snapshot.pid}。"
         )
+        if snapshot.settings is not None and DEBUG_WAIT_ARGUMENT in snapshot.arguments:
+            self._append_log(
+                f"[{snapshot.display_name}] 已启用“等待 Lua 调试器”：App 会停在启动阶段，"
+                f"直到 IDE 通过 Attach {self.attach_configuration.name} 连接后才继续运行。"
+            )
 
     def _on_instance_stopped(self, result: object) -> None:
         snapshot = result
@@ -561,6 +695,16 @@ class DebugLauncherApp:
             bridge_port=ports.bridge_port,
             target_port=ports.target_port,
         )
+        if not options.adapter.is_file():
+            if not self.debug_component_missing_reported:
+                self.debug_component_missing_reported = True
+                self._append_log(
+                    f"Lua 调试组件不存在：{options.adapter}。"
+                    "App 仍可正常启动和运行；如需调试，请恢复该组件。", error=True,
+                )
+            self.debug_states[debug_port] = "调试不可用"
+            self._update_debug_status()
+            return
         self.debug_states[debug_port] = "调试启动中"
         self.debug_attach_clients[debug_port] = "未连接"
         self.debug_runtime_clients[debug_port] = "未连接"
@@ -621,6 +765,11 @@ class DebugLauncherApp:
             except queue.Empty:
                 break
 
+            if kind == "pair_host":
+                snapshot, reused = payload
+                self._on_host_started(snapshot, reused)
+                self.status_var.set("Host 已启动，正在准备 Client…")
+                continue
             if kind == "debug_log":
                 debug_port, message = payload  # type: ignore[misc]
                 self._append_log(f"[DAP {debug_port}] [常驻调试] {message}")
@@ -698,7 +847,7 @@ class DebugLauncherApp:
         runtime_client = self.debug_runtime_clients.get(debug_port, "未连接")
         attach_connected = attach_client != "未连接"
         runtime_connected = runtime_client != "未连接"
-        service_failed = state == "调试失败"
+        service_failed = state in ("调试失败", "调试不可用")
         attach_image = (
             "connected"
             if attach_connected
@@ -770,15 +919,18 @@ class DebugLauncherApp:
 
     def _update_buttons(self) -> None:
         selected = self._selected_instance_id() is not None
-        self.start_button.configure(state=tk.DISABLED if self.busy else tk.NORMAL)
-        self.stop_button.configure(
-            state=tk.NORMAL if not self.busy and selected else tk.DISABLED
-        )
-        self.restart_button.configure(
-            state=tk.NORMAL if not self.busy and selected else tk.DISABLED
-        )
+        idle = not self.busy and not self.closing
+        for role, controls in self.role_controls.items():
+            has_profile = self.config.selected(role) is not None
+            controls.start_button.configure(state=tk.NORMAL if idle and has_profile else tk.DISABLED)
+        both_selected = all(self.config.selected(role) is not None for role in LAUNCH_ROLES)
+        self.start_pair_button.configure(state=tk.NORMAL if idle and both_selected else tk.DISABLED)
+        instance_state = tk.NORMAL if idle and selected else tk.DISABLED
+        self.stop_button.configure(state=instance_state)
+        self.restart_button.configure(state=instance_state)
+        self.command_button.configure(state=tk.NORMAL if selected else tk.DISABLED)
         self.stop_all_button.configure(
-            state=tk.NORMAL if not self.busy and self.snapshots_by_id else tk.DISABLED
+            state=tk.NORMAL if idle and self.snapshots_by_id else tk.DISABLED
         )
 
     def _selected_instance_id(self) -> int | None:
@@ -791,39 +943,28 @@ class DebugLauncherApp:
             self.instance_tree.delete(item)
         role_labels = {
             NetworkRole.STANDALONE: "单机",
-            NetworkRole.HOST: "主机",
-            NetworkRole.CLIENT: "客机",
+            NetworkRole.HOST: "Host",
+            NetworkRole.CLIENT: "Client",
         }
         for instance_id, snapshot in self.snapshots_by_id.items():
             settings = snapshot.settings or LauncherSettings()
             network = settings.network
             role = network.role
             if role is NetworkRole.HOST:
-                endpoint = f"监听 :{network.port} / 房间 {network.room_id}"
+                endpoint, room, account = f"监听 :{network.port}", network.room_id, network.dev_account or "—"
             elif role is NetworkRole.CLIENT:
-                endpoint = (
-                    f"{network.host}:{network.port} / 房间 {network.room_id}"
-                    f" / UIN {network.uin}"
-                )
+                endpoint, room, account = f"{network.host}:{network.port}", network.room_id, network.dev_account or "—"
             else:
-                endpoint = "—"
+                endpoint, room, account = "—", "—", "—"
             ports = snapshot.debug_ports
             debug_port = ports.dap_port if ports else None
-            attach_client = self.debug_attach_clients.get(
-                debug_port, "未连接"
-            )
-            runtime_client = self.debug_runtime_clients.get(
-                debug_port, "未连接"
-            )
+            attach_client = self.debug_attach_clients.get(debug_port, "未连接")
+            runtime_client = self.debug_runtime_clients.get(debug_port, "未连接")
             attach_state = (
-                f"已连接 {attach_client}"
-                if attach_client != "未连接"
-                else "未连接"
+                f"已连接 {attach_client}" if attach_client != "未连接" else "未连接"
             )
             runtime_state = (
-                f"已连接 {runtime_client}"
-                if runtime_client != "未连接"
-                else "未连接"
+                f"已连接 {runtime_client}" if runtime_client != "未连接" else "未连接"
             )
             self.instance_tree.insert(
                 "",
@@ -831,50 +972,22 @@ class DebugLauncherApp:
                 iid=str(instance_id),
                 values=(
                     instance_id,
+                    snapshot.label or "—",
                     role_labels[role],
                     snapshot.pid or "—",
                     endpoint,
+                    room,
+                    account,
+                    "运行中",
                     ports.target_port if ports else "—",
                     ports.dap_port if ports else "—",
                     attach_state if ports else "—",
                     runtime_state if ports else "—",
-                    self.debug_states.get(debug_port, "运行中"),
+                    self.debug_states.get(debug_port, "—") if ports else "—",
                 ),
             )
         if selected is not None and selected in self.snapshots_by_id:
             self.instance_tree.selection_set(str(selected))
-
-    def _apply_network_preset(self, role: NetworkRole) -> None:
-        try:
-            arguments = parse_argument_text(self.argument_text_var.get())
-            self.argument_text_var.set(format_argument_text(
-                apply_network_preset(arguments, role)
-            ))
-        except LauncherError as exc:
-            self._show_error("填入参数失败", exc)
-            return
-        self.arguments_entry.xview_moveto(0)
-        self.arguments_entry.focus_set()
-
-    def _refresh_preview(self) -> None:
-        try:
-            settings = self._collect_settings()
-        except LauncherError as exc:
-            self.preview_var.set(f"参数无效：{exc}")
-            return
-        self.preview_var.set(format_command_preview(settings))
-
-    def _browse_executable(self) -> None:
-        current = Path(self.executable_var.get().strip() or r"C:\MiniGame\Bin64")
-        initial = current.parent if current.suffix else current
-        selected = filedialog.askopenfilename(
-            parent=self.root,
-            title="选择 App 可执行文件",
-            initialdir=str(initial),
-            filetypes=(("可执行文件", "*.exe"), ("所有文件", "*.*")),
-        )
-        if selected:
-            self.executable_var.set(selected)
 
     def _remember_window_geometry(self, event: tk.Event[tk.Misc]) -> None:
         if event.widget is not self.root or self.root.state() != "normal":
@@ -915,11 +1028,16 @@ class DebugLauncherApp:
     def _on_close(self) -> None:
         if self.closing:
             return
+        if self.profile_manager is not None and not self.profile_manager.close():
+            return
         self.closing = True
+        self.launch_cancel.set()
+        for callback_id in self.root.tk.splitlist(self.root.tk.call("after", "info")):
+            self.root.after_cancel(callback_id)
         close_errors: list[str] = []
         try:
-            self.store.save_window_geometry(self._current_window_geometry())
-        except ConfigurationError as exc:
+            self._save_config(self.config)
+        except LauncherError as exc:
             close_errors.append(str(exc))
 
         try:

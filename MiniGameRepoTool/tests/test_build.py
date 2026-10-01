@@ -14,7 +14,9 @@ from repo_tool.profiles import ProfileStore, parse_document
 from repo_tool.storage import RunLock
 
 
-SOLUTION = 'Project("{GUID}") = "MiniGame", "MiniGame.vcxproj", "{ID}"\nEndProject\n'
+# Like the generated SLN: "MiniGame" is a solution folder, MiniGameApp is the real C++ project.
+SOLUTION = ('Project("{2150E333-8FDC-42A3-9474-1A3956D46DE8}") = "MiniGame", "MiniGame", "{FOLDER}"\nEndProject\n'
+            'Project("{GUID}") = "MiniGameApp", "MiniGameApp.vcxproj", "{ID}"\nEndProject\n')
 
 
 @pytest.fixture
@@ -31,7 +33,7 @@ def build_profile(tmp_path):
         "assert os.environ['USE_LUA_JIT'] == '1'\n"
         "folder = Path('../../Projects') / sys.argv[1]\nfolder.mkdir(parents=True, exist_ok=True)\n"
         f"(folder / 'MiniGame.sln').write_text({SOLUTION!r})\n"
-        "(folder / 'MiniGame.vcxproj').write_text('<Project />')\n", encoding="utf-8")
+        "(folder / 'MiniGameApp.vcxproj').write_text('<Project />')\n", encoding="utf-8")
     preset = root / "Tools/buildtools/platformconfig/public/vs2019-win64-MiniGame.xml"
     preset.parent.mkdir(parents=True)
     preset.write_text("<preset />")
@@ -70,7 +72,7 @@ def existing_solution(profile):
     solution = profile.build.solution(Path(profile.root))
     solution.parent.mkdir(parents=True, exist_ok=True)
     solution.write_text(SOLUTION, encoding="utf-8")
-    (solution.parent / "MiniGame.vcxproj").write_text("<Project />")
+    (solution.parent / "MiniGameApp.vcxproj").write_text("<Project />")
     return solution
 
 
@@ -81,7 +83,7 @@ def test_build_options_legacy_defaults_and_roundtrip(build_profile, tmp_path):
     restored = parse_document(legacy).profiles[0].build
     assert restored.steps == ["compile"]
     assert (restored.target, restored.configuration, restored.platform, restored.visual_studio_version) == (
-        "MiniGame", "Debug", "x64", "2019")
+        "MiniGameApp", "Debug", "x64", "2019")
     build_profile.build.steps = ["setup", "generate", "compile"]
     build_profile.build.compile_type = "参数 & literal"
     build_profile.build.open_monitor = True
@@ -114,7 +116,7 @@ def test_generation_uses_bat_working_directory_environment_and_output(build_prof
     build_profile.build.steps = ["generate"]
     result = BuildService(tmp_path / "app").run(build_profile)
     assert result["generate"].outcome == "success"
-    assert read_solution_targets(build_profile.build.solution(Path(build_profile.root))) == ["MiniGame"]
+    assert read_solution_targets(build_profile.build.solution(Path(build_profile.root))) == ["MiniGameApp"]
     assert not (Path(build_profile.root) / "setup-ran.txt").exists()
 
 
@@ -154,7 +156,7 @@ def test_pipeline_uses_skill_entry_and_records_actual_ib_exit_code(build_profile
     assert result["compile"].exit_code == 12
     assert any(kind == "log" and "SUMMARY_READ" in value[1] for kind, value in events)
     request = json.loads((Path(result["compile"].session_file).parent / "invoke-mini-ib-build.ps1.request.json").read_text())
-    assert request["Parameters"]["Target"] == "MiniGame"
+    assert request["Parameters"]["Target"] == "MiniGameApp"
     assert "AllowConcurrent" not in request["Parameters"]
     assert "MSBuild.exe" not in request["Script"]
 
@@ -168,6 +170,15 @@ def test_config_check_never_runs_setup_generation_or_compilation(build_profile, 
     assert not list((tmp_path / "app").rglob("incredibuild.session.json"))
     request = next((tmp_path / "app").rglob("invoke-mini-ib-build.ps1.request.json"))
     assert json.loads(request.read_text())["Parameters"]["ValidateOnly"] is True
+
+
+def test_compile_rejects_solution_folder_target_before_calling_skill(build_profile, tmp_path):
+    existing_solution(build_profile)
+    build_profile.build.target = "MiniGame"
+    result = BuildService(tmp_path / "app").run(build_profile, validate_only=True)["compile"]
+    assert result.outcome == "failed"
+    assert "MiniGame 不是 SLN 中的 C++ 工程" in result.message and "MiniGameApp" in result.message
+    assert not list((tmp_path / "app").rglob("invoke-mini-ib-build.ps1.request.json"))
 
 
 def test_successful_ib_run_keeps_complete_logs_and_monitor_parameter(build_profile, tmp_path):

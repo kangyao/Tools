@@ -95,7 +95,7 @@
       "build": {
         "steps": ["compile"],
         "python_path": "Tools/buildtools/Python39/python.exe",
-        "target": "MiniGame",
+        "target": "MiniGameApp",
         "configuration": "Debug",
         "platform": "x64",
         "visual_studio_version": "2019",

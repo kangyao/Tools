@@ -4,6 +4,7 @@ import json
 from pathlib import Path
 import sys
 import tempfile
+import threading
 import unittest
 
 
@@ -77,8 +78,8 @@ class ConfigStoreTests(unittest.TestCase):
 
     def test_settings_round_trip(self) -> None:
         arguments = (
-            "-MGFNetRole", "Client", "-MGFNetHost", "192.168.1.25",
-            "-MGFNetPort", "7001", "-MGFNetRoomId", "3", "-MGFNetUin", "10002",
+            "-MGFDevAccount", "5", "-MGFNetRole", "Client", "-MGFNetHost", "192.168.1.25",
+            "-MGFNetPort", "7001", "-MGFNetRoomId", "3",
             "-Custom", "value with spaces", "", 'a"b', "-script-debug-wait-client",
         )
         settings = LauncherSettings(
@@ -94,7 +95,7 @@ class ConfigStoreTests(unittest.TestCase):
             store.save(settings)
             self.assertEqual(store.load(), settings)
             self.assertEqual(store.load().network, NetworkOptions(
-                NetworkRole.CLIENT, "192.168.1.25", 7001, 3, 10002,
+                NetworkRole.CLIENT, "192.168.1.25", 7001, 3, 5,
             ))
             raw = json.loads(path.read_text(encoding="utf-8"))
             self.assertEqual(raw["version"], 2)
@@ -146,7 +147,7 @@ class ConfigStoreTests(unittest.TestCase):
                 self.assertNotIn("-MGFTopBattle", loaded.arguments)
                 if role == "client":
                     self.assertEqual(loaded.network.host, "10.0.0.8")
-                    self.assertEqual(loaded.network.uin, 10001)
+                    self.assertEqual(loaded.network.dev_account, 2)
 
     def test_legacy_settings_without_optional_fields_still_load(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -208,7 +209,7 @@ class ConfigStoreTests(unittest.TestCase):
 
 class ArgumentTests(unittest.TestCase):
     def test_host_preset_matches_start_aicore_host_bat(self) -> None:
-        expected = ("-MGFNetRole", "Host", "-MGFNetPort", "7000", "-MGFNetRoomId", "1")
+        expected = ("-MGFDevAccount", "1", "-MGFNetRole", "Host", "-MGFNetPort", "7000", "-MGFNetRoomId", "1")
         arguments = apply_network_preset((), NetworkRole.HOST)
         self.assertEqual(arguments, expected)
         settings = LauncherSettings(arguments=arguments)
@@ -217,8 +218,8 @@ class ArgumentTests(unittest.TestCase):
 
     def test_client_preset_matches_start_aicore_client_bat(self) -> None:
         expected = (
-            "-MGFNetRole", "Client", "-MGFNetHost", "127.0.0.1",
-            "-MGFNetPort", "7000", "-MGFNetRoomId", "1", "-MGFNetUin", "10001",
+            "-MGFDevAccount", "2", "-MGFNetRole", "Client", "-MGFNetHost", "127.0.0.1",
+            "-MGFNetPort", "7000", "-MGFNetRoomId", "1",
         )
         arguments = apply_network_preset((), NetworkRole.CLIENT)
         self.assertEqual(arguments, expected)
@@ -228,11 +229,11 @@ class ArgumentTests(unittest.TestCase):
 
     def test_switching_presets_preserves_custom_options_without_stale_network_flags(self) -> None:
         custom = ("-App", "value with spaces", "-script-debug-wait-client")
-        client = NetworkOptions(NetworkRole.CLIENT, "10.0.0.8", 7002, 5, 10008).arguments()
-        host = apply_network_preset(custom + client, NetworkRole.HOST)
+        client = NetworkOptions(NetworkRole.CLIENT, "10.0.0.8", 7002, 5, 8).arguments()
+        host = apply_network_preset(custom + client + ("-MGFNetUin", "10008"), NetworkRole.HOST)
         self.assertEqual(host, (
-            "-MGFNetRole", "Host", "-MGFNetPort", "7000", "-MGFNetRoomId", "1", *custom,
-        ))
+            "-MGFDevAccount", "1", "-MGFNetRole", "Host", "-MGFNetPort", "7000", "-MGFNetRoomId", "1", *custom,
+        ), "切换预设同时清掉已移除的 -MGFNetUin")
         self.assertEqual(apply_network_preset(host, NetworkRole.STANDALONE), custom)
 
     def test_custom_app_arguments_are_preserved_without_gameplay_selection(self) -> None:
@@ -244,11 +245,11 @@ class ArgumentTests(unittest.TestCase):
 
     def test_edited_network_values_drive_metadata_and_launch(self) -> None:
         arguments = parse_argument_text(
-            '-MGFNetRole Client -MGFNetHost 10.0.0.8 -MGFNetPort 7002 '
-            '-MGFNetRoomId 12 -MGFNetUin 20002 -App "Custom App"'
+            '-MGFDevAccount 7 -MGFNetRole Client -MGFNetHost 10.0.0.8 -MGFNetPort 7002 '
+            '-MGFNetRoomId 12 -App "Custom App"'
         )
         settings = LauncherSettings(arguments=arguments)
-        self.assertEqual(settings.network, NetworkOptions(NetworkRole.CLIENT, "10.0.0.8", 7002, 12, 20002))
+        self.assertEqual(settings.network, NetworkOptions(NetworkRole.CLIENT, "10.0.0.8", 7002, 12, 7))
         self.assertEqual(build_launch_arguments(settings), arguments)
 
     def test_invalid_network_values_are_rejected(self) -> None:
@@ -257,8 +258,7 @@ class ArgumentTests(unittest.TestCase):
             ("-MGFNetPort", "0"), ("-MGFNetPort", "65536"),
             ("-MGFNetPort", "abc"), ("-MGFNetPort", "-MGFNetRoomId", "1"),
             ("-MGFNetHost", ""), ("-MGFNetRoomId", "0"),
-            ("-MGFNetRole", "Client", "-MGFNetUin", "1"),
-            ("-MGFNetUin", "-2"), ("-MGFNetUin", "abc"),
+            ("-MGFDevAccount", "0"), ("-MGFDevAccount", "abc"), ("-MGFDevAccount",),
             ("-MGFNetPort", "7000", "-MGFNetPort", "7001"),
             ("-lua-debug-port", "3382"),
         )
@@ -507,7 +507,7 @@ class LauncherControllerTests(unittest.TestCase):
         client = LauncherSettings(arguments=NetworkOptions(role=NetworkRole.CLIENT).arguments())
         self.controller.start(client)
         self.controller.start(LauncherSettings(
-            arguments=NetworkOptions(role=NetworkRole.CLIENT, uin=10002).arguments(),
+            arguments=NetworkOptions(role=NetworkRole.CLIENT, dev_account=3).arguments(),
         ))
         self.assertEqual(len(self.factory.created), 2)
 
@@ -532,15 +532,161 @@ class LauncherControllerTests(unittest.TestCase):
             {"MINIGAME_MCP_CLIENT_NAME": "AICore_profile-CLIENT-3382"},
         )
 
-    def test_duplicate_client_uin_in_same_room_is_rejected(self) -> None:
+    def test_duplicate_dev_account_is_rejected(self) -> None:
         client = LauncherSettings(arguments=NetworkOptions(role=NetworkRole.CLIENT).arguments())
         started = self.controller.start(client)
-        with self.assertRaisesRegex(LauncherError, "UIN 10001"):
+        with self.assertRaisesRegex(LauncherError, "开发账号 2"):
             self.controller.start(client)
         self.assertEqual(len(self.factory.created), 1)
         self.controller.stop(started.instance_id)
         self.controller.start(client)
         self.assertEqual(len(self.factory.created), 2)
+
+    def test_pair_starts_host_before_client_and_uses_separate_debug_ports(self) -> None:
+        host = LauncherSettings(arguments=NetworkOptions(role=NetworkRole.HOST).arguments())
+        client = LauncherSettings(arguments=NetworkOptions(role=NetworkRole.CLIENT).arguments())
+        observed = []
+        result = self.controller.start_pair(
+            host, client, delay_seconds=0,
+            on_host_started=lambda snapshot, reused: observed.append((snapshot.instance_id, reused, len(self.factory.created))),
+        )
+        self.assertEqual(observed, [(1, False, 1)])
+        self.assertEqual(result.client.instance_id, 2)
+        self.assertNotEqual(result.host.debug_ports, result.client.debug_ports)
+        self.assertEqual(self.factory.calls[0][1][:4], ("-MGFDevAccount", "1", "-MGFNetRole", "Host"))
+        self.assertEqual(self.factory.calls[1][1][:4], ("-MGFDevAccount", "2", "-MGFNetRole", "Client"))
+
+    def test_pair_reuses_managed_host_and_allocates_another_client_dev_account(self) -> None:
+        host = LauncherSettings(arguments=NetworkOptions(role=NetworkRole.HOST).arguments())
+        client = LauncherSettings(arguments=NetworkOptions(role=NetworkRole.CLIENT).arguments())
+        first = self.controller.start_pair(host, client, delay_seconds=0)
+        second = self.controller.start_pair(host, client, delay_seconds=0)
+        self.assertTrue(second.host_reused)
+        self.assertEqual(first.host.instance_id, second.host.instance_id)
+        self.assertEqual(second.client.settings.network.dev_account, 3)
+        self.assertEqual(len(self.factory.created), 3)
+
+    def test_changed_host_configuration_is_not_silently_reused(self) -> None:
+        original = LauncherSettings(arguments=NetworkOptions(role=NetworkRole.HOST).arguments())
+        changed = LauncherSettings(arguments=NetworkOptions(role=NetworkRole.HOST, room_id=2).arguments())
+        self.controller.ensure_host(original)
+        with self.assertRaisesRegex(LauncherError, "参数不同"):
+            self.controller.ensure_host(changed)
+        self.assertEqual(len(self.factory.created), 1)
+
+    def test_client_failure_keeps_host_owned_and_reports_partial_result(self) -> None:
+        normal_factory = self.controller._process_factory
+        def fail_client(executable, arguments, show_console, environment):
+            if "Client" in arguments:
+                raise LauncherError("Client executable missing")
+            return normal_factory(executable, arguments, show_console, environment)
+        self.controller._process_factory = fail_client
+        result = self.controller.start_pair(
+            LauncherSettings(arguments=NetworkOptions(role=NetworkRole.HOST).arguments()),
+            LauncherSettings(arguments=NetworkOptions(role=NetworkRole.CLIENT).arguments()),
+            delay_seconds=0,
+        )
+        self.assertIsNone(result.client)
+        self.assertIn("Client executable missing", result.error)
+        self.assertEqual(len(self.controller.snapshots()), 1)
+        self.controller.stop(result.host.instance_id)
+        self.assertTrue(self.factory.created[0].terminated)
+
+    def test_host_failure_prevents_client_launch(self) -> None:
+        def fail(*args):
+            raise LauncherError("Host executable missing")
+        self.controller._process_factory = fail
+        with self.assertRaisesRegex(LauncherError, "Host executable missing"):
+            self.controller.start_pair(
+                LauncherSettings(arguments=NetworkOptions(role=NetworkRole.HOST).arguments()),
+                LauncherSettings(arguments=NetworkOptions(role=NetworkRole.CLIENT).arguments()),
+                delay_seconds=0,
+            )
+        self.assertEqual(self.controller.snapshots(), ())
+
+    def test_cancelling_pair_after_host_start_prevents_client(self) -> None:
+        cancel = threading.Event()
+        result = self.controller.start_pair(
+            LauncherSettings(arguments=NetworkOptions(role=NetworkRole.HOST).arguments()),
+            LauncherSettings(arguments=NetworkOptions(role=NetworkRole.CLIENT).arguments()),
+            delay_seconds=5, cancel=cancel,
+            on_host_started=lambda *_: cancel.set(),
+        )
+        self.assertIsNone(result.client)
+        self.assertIn("取消", result.error)
+        self.assertEqual(len(self.factory.created), 1)
+
+    def test_client_can_disable_auto_dev_account_and_report_duplicate(self) -> None:
+        client = LauncherSettings(arguments=NetworkOptions(role=NetworkRole.CLIENT).arguments())
+        self.controller.start_client(client, auto_dev_account=False)
+        with self.assertRaisesRegex(LauncherError, "开发账号 2"):
+            self.controller.start_client(client, auto_dev_account=False)
+
+    def test_auto_dev_account_skips_accounts_used_by_host(self) -> None:
+        self.controller.start(LauncherSettings(
+            arguments=NetworkOptions(role=NetworkRole.HOST, dev_account=2).arguments(),
+        ))
+        client = LauncherSettings(arguments=NetworkOptions(role=NetworkRole.CLIENT).arguments())
+        started = self.controller.start_client(client)
+        self.assertEqual(started.settings.network.dev_account, 3, "本机账号锁全局：跳过 Host 占用的 2")
+
+    def test_profile_label_follows_instance_through_restart_and_conflicts(self) -> None:
+        host = LauncherSettings(arguments=NetworkOptions(role=NetworkRole.HOST).arguments())
+        snapshot, _ = self.controller.ensure_host(host, "本机 Host")
+        self.assertEqual(snapshot.label, "本机 Host")
+        self.assertEqual(self.controller.restart(snapshot.instance_id).label, "本机 Host")
+        changed = LauncherSettings(arguments=NetworkOptions(role=NetworkRole.HOST, room_id=2).arguments())
+        with self.assertRaisesRegex(LauncherError, "实例 1「本机 Host」"):
+            self.controller.ensure_host(changed, "房间 2 Host")
+        result = self.controller.start_pair(
+            host, LauncherSettings(arguments=NetworkOptions(role=NetworkRole.CLIENT).arguments()),
+            delay_seconds=0, host_label="另一个名称", client_label="本机 Client",
+        )
+        self.assertEqual((result.host.label, result.client.label), ("本机 Host", "本机 Client"))
+        self.assertEqual(self.controller.stop(result.client.instance_id).label, "本机 Client")
+
+    def test_start_clients_gives_each_client_its_own_dev_account(self) -> None:
+        client = LauncherSettings(arguments=NetworkOptions(role=NetworkRole.CLIENT).arguments())
+        result = self.controller.start_clients(client, 3, label="本机 Client")
+        self.assertEqual([c.settings.network.dev_account for c in result.clients], [2, 3, 4])
+        self.assertEqual({c.label for c in result.clients}, {"本机 Client"})
+        self.assertEqual(result.error, "")
+
+    def test_fixed_dev_account_cannot_start_several_clients(self) -> None:
+        client = LauncherSettings(arguments=NetworkOptions(role=NetworkRole.CLIENT).arguments())
+        with self.assertRaisesRegex(ConfigurationError, "固定开发账号"):
+            self.controller.start_clients(client, 2, auto_dev_account=False)
+        with self.assertRaisesRegex(ConfigurationError, "固定开发账号"):
+            self.controller.start_pair(
+                LauncherSettings(arguments=NetworkOptions(role=NetworkRole.HOST).arguments()),
+                client, delay_seconds=0, auto_dev_account=False, client_count=2,
+            )
+        self.assertEqual(self.factory.created, [])
+
+    def test_client_batch_failure_keeps_started_clients(self) -> None:
+        normal_factory = self.controller._process_factory
+
+        def fail_third(executable, arguments, show_console, environment):
+            if len(self.factory.created) == 2:
+                raise LauncherError("third client failed")
+            return normal_factory(executable, arguments, show_console, environment)
+
+        self.controller._process_factory = fail_third
+        client = LauncherSettings(arguments=NetworkOptions(role=NetworkRole.CLIENT).arguments())
+        result = self.controller.start_clients(client, 3)
+        self.assertEqual((len(result.clients), result.requested), (2, 3))
+        self.assertIn("third client failed", result.error)
+        self.assertEqual(len(self.controller.snapshots()), 2)
+
+    def test_pair_starts_the_requested_number_of_clients(self) -> None:
+        result = self.controller.start_pair(
+            LauncherSettings(arguments=NetworkOptions(role=NetworkRole.HOST).arguments()),
+            LauncherSettings(arguments=NetworkOptions(role=NetworkRole.CLIENT).arguments()),
+            delay_seconds=0, client_count=2,
+        )
+        self.assertEqual(len(result.clients), 2)
+        self.assertEqual(result.client, result.clients[0])
+        self.assertEqual(len(self.factory.created), 3)
 
     def test_stop_all(self) -> None:
         self.controller.start(self.settings)

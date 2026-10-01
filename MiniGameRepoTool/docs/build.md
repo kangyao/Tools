@@ -28,7 +28,7 @@
 | 依赖打包 | 选中后传 --packzip True，生成 WinSetup.zip；不能与离线包同时使用 |
 | 生成参数 | 对应原生成 BAT 的第一个参数 mComplieType，可留空 |
 | 生成环境参数 | 每行 名称=值；支持 USE_LUA_JIT、USE_RAINBOW_LIB、USE_DEV_BUILD 等原 BAT 参数，默认值见下方 |
-| 编译目标 | MiniGame；可以输入 MiniGameProfiler 等已有目标，也可点“读取 SLN 目标”选择实际存在的 C++ 项目 |
+| 编译目标 | MiniGameApp；SLN 中的 MiniGame 只是解决方案文件夹，不能作为目标。可以输入其他已有目标，也可点“读取 SLN 目标”选择实际存在的 C++ 项目（当前目标不在列表中时自动切到 MiniGameApp）。编译和检查前，工具先确认目标是 SLN 中的 C++ 项目 |
 | 构建配置 | Debug；可选 Release、Profile、EditorDebug、EditorRelease，实际支持情况由现有工程与 IB 判定 |
 | 动作 | Build 增量编译、Rebuild 重新编译、Clean 清理，均只针对指定目标 |
 | mini-compile-ib 技能目录 | W:/git/skills/mini-compile-ib；必须含 scripts 下的 invoke/read/stop 三个脚本 |

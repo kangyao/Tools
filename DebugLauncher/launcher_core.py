@@ -25,10 +25,15 @@ MCP_CLIENT_NAME_ENVIRONMENT_VARIABLE = "MINIGAME_MCP_CLIENT_NAME"
 DEFAULT_NETWORK_HOST = "127.0.0.1"
 DEFAULT_NETWORK_PORT = 7000
 DEFAULT_NETWORK_ROOM_ID = 1
-DEFAULT_NETWORK_UIN = 10001
+DEV_ACCOUNT_ARGUMENT = "-MGFDevAccount"
+# 开发账号序号（AIGamePlay/.dev/account.json 的数组位置，1 起）：Host 默认 1，Client 默认 2。
+# AICore 按账号加锁，同一台机器上每个进程必须用不同的账号。
+DEFAULT_DEV_ACCOUNTS = {"host": 1, "client": 2}
 NETWORK_ARGUMENTS = (
-    "-MGFNetRole", "-MGFNetHost", "-MGFNetPort", "-MGFNetRoomId", "-MGFNetUin",
+    DEV_ACCOUNT_ARGUMENT, "-MGFNetRole", "-MGFNetHost", "-MGFNetPort", "-MGFNetRoomId",
 )
+# 已移除的旧参数：客机身份改取登录账号，AICore 收到会判 NetLaunchInvalid: uin；读取旧参数时丢弃。
+LEGACY_NETWORK_ARGUMENTS = ("-MGFNetUin",)
 DEFAULT_SCRIPT_DEBUG_PORT = 3382
 DEFAULT_BRIDGE_PORT = 3383
 DEFAULT_DAP_PORT = 4711
@@ -107,26 +112,37 @@ class NetworkRole(str, Enum):
     CLIENT = "client"
 
 
+def default_dev_account(role: NetworkRole) -> int:
+    """Default dev account index for a role; 0 means the role passes no -MGFDevAccount."""
+    return DEFAULT_DEV_ACCOUNTS.get(role.value, 0)
+
+
 @dataclass(frozen=True)
 class NetworkOptions:
     role: NetworkRole = NetworkRole.STANDALONE
     host: str = DEFAULT_NETWORK_HOST
     port: int = DEFAULT_NETWORK_PORT
     room_id: int = DEFAULT_NETWORK_ROOM_ID
-    uin: int = DEFAULT_NETWORK_UIN
+    # None 表示取角色默认值（Host 1、Client 2、单机不传）。
+    dev_account: int | None = None
+
+    def __post_init__(self) -> None:
+        if self.dev_account is None:
+            object.__setattr__(self, "dev_account", default_dev_account(self.role))
 
     def arguments(self) -> tuple[str, ...]:
-        """Match StartAICoreHost.bat / StartAICoreClient.bat argument order."""
+        """Match AIGamePlay Tools/Start-NetDebug.ps1 argument order (dev account first)."""
         if self.role is NetworkRole.STANDALONE:
             return ()
-        arguments = ["-MGFNetRole", self.role.value.title()]
+        arguments: list[str] = []
+        if self.dev_account:
+            arguments.extend((DEV_ACCOUNT_ARGUMENT, str(self.dev_account)))
+        arguments.extend(("-MGFNetRole", self.role.value.title()))
         if self.role is NetworkRole.CLIENT:
             arguments.extend(("-MGFNetHost", self.host))
         arguments.extend((
             "-MGFNetPort", str(self.port), "-MGFNetRoomId", str(self.room_id),
         ))
-        if self.role is NetworkRole.CLIENT:
-            arguments.extend(("-MGFNetUin", str(self.uin)))
         return tuple(arguments)
 
 
@@ -137,6 +153,10 @@ def parse_network_arguments(arguments: Sequence[str]) -> NetworkOptions:
     while index < len(arguments):
         argument = arguments[index]
         index += 1
+        if argument in LEGACY_NETWORK_ARGUMENTS:
+            if index < len(arguments) and not arguments[index].startswith("-"):
+                index += 1
+            continue
         if argument not in NETWORK_ARGUMENTS:
             continue
         if argument in values:
@@ -167,10 +187,11 @@ def parse_network_arguments(arguments: Sequence[str]) -> NetworkOptions:
     if port > MAX_PORT:
         raise ConfigurationError(f"-MGFNetPort 必须是 1 到 {MAX_PORT} 之间的整数。")
     room_id = positive_integer("-MGFNetRoomId", DEFAULT_NETWORK_ROOM_ID)
-    uin = positive_integer("-MGFNetUin", DEFAULT_NETWORK_UIN)
-    if role is NetworkRole.CLIENT and uin == 1:
-        raise ConfigurationError("Client 的 -MGFNetUin 不能为 1（主机本地玩家 ID）。")
-    return NetworkOptions(role, host, port, room_id, uin)
+    if DEV_ACCOUNT_ARGUMENT in values:
+        dev_account = positive_integer(DEV_ACCOUNT_ARGUMENT, 1)
+    else:
+        dev_account = default_dev_account(role)
+    return NetworkOptions(role, host, port, room_id, dev_account)
 
 
 def apply_network_preset(
@@ -182,7 +203,7 @@ def apply_network_preset(
     while index < len(arguments):
         argument = arguments[index]
         index += 1
-        if argument in NETWORK_ARGUMENTS:
+        if argument in NETWORK_ARGUMENTS or argument in LEGACY_NETWORK_ARGUMENTS:
             if index < len(arguments) and not arguments[index].startswith("-"):
                 index += 1
         else:
@@ -240,8 +261,12 @@ class ConfigStore:
         self.path = path
 
     def load(self) -> LauncherSettings:
+        raw = self.read_payload()
+        return LauncherSettings() if raw is None else self.parse_settings(raw)
+
+    def read_payload(self) -> dict[str, object] | None:
         if not self.path.exists():
-            return LauncherSettings()
+            return None
 
         try:
             raw = json.loads(self.path.read_text(encoding="utf-8"))
@@ -250,6 +275,10 @@ class ConfigStore:
 
         if not isinstance(raw, dict):
             raise ConfigurationError("配置文件根节点必须是 JSON 对象。")
+        return raw
+
+    @staticmethod
+    def parse_settings(raw: dict[str, object]) -> LauncherSettings:
         if raw.get("version") not in (1, CONFIG_VERSION):
             raise ConfigurationError(
                 f"不支持的配置版本：{raw.get('version')!r}，当前版本为 {CONFIG_VERSION}。"
@@ -326,7 +355,11 @@ class ConfigStore:
         )
 
     def save(self, settings: LauncherSettings) -> None:
-        payload = {
+        self.write_payload(self.settings_payload(settings))
+
+    @staticmethod
+    def settings_payload(settings: LauncherSettings) -> dict[str, object]:
+        return {
             "version": CONFIG_VERSION,
             "executable": settings.executable,
             "arguments": list(settings.arguments),
@@ -334,7 +367,10 @@ class ConfigStore:
             "show_console": settings.show_console,
             "window_geometry": settings.window_geometry,
         }
-        if not is_valid_window_geometry(settings.window_geometry):
+
+    def write_payload(self, payload: dict[str, object]) -> None:
+        geometry = payload.get("window_geometry", "")
+        if not isinstance(geometry, str) or not is_valid_window_geometry(geometry):
             raise ConfigurationError(
                 "窗口位置格式无效，必须是“宽x高+X+Y”。"
             )
@@ -879,6 +915,33 @@ class ControllerSnapshot:
     settings: LauncherSettings | None = None
     debug_ports: DebugPortBundle | None = None
     arguments: tuple[str, ...] = ()
+    label: str = ""
+
+    @property
+    def display_name(self) -> str:
+        return f"实例 {self.instance_id}" + (f"「{self.label}」" if self.label else "")
+
+
+@dataclass(frozen=True)
+class ClientLaunchResult:
+    """Clients started by one batch; a failure stops the batch but keeps earlier Clients."""
+
+    clients: tuple[ControllerSnapshot, ...] = ()
+    requested: int = 1
+    error: str = ""
+
+
+@dataclass(frozen=True)
+class PairLaunchResult:
+    host: ControllerSnapshot
+    clients: tuple[ControllerSnapshot, ...] = ()
+    host_reused: bool = False
+    error: str = ""
+    requested_clients: int = 1
+
+    @property
+    def client(self) -> ControllerSnapshot | None:
+        return self.clients[0] if self.clients else None
 
 
 ProcessFactory = Callable[
@@ -894,6 +957,20 @@ class _ManagedInstance:
     debug_ports: DebugPortBundle
     arguments: tuple[str, ...]
     process: ManagedProcess
+    label: str = ""
+
+
+MAX_CLIENT_COUNT = 16
+
+
+def validate_client_count(count: int, auto_dev_account: bool) -> None:
+    if isinstance(count, bool) or not isinstance(count, int) or not 1 <= count <= MAX_CLIENT_COUNT:
+        raise ConfigurationError(f"Client 数量必须是 1 到 {MAX_CLIENT_COUNT} 之间的整数。")
+    if count > 1 and not auto_dev_account:
+        raise ConfigurationError(
+            "该 Client 配置使用固定开发账号，不能一次启动多个；"
+            "请在配置管理中启用“多开时自动分配不同账号”，或把数量设为 1。"
+        )
 
 
 class LauncherController:
@@ -965,7 +1042,7 @@ class LauncherController:
                 self._idle_debug_slots.append(debug_ports)
             return debug_ports
 
-    def start(self, settings: LauncherSettings) -> ControllerSnapshot:
+    def start(self, settings: LauncherSettings, label: str = "") -> ControllerSnapshot:
         with self._lock:
             if self._closed:
                 raise LauncherError("启动器正在关闭，不能再启动 App。")
@@ -991,9 +1068,125 @@ class LauncherController:
                 debug_ports,
                 arguments,
                 process,
+                label,
             )
             self._instances[instance_id] = instance
             return self._snapshot(instance)
+
+    def ensure_host(
+        self, settings: LauncherSettings, label: str = "",
+    ) -> tuple[ControllerSnapshot, bool]:
+        """Reuse only a managed Host with the same executable and arguments."""
+        if settings.network.role is not NetworkRole.HOST:
+            raise ConfigurationError("Host 配置的网络角色必须是 Host。")
+        with self._lock:
+            if self._closed:
+                raise LauncherError("启动器正在关闭，不能再启动 Host。")
+            self._reap_finished_processes()
+            for instance in self._instances.values():
+                existing = instance.settings
+                if (
+                    existing.network.role is NetworkRole.HOST
+                    and existing.network.port == settings.network.port
+                ):
+                    same_executable = os.path.normcase(os.path.normpath(existing.executable)) == (
+                        os.path.normcase(os.path.normpath(settings.executable))
+                    )
+                    if same_executable and existing.enabled_arguments == settings.enabled_arguments:
+                        return self._snapshot(instance), True
+                    raise LauncherError(
+                        f"端口 {settings.network.port} 上已有参数不同的 Host"
+                        f"（{self._snapshot(instance).display_name}），"
+                        "请先关闭该实例，或选择使用其他端口的配置。"
+                    )
+            return self.start(settings, label), False
+
+    def start_client(
+        self, settings: LauncherSettings, *, auto_dev_account: bool = True, label: str = "",
+    ) -> ControllerSnapshot:
+        if settings.network.role is not NetworkRole.CLIENT:
+            raise ConfigurationError("Client 配置的网络角色必须是 Client。")
+        with self._lock:
+            self._reap_finished_processes()
+            if auto_dev_account:
+                network = settings.network
+                # 开发账号锁是本机全局的：Host 与所有 Client（不论房间）占用的序号都要跳过。
+                used = {
+                    instance.settings.network.dev_account
+                    for instance in self._instances.values()
+                    if instance.settings.network.dev_account
+                }
+                dev_account = network.dev_account or default_dev_account(NetworkRole.CLIENT)
+                while dev_account in used:
+                    dev_account += 1
+                if dev_account != network.dev_account:
+                    arguments = replace(network, dev_account=dev_account).arguments() + apply_network_preset(
+                        settings.enabled_arguments, NetworkRole.STANDALONE,
+                    )
+                    settings = replace(settings, arguments=arguments, argument_enabled=None)
+            return self.start(settings, label)
+
+    def start_clients(
+        self,
+        settings: LauncherSettings,
+        count: int = 1,
+        *,
+        auto_dev_account: bool = True,
+        label: str = "",
+        cancel: threading.Event | None = None,
+    ) -> ClientLaunchResult:
+        """Start several Clients from one configuration, each with its own dev account."""
+        validate_client_count(count, auto_dev_account)
+        clients: list[ControllerSnapshot] = []
+        try:
+            for _index in range(count):
+                if cancel is not None and cancel.is_set():
+                    raise LauncherError("已取消后续 Client 启动。")
+                clients.append(self.start_client(settings, auto_dev_account=auto_dev_account, label=label))
+        except Exception as exc:
+            if not clients:
+                raise
+            return ClientLaunchResult(tuple(clients), count, str(exc))
+        return ClientLaunchResult(tuple(clients), count)
+
+    def start_pair(
+        self,
+        host: LauncherSettings,
+        client: LauncherSettings,
+        *,
+        delay_seconds: float = 2.0,
+        auto_dev_account: bool = True,
+        client_count: int = 1,
+        cancel: threading.Event | None = None,
+        on_host_started: Callable[[ControllerSnapshot, bool], None] | None = None,
+        host_label: str = "",
+        client_label: str = "",
+    ) -> PairLaunchResult:
+        """Start Host first, then the Clients; keep the Host managed if a Client fails."""
+        if client.network.role is not NetworkRole.CLIENT:
+            raise ConfigurationError("Client 配置的网络角色必须是 Client。")
+        if not 0 <= delay_seconds <= 60:
+            raise ConfigurationError("Client 启动间隔必须在 0 到 60 秒之间。")
+        validate_client_count(client_count, auto_dev_account)
+        cancel = cancel or threading.Event()
+        if cancel.is_set():
+            raise LauncherError("已取消启动。")
+        snapshot, reused = self.ensure_host(host, host_label)
+        if on_host_started is not None:
+            on_host_started(snapshot, reused)
+        try:
+            if cancel.wait(0 if reused else delay_seconds):
+                raise LauncherError("已取消后续 Client 启动。")
+            self.snapshot(snapshot.instance_id)  # Host may have exited during the delay.
+            launched = self.start_clients(
+                client, client_count, auto_dev_account=auto_dev_account,
+                label=client_label, cancel=cancel,
+            )
+        except Exception as exc:
+            return PairLaunchResult(
+                snapshot, host_reused=reused, error=str(exc), requested_clients=client_count,
+            )
+        return PairLaunchResult(snapshot, launched.clients, reused, launched.error, client_count)
 
     def stop(self, instance_id: int, timeout_ms: int = 5000) -> ControllerSnapshot:
         with self._lock:
@@ -1018,6 +1211,7 @@ class LauncherController:
                 settings=instance.settings,
                 debug_ports=instance.debug_ports,
                 arguments=instance.arguments,
+                label=instance.label,
             )
 
     def restart(self, instance_id: int, timeout_ms: int = 5000) -> ControllerSnapshot:
@@ -1095,10 +1289,10 @@ class LauncherController:
                     f"Host 端口 {network.port} 已被实例 "
                     f"{instance.instance_id} 使用。"
                 )
-            if network.role is NetworkRole.CLIENT and existing == network:
+            if network.dev_account and existing.dev_account == network.dev_account:
                 raise LauncherError(
-                    f"Client UIN {network.uin} 已被实例 {instance.instance_id} "
-                    "用于同一房间，请修改 -MGFNetUin 后再启动。"
+                    f"开发账号 {network.dev_account} 已被{self._snapshot(instance).display_name}"
+                    "占用（同一台机器每个进程须用不同账号），请修改开发账号序号或启用自动分配后再启动。"
                 )
 
     def _acquire_debug_slot(self) -> DebugPortBundle:
@@ -1125,6 +1319,7 @@ class LauncherController:
             settings=instance.settings,
             debug_ports=instance.debug_ports,
             arguments=instance.arguments,
+            label=instance.label,
         )
 
     def _reap_finished_processes(self) -> None:

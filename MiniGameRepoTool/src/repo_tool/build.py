@@ -8,7 +8,8 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 
-from .build_config import BUILD_STEPS, default_generation_environment, resolve_build_path, validate_build_options
+from .build_config import (BUILD_STEPS, default_generation_environment, require_solution_target, resolve_build_path,
+                           validate_build_options)
 from .models import Profile
 from .process import ProcessRunner, redact
 from .profiles import atomic_json
@@ -193,6 +194,7 @@ class BuildService:
         root = Path(profile.root).resolve()
         options = profile.build
         self._require(options.solution(root), "已有 SLN 工程（请先执行生成 SLN 工程）")
+        require_solution_target(options.solution(root), options.target)
         skill = resolve_build_path(root, options.ib_skill_dir) / "scripts"
         for name in ("invoke-mini-ib-build.ps1", "stop-mini-ib-build.ps1", "read-mini-ib-result.ps1"):
             self._require(skill / name, "IB 技能脚本")

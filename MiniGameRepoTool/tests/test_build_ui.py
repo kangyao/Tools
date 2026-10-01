@@ -50,9 +50,11 @@ def test_build_dialog_executes_selected_step_and_reports_errors(qapp, build_prof
 
 def test_build_dialog_reads_targets_and_checks_without_build(qapp, build_profile, tmp_path):
     existing_solution(build_profile)
+    build_profile.build.target = "MiniGame"  # legacy default: only a solution folder
     dialog = BuildDialog(tmp_path / "app", build_profile, lambda _: True)
     dialog.load_targets()
-    assert dialog.target.findText("MiniGame") >= 0
+    assert dialog.target.findText("MiniGame") < 0
+    assert dialog.target.currentText() == "MiniGameApp"
     dialog.start(True)
     wait_job(dialog, qapp, timeout=90)
     assert dialog.status_table.item(2, 1).text() == "检查通过"

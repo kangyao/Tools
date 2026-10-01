@@ -10,6 +10,7 @@ CONFIGURATIONS = ("Debug", "Release", "Profile", "EditorDebug", "EditorRelease")
 PLATFORMS = ("x64", "Win32")
 VS_VERSIONS = ("2019", "2022")
 BUILD_ACTIONS = ("Build", "Rebuild", "Clean")
+DEFAULT_TARGET = "MiniGameApp"
 
 
 def default_generation_environment() -> dict[str, str]:
@@ -27,7 +28,8 @@ class BuildOptions:
     setup_pack_zip: bool = False
     compile_type: str = ""
     generation_environment: dict[str, str] = field(default_factory=default_generation_environment)
-    target: str = "MiniGame"
+    # "MiniGame" in the generated SLN is only a solution folder; the game executable project is MiniGameApp.
+    target: str = DEFAULT_TARGET
     configuration: str = "Debug"
     platform: str = "x64"
     visual_studio_version: str = "2019"
@@ -98,3 +100,13 @@ def read_solution_targets(solution: Path) -> list[str]:
     text = solution.read_text(encoding="utf-8-sig", errors="replace")
     return sorted(set(re.findall(r'^Project\([^\r\n]+\)\s*=\s*"([^"]+)"\s*,\s*"[^"]+\.vcxproj"',
                                  text, re.MULTILINE | re.IGNORECASE)))
+
+
+def require_solution_target(solution: Path, target: str) -> None:
+    # The IB skill matches project names case-insensitively, so mirror that here.
+    targets = read_solution_targets(solution)
+    if target.casefold() in {name.casefold() for name in targets}:
+        return
+    hints = [name for name in targets if target.casefold() in name.casefold()][:5]
+    raise ValueError(f"编译目标 {target} 不是 SLN 中的 C++ 工程（可能只是解决方案文件夹）；"
+                     + (f"可选：{'、'.join(hints)}" if hints else "请点击“读取 SLN 目标”重新选择"))

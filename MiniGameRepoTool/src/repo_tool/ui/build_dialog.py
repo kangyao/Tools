@@ -14,7 +14,7 @@ from PySide6.QtWidgets import (
 
 from ..build import build_preview
 from ..build_config import (
-    BUILD_ACTIONS, BUILD_STEPS, CONFIGURATIONS, PLATFORMS, VS_VERSIONS, BuildOptions,
+    BUILD_ACTIONS, BUILD_STEPS, CONFIGURATIONS, DEFAULT_TARGET, PLATFORMS, VS_VERSIONS, BuildOptions,
     read_solution_targets, validate_build_options,
 )
 from ..process import redact
@@ -304,14 +304,18 @@ class BuildDialog(QDialog):
             targets = read_solution_targets(options.solution(Path(self.profile.root)))
             if not targets:
                 raise ValueError("SLN 中没有找到 C++ 编译目标")
-            current = self.target.currentText()
+            current = self.target.currentText().strip()
+            message = f"已读取 {len(targets)} 个编译目标"
+            if current.casefold() not in {name.casefold() for name in targets} and DEFAULT_TARGET in targets:
+                message += f"；{current or '当前目标'} 不是 C++ 工程，已切换为 {DEFAULT_TARGET}"
+                current = DEFAULT_TARGET
             self.target.blockSignals(True)
             self.target.clear()
             self.target.addItems(targets)
             self.target.setCurrentText(current)
             self.target.blockSignals(False)
             self.refresh_preview()
-            self.message.setText(f"已读取 {len(targets)} 个编译目标")
+            self.message.setText(message)
         except (ValueError, OSError) as error:
             QMessageBox.warning(self, "读取目标失败", str(error))
 
