@@ -10,3 +10,4 @@ fastgithub_win-x64/dnsendpoints.json
 fastgithub_win-x64/logs/log20250606.txt
 *.txt
 fastgithub_win-x64/dnscrypt-proxy/dnscrypt-proxy.toml
+BitLockerAutoUnlock/__pycache__

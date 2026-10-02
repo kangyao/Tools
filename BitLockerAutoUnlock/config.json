@@ -1,0 +1,12 @@
+{
+  "_readme": "WaitTimeoutSeconds=开机后等待盘符出现的秒数；Drives 中每项：DriveLetter=盘符，Method=Password(解锁密码) 或 RecoveryPassword(48位恢复密码)，SecurePassword 由 Set-Drive.ps1 生成请勿手改。建议不要手改此文件，直接用 Set-Drive.ps1 配置。",
+  "WaitTimeoutSeconds": 90,
+  "Drives": [
+    {
+      "DriveLetter": "W",
+      "Method": "RecoveryPassword",
+      "Scope": "Machine",
+      "SecurePassword": "AQAAANCMnd8BFdERjHoAwE/Cl+sBAAAAE5QDFLyWu0COLJ9l/UB9ZAQAAAACAAAAAAAQZgAAAAEAACAAAADaevr88Bkpis4f/aJEiB6Xw8AQzXC05jK/RqsfajBZdwAAAAAOgAAAAAIAACAAAADRABjIYzFPp3ArMur/PWDwnRKVm5vzqh36zC3GatzdvEAAAABb+h91UaMPHGOUiVX53F2NKaUX0EvubFP4t2GiL8PQjvflK2s30PVbybSQTdnnrtpITzzhVJ8t/Bp9BZV2k9oYQAAAAFXyQKEKPsIjZmdOE09+hJ/tfiuRPoBEAmFqFvockkbkwnNeQfOTGkvFhbCGZqL9SOriDB8boPoFIPZ38yQr8Pg="
+    }
+  ]
+}
