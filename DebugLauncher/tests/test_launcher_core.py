@@ -388,6 +388,38 @@ class DebugPortAllocatorTests(unittest.TestCase):
             )
 
 
+class AppLogPathTests(unittest.TestCase):
+    EXE = r"C:\MiniGame\Bin64\AICore_profile.exe"
+
+    def name(self, *arguments: str, pid: int | None = 42) -> str:
+        from launcher_core import resolve_app_log_path
+        path = resolve_app_log_path(self.EXE, arguments, pid)
+        self.assertEqual(path.parent, Path(r"C:\MiniGame\Bin64"))
+        return path.name
+
+    def test_names_follow_aicore_win_game_start_rules(self) -> None:
+        cases = {
+            "AICoreApp.log": (),
+            "AICoreApp_dev2.log": ("-MGFDevAccount", "2", "-MGFNetRole", "Client"),
+            "AICoreApp_dev1.log": ("-mgfdevaccount", "1"),
+            "AICoreApp_dev-42.log": ("-MGFDevAccount", "01"),
+            "AICoreApp-server.log": ("-AICoreNetRole", "Dedicated", "-MGFDevAccount", "3"),
+            "AICoreApp-client-42.log": ("-AICoreNetRole", "Client", "-MGFDevAccount", "3"),
+            "mine.log": ("-AICoreLogFile", "mine.log", "-AICoreNetRole", "Dedicated"),
+            "AICoreAvatarTerrainDemo.log": ("-MGFAvatarTerrainDemo", "-AICoreLogFile", "x.log"),
+        }
+        for expected, arguments in cases.items():
+            with self.subTest(arguments=arguments):
+                self.assertEqual(self.name(*arguments), expected)
+
+    def test_log_file_with_a_path_is_ignored_like_the_app(self) -> None:
+        self.assertEqual(self.name("-AICoreLogFile", r"D:\x.log", "-MGFDevAccount", "4"), "AICoreApp_dev4.log")
+
+    def test_dev_account_without_value_uses_pid(self) -> None:
+        self.assertEqual(self.name("-MGFDevAccount"), "AICoreApp_dev-42.log")
+        self.assertEqual(self.name("-MGFDevAccount", "x", pid=None), "AICoreApp_dev-<pid>.log")
+
+
 class LauncherControllerTests(unittest.TestCase):
     def setUp(self) -> None:
         self.factory = FakeFactory()

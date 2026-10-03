@@ -208,6 +208,45 @@ class LauncherUiTests(unittest.TestCase):
         self.assertIn("本机 Host", message)
         self.assertEqual(len(self.tree_values()), 1)
 
+    def test_open_log_opens_the_instance_log_file(self) -> None:
+        bin_dir = Path(self.directory.name) / "Bin64"
+        bin_dir.mkdir()
+        log = bin_dir / "AICoreApp_dev2.log"
+        log.write_text("log", encoding="utf-8")
+        self.seed(
+            LaunchProfile(name="本机 Host", role=HOST, executable=str(bin_dir / "AICore.exe")),
+            LaunchProfile(name="本机 Client", role=CLIENT, executable=str(bin_dir / "AICore.exe")),
+        )
+        self.assertEqual(str(self.app.log_button.cget("state")), tk.DISABLED)
+        self.app.role_controls[CLIENT].start_button.invoke()
+        self.wait_until_idle()
+        self.app.role_controls[CLIENT].start_button.invoke()
+        self.wait_until_idle()
+        first, second = self.app.instance_tree.get_children()
+        self.app.instance_tree.selection_set(first)
+        self.root.update()
+        with patch.object(launcher.os, "startfile", create=True) as startfile:
+            self.app.log_button.invoke()
+            startfile.assert_called_once_with(log)
+            startfile.reset_mock()
+            self.app.instance_tree.selection_set(second)
+            self.root.update()
+            with patch.object(launcher.messagebox, "askyesno", return_value=True) as ask:
+                self.app.log_button.invoke()
+            self.assertIn("AICoreApp_dev3.log", ask.call_args.args[1])
+            startfile.assert_called_once_with(bin_dir)
+
+    def test_double_click_on_instance_opens_its_log(self) -> None:
+        self.app.role_controls[HOST].start_button.invoke()
+        self.wait_until_idle()
+        with patch.object(self.app, "_open_instance_log") as open_log, \
+                patch.object(self.app.instance_tree, "identify_row", return_value="1"):
+            self.app._on_instance_double_click(type("Event", (), {"y": 5})())
+        open_log.assert_called_once_with()
+        self.assertEqual(
+            self.app._instance_log_path(1).name, "AICoreApp_dev1.log",
+        )
+
     def test_view_command_shows_actual_dev_account_and_debug_port(self) -> None:
         self.app.role_controls[CLIENT].start_button.invoke()
         self.wait_until_idle()

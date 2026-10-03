@@ -47,6 +47,7 @@ AICore 按开发账号加锁，同一台机器上每个进程必须用不同账�
 - **关闭选中实例 / 关闭全部**：结束本启动器创建的指定实例或全部实例及其子进程。
 - **重启选中实例**：使用该实例的启动快照（参数、实际开发账号、调试端口），不受之后的配置编辑影响。要使用修改后的配置，关闭旧实例后重新启动。
 - **查看启动命令**：显示所选实例实际传递的完整命令，包括自动分配的 `-lua-debug-port`，可复制。
+- **打开日志**（或双击实例行）：用系统关联程序打开该实例的日志文件。路径按 AICore `WinGameStart.cpp` 的规则推算，位于 EXE 所在目录：`-AICoreLogFile` 指定的文件名优先；其次 `-AICoreNetRole Dedicated` 为 `AICoreApp-server.log`、`Client` 为 `AICoreApp-client-<PID>.log`；再次 `-MGFDevAccount N` 为 `AICoreApp_devN.log`；否则 `AICoreApp.log`。文件尚不存在时提示路径，并可打开所在目录。注意同一开发账号的实例共用一个日志文件。
 - **等待 Lua 调试器**：追加 `-script-debug-wait-client`，新建配置默认关闭。勾选后 App 会停在启动阶段，直到 IDE 通过 Attach Lua 连接后才继续运行。
 - **Attach 状态**：从 `.run/Lua.run.xml` 读取配置名和端口；两个状态图片分别显示 IDE 到 DAP/桥接、桥接到 App ScriptDebugger 的连接情况。缺失调试组件时只提示一次，App 仍可正常启动。
 - **窗口记忆**：保存激活配置、Client 数量、双端启动间隔和窗口位置。

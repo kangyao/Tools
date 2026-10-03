@@ -25,6 +25,7 @@ from launcher_core import (
     PairLaunchResult,
     is_valid_window_geometry,
     load_attach_configuration,
+    resolve_app_log_path,
     validate_client_count,
 )
 from launch_profiles import (
@@ -190,6 +191,7 @@ class DebugLauncherApp:
             self.instance_tree.column(column, width=width, anchor=tk.CENTER, stretch=False)
         self.instance_tree.grid(row=0, column=0, sticky=tk.EW)
         self.instance_tree.bind("<<TreeviewSelect>>", lambda _event: self._update_buttons())
+        self.instance_tree.bind("<Double-1>", self._on_instance_double_click)
         instance_y_scrollbar = ttk.Scrollbar(
             instance_frame, orient=tk.VERTICAL, command=self.instance_tree.yview,
         )
@@ -219,6 +221,10 @@ class DebugLauncherApp:
             action_frame, text="查看启动命令", command=self._show_instance_command, width=12
         )
         self.command_button.grid(row=0, column=2, padx=8)
+        self.log_button = ttk.Button(
+            action_frame, text="打开日志", command=self._open_instance_log, width=12
+        )
+        self.log_button.grid(row=0, column=3, padx=8)
 
         status_box = ttk.Frame(action_frame)
         status_box.grid(row=0, column=5, sticky=tk.E)
@@ -524,6 +530,38 @@ class DebugLauncherApp:
         if snapshot is None or snapshot.settings is None:
             return None
         return subprocess.list2cmdline([snapshot.settings.executable, *snapshot.arguments])
+
+    def _instance_log_path(self, instance_id: int | None) -> Path | None:
+        snapshot = self.snapshots_by_id.get(instance_id) if instance_id is not None else None
+        if snapshot is None or snapshot.settings is None:
+            return None
+        return resolve_app_log_path(snapshot.settings.executable, snapshot.arguments, snapshot.pid)
+
+    def _open_instance_log(self) -> None:
+        instance_id = self._selected_instance_id()
+        path = self._instance_log_path(instance_id)
+        if instance_id is None or path is None:
+            return
+        name = self.snapshots_by_id[instance_id].display_name
+        try:
+            if path.is_file():
+                os.startfile(path)  # type: ignore[attr-defined]  # 用系统关联的程序打开。
+                self._append_log(f"[{name}] 已打开日志：{path}")
+                return
+            if not messagebox.askyesno(
+                "日志文件不存在",
+                f"{name} 的日志文件尚不存在：\n{path}\n\n"
+                "App 可能还未写出日志，或该程序不按 AICore 规则命名日志。是否打开所在目录？",
+                parent=self.root,
+            ):
+                return
+            os.startfile(path.parent)  # type: ignore[attr-defined]
+        except OSError as exc:
+            self._show_error("打开日志失败", LauncherError(f"{path}：{exc}"))
+
+    def _on_instance_double_click(self, event: tk.Event[tk.Misc]) -> None:
+        if self.instance_tree.identify_row(event.y):
+            self._open_instance_log()
 
     def _show_instance_command(self) -> None:
         instance_id = self._selected_instance_id()
@@ -929,6 +967,7 @@ class DebugLauncherApp:
         self.stop_button.configure(state=instance_state)
         self.restart_button.configure(state=instance_state)
         self.command_button.configure(state=tk.NORMAL if selected else tk.DISABLED)
+        self.log_button.configure(state=tk.NORMAL if selected else tk.DISABLED)
         self.stop_all_button.configure(
             state=tk.NORMAL if idle and self.snapshots_by_id else tk.DISABLED
         )

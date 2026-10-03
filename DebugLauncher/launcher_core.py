@@ -453,6 +453,49 @@ class DebugPortBundle:
     dap_port: int
 
 
+_MAX_DEV_ACCOUNT_DIGITS = 9
+
+
+def resolve_app_log_path(
+    executable: str, arguments: Sequence[str], pid: int | None,
+) -> Path:
+    """Return the log file an AICore App writes next to its executable.
+
+    Mirrors GetLogFileName / ResolveDevAccountLogTag in AiFrameworkApp/WinApp/WinGameStart.cpp:
+    -AICoreLogFile wins, then -AICoreNetRole Dedicated / Client, then -MGFDevAccount, else AICoreApp.log.
+    """
+
+    directory = Path(os.path.expandvars(executable)).expanduser().parent
+    process = str(pid) if pid is not None else "<pid>"
+
+    def value(name: str) -> str:
+        for index, argument in enumerate(arguments[:-1]):
+            if argument == name and not arguments[index + 1].startswith("-"):
+                return arguments[index + 1]
+        return ""
+
+    if any("MGFAvatarTerrainDemo" in argument for argument in arguments):
+        return directory / "AICoreAvatarTerrainDemo.log"
+    explicit = value("-AICoreLogFile")
+    if explicit and not any(separator in explicit for separator in "\\/:"):
+        return directory / explicit
+    role = value("-AICoreNetRole")
+    if role == "Dedicated":
+        return directory / "AICoreApp-server.log"
+    if role == "Client":
+        return directory / f"AICoreApp-client-{process}.log"
+    for index, argument in enumerate(arguments):
+        if argument.casefold() != DEV_ACCOUNT_ARGUMENT.casefold():
+            continue
+        account = arguments[index + 1] if index + 1 < len(arguments) else ""
+        if account.isdigit() and account.isascii() and not account.startswith("0") and (
+            len(account) <= _MAX_DEV_ACCOUNT_DIGITS
+        ):
+            return directory / f"AICoreApp_dev{account}.log"
+        return directory / f"AICoreApp_dev-{process}.log"
+    return directory / "AICoreApp.log"
+
+
 def build_launch_arguments(
     settings: LauncherSettings,
     debug_ports: DebugPortBundle | None = None,
