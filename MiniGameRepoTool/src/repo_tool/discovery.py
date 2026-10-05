@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import os
 import re
+import stat
 from collections import Counter
 from dataclasses import dataclass, field, replace
 from pathlib import Path
@@ -30,6 +31,18 @@ class Discovery:
     notes: list[str] = field(default_factory=list)
 
 
+def _entry_is_junction(entry: os.DirEntry) -> bool:
+    """``DirEntry.is_junction`` exists only on Python 3.12+; fall back to the reparse attribute."""
+    is_junction = getattr(entry, "is_junction", None)
+    if is_junction is not None:
+        return bool(is_junction())
+    try:
+        return bool(entry.stat(follow_symlinks=False).st_file_attributes
+                    & stat.FILE_ATTRIBUTE_REPARSE_POINT)
+    except OSError:
+        return False
+
+
 def find_repositories(root: Path, max_depth: int = MAX_DEPTH) -> list[Path]:
     """Directories under root (root included) that are Git worktree roots, nearest first."""
     found: list[Path] = []
@@ -48,7 +61,7 @@ def find_repositories(root: Path, max_depth: int = MAX_DEPTH) -> list[Path]:
             if name.startswith(".") or name in SKIPPED_DIRECTORIES:
                 continue
             try:
-                if not entry.is_dir(follow_symlinks=False) or entry.is_junction():
+                if not entry.is_dir(follow_symlinks=False) or _entry_is_junction(entry):
                     continue
             except OSError:
                 continue

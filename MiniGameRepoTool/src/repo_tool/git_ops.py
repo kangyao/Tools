@@ -225,7 +225,7 @@ class Inspector:
                                                "如需按分支独立更新，可删除该目录后由本工具重新克隆")
         origin = self.git.run(["remote", "get-url", "origin"], path)
         snap.origin = origin.output.strip() if not origin.returncode else ""
-        if not snap.origin or normalized_remote(snap.origin) != normalized_remote(repo.remote):
+        if not snap.origin or remote_identity(snap.origin) != remote_identity(repo.remote):
             return state("remote_mismatch", "block", "origin 与配置不一致，请编辑配置或明确更换 origin")
         for marker in ("MERGE_HEAD", "CHERRY_PICK_HEAD", "REVERT_HEAD", "rebase-merge", "rebase-apply"):
             marker_path = self.git.run(["rev-parse", "--git-path", marker], path).output.strip()
