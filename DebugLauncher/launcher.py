@@ -37,6 +37,7 @@ from launch_profiles import (
 )
 from persistent_debug_server import PersistentDebugOptions, run_embedded_debug_server
 from profile_manager import ProfileManagerWindow
+from window_layout import LayoutResult, LayoutTarget, WindowLayoutService
 
 
 TOOL_DIR = Path(__file__).resolve().parent
@@ -58,11 +59,14 @@ class _RoleControls:
 
 
 class DebugLauncherApp:
-    def __init__(self, root: tk.Tk) -> None:
+    def __init__(
+        self, root: tk.Tk, window_layout_service: WindowLayoutService | None = None,
+    ) -> None:
         self.root = root
         self.store = ProfileStore(CONFIG_PATH)
         self.config = LauncherConfig.default()
         self.controller = LauncherController()
+        self.window_layout_service = window_layout_service or WindowLayoutService()
         self.attach_configuration = load_attach_configuration(
             RUN_CONFIGURATION_PATH
         )
@@ -79,10 +83,15 @@ class DebugLauncherApp:
         self.status_after_id: str | None = None
         self.normal_window_geometry = ""
         self.launch_cancel = threading.Event()
+        self.layout_after_id: str | None = None
+        self.layout_cancel = threading.Event()
+        self.layout_generation = 0
+        self.layout_thread: threading.Thread | None = None
         self.profile_manager: ProfileManagerWindow | None = None
         self.role_controls: dict[NetworkRole, _RoleControls] = {}
         self.client_delay_var = tk.StringVar(value="2")
         self.client_count_var = tk.StringVar(value="1")
+        self.auto_tile_windows_var = tk.BooleanVar(value=True)
         self.status_var = tk.StringVar(value="运行实例：0")
         self.debug_attach_status_var = tk.StringVar(
             value=f"Attach {self.attach_configuration.name}：启动中…"
@@ -154,6 +163,13 @@ class DebugLauncherApp:
             from_=0, to=60, increment=0.5, width=5,
         ).pack(side=tk.LEFT)
         ttk.Label(pair_bar, text="秒启动 Client").pack(side=tk.LEFT, padx=(5, 0))
+        self.auto_tile_windows_button = ttk.Checkbutton(
+            pair_bar,
+            text="启动或重启后自动平铺 App 窗口",
+            variable=self.auto_tile_windows_var,
+            command=self._on_auto_tile_windows_changed,
+        )
+        self.auto_tile_windows_button.pack(side=tk.LEFT, padx=(18, 0))
         self.stop_all_button = ttk.Button(
             pair_bar, text="关闭全部", command=self._stop_all, width=12
         )
@@ -345,6 +361,7 @@ class DebugLauncherApp:
             ))
         self.client_delay_var.set(f"{self.config.client_delay_seconds:g}")
         self.client_count_var.set(str(self.config.client_count))
+        self.auto_tile_windows_var.set(self.config.auto_tile_windows)
         if self.config.window_geometry:
             self.normal_window_geometry = self.config.window_geometry
             self.root.geometry(self.config.window_geometry)
@@ -361,7 +378,11 @@ class DebugLauncherApp:
         count = self._client_count()
         if count is not None:
             config = replace(config, client_count=count)
-        config = replace(config, window_geometry=self._current_window_geometry())
+        config = replace(
+            config,
+            window_geometry=self._current_window_geometry(),
+            auto_tile_windows=bool(self.auto_tile_windows_var.get()),
+        )
         self.store.save(config)
         self.config = config
 
@@ -413,6 +434,115 @@ class DebugLauncherApp:
     def _on_profile_manager_closed(self) -> None:
         self.profile_manager = None
 
+    # ----- App window layout --------------------------------------------------------------------
+
+    def _on_auto_tile_windows_changed(self) -> None:
+        if not self.auto_tile_windows_var.get():
+            self._cancel_window_layout()
+        try:
+            self._save_config(replace(
+                self.config, auto_tile_windows=bool(self.auto_tile_windows_var.get()),
+            ))
+        except LauncherError as exc:
+            self._show_error("保存自动平铺设置失败", exc)
+
+    def _cancel_window_layout(self) -> None:
+        if self.layout_after_id is not None:
+            self.root.after_cancel(self.layout_after_id)
+            self.layout_after_id = None
+        self.layout_cancel.set()
+        self.layout_generation += 1
+
+    def _layout_targets(self) -> tuple[LayoutTarget, ...]:
+        role_order = {NetworkRole.HOST: 0, NetworkRole.CLIENT: 1}
+        snapshots = [
+            snapshot
+            for snapshot in self.snapshots_by_id.values()
+            if snapshot.pid is not None
+            and snapshot.pid > 0
+            and snapshot.settings is not None
+            and snapshot.settings.network.role in role_order
+        ]
+        snapshots.sort(key=lambda snapshot: (
+            role_order[snapshot.settings.network.role],  # type: ignore[union-attr]
+            snapshot.instance_id,
+        ))
+        return tuple(
+            LayoutTarget(snapshot.instance_id, snapshot.pid)
+            for snapshot in snapshots
+            if snapshot.pid is not None
+        )
+
+    def _request_window_layout(self) -> None:
+        self._cancel_window_layout()
+        if self.closing or not self.auto_tile_windows_var.get():
+            return
+        generation = self.layout_generation
+        self.layout_after_id = self.root.after(
+            250, lambda: self._start_window_layout(generation),
+        )
+
+    def _start_window_layout(self, generation: int) -> None:
+        self.layout_after_id = None
+        if (
+            self.closing
+            or generation != self.layout_generation
+            or not self.auto_tile_windows_var.get()
+        ):
+            return
+        targets = self._layout_targets()
+        if not targets:
+            return
+        cancel = threading.Event()
+        self.layout_cancel = cancel
+        anchor_hwnd = int(self.root.winfo_id())
+
+        def worker() -> None:
+            try:
+                result = self.window_layout_service.arrange(
+                    targets, anchor_hwnd, cancel,
+                )
+            except Exception as exc:
+                self.events.put(("window_layout_failed", (generation, exc)))
+            else:
+                self.events.put(("window_layout_finished", (generation, result)))
+
+        thread = threading.Thread(
+            target=worker, name=f"window-layout-{generation}", daemon=True,
+        )
+        self.layout_thread = thread
+        thread.start()
+
+    def _on_window_layout_finished(
+        self, generation: int, result: LayoutResult,
+    ) -> None:
+        if generation != self.layout_generation or self.closing or result.cancelled:
+            return
+        self.layout_thread = None
+        if result.moved:
+            self._append_log(
+                f"已平铺 {len(result.moved)} 个 App 窗口（实例 "
+                + ", ".join(str(instance_id) for instance_id in result.moved)
+                + "）。"
+            )
+        if result.missing:
+            self._append_log(
+                "App 窗口等待超时，未找到实例 "
+                + ", ".join(str(instance_id) for instance_id in result.missing)
+                + " 的可平铺窗口；进程仍正常运行。"
+            )
+        for failure in result.failures:
+            self._append_log(
+                f"实例 {failure.instance_id} 的 App 窗口平铺失败：{failure.message}",
+                error=True,
+            )
+
+    def _on_window_layout_failed(self, generation: int, error: object) -> None:
+        if generation != self.layout_generation or self.closing:
+            return
+        self.layout_thread = None
+        self._append_log(f"自动平铺 App 窗口失败：{error}", error=True)
+
     # ----- launching ----------------------------------------------------------------------------
 
     def _start_role(self, role: NetworkRole) -> None:
@@ -430,6 +560,7 @@ class DebugLauncherApp:
         except LauncherError as exc:
             self._show_error("启动失败", exc)
             return
+        self._cancel_window_layout()
         if role is NetworkRole.HOST:
             self._run_async(
                 "正在启动 Host…", lambda: self.controller.ensure_host(settings, profile.name),
@@ -471,6 +602,7 @@ class DebugLauncherApp:
         except LauncherError as exc:
             self._show_error("启动失败", exc)
             return
+        self._cancel_window_layout()
         self.launch_cancel.clear()
         self._run_async(
             f"正在启动 Host + {count} 个 Client…",
@@ -484,7 +616,9 @@ class DebugLauncherApp:
             self._on_pair_started,
         )
 
-    def _on_host_started(self, snapshot: ControllerSnapshot, reused: bool) -> None:
+    def _on_host_started(
+        self, snapshot: ControllerSnapshot, reused: bool, *, request_layout: bool = True,
+    ) -> None:
         if reused:
             self.snapshots_by_id[snapshot.instance_id] = snapshot
             self._append_log(
@@ -494,6 +628,8 @@ class DebugLauncherApp:
             self._on_instance_started(snapshot)
         self._render_instances()
         self.instance_tree.selection_set(str(snapshot.instance_id))
+        if request_layout:
+            self._request_window_layout()
 
     def _on_client_started(self, result: object) -> None:
         if not isinstance(result, ControllerSnapshot):
@@ -507,6 +643,7 @@ class DebugLauncherApp:
             return
         for client in result.clients:
             self._on_client_started(client)
+        self._request_window_layout()
         if result.error and not self.closing:
             self._show_error("部分 Client 未启动", LauncherError(
                 f"已启动 {len(result.clients)} / {result.requested} 个 Client。\n{result.error}"
@@ -517,6 +654,7 @@ class DebugLauncherApp:
             return
         for client in result.clients:
             self._on_client_started(client)
+        self._request_window_layout()
         if result.error and not self.closing:
             self._show_error("Client 未全部启动", LauncherError(
                 f"已启动 {len(result.clients)} / {result.requested_clients} 个 Client。\n{result.error}"
@@ -595,6 +733,7 @@ class DebugLauncherApp:
         instance_id = self._selected_instance_id()
         if instance_id is None:
             return
+        self._cancel_window_layout()
         self._run_async(
             "正在关闭…",
             lambda: self._stop_instance(instance_id),
@@ -605,6 +744,7 @@ class DebugLauncherApp:
         instance_id = self._selected_instance_id()
         if instance_id is None:
             return
+        self._cancel_window_layout()
         self._run_async(
             "正在重新启动…",
             lambda: self.controller.restart(instance_id),
@@ -614,6 +754,7 @@ class DebugLauncherApp:
     def _stop_all(self) -> None:
         if not self.snapshots_by_id:
             return
+        self._cancel_window_layout()
         self._run_async(
             "正在关闭全部…",
             self._stop_all_instances,
@@ -689,6 +830,7 @@ class DebugLauncherApp:
         self._append_log(
             f"[实例 {snapshot.instance_id}] 已按原始配置重新启动，PID {snapshot.pid}。"
         )
+        self._request_window_layout()
 
     def _on_all_stopped(self, result: object) -> None:
         snapshots = result if isinstance(result, tuple) else ()
@@ -805,8 +947,17 @@ class DebugLauncherApp:
 
             if kind == "pair_host":
                 snapshot, reused = payload
-                self._on_host_started(snapshot, reused)
+                self._on_host_started(snapshot, reused, request_layout=False)
                 self.status_var.set("Host 已启动，正在准备 Client…")
+                continue
+            if kind == "window_layout_finished":
+                generation, result = payload  # type: ignore[misc]
+                if isinstance(result, LayoutResult):
+                    self._on_window_layout_finished(generation, result)
+                continue
+            if kind == "window_layout_failed":
+                generation, error = payload  # type: ignore[misc]
+                self._on_window_layout_failed(generation, error)
                 continue
             if kind == "debug_log":
                 debug_port, message = payload  # type: ignore[misc]
@@ -945,6 +1096,8 @@ class DebugLauncherApp:
             self._append_log(
                 f"[实例 {instance_id}] App（PID {previous.pid}）已自然退出。"
             )
+        if finished_ids:
+            self._cancel_window_layout()
         self.snapshots_by_id = current
         if snapshots:
             self.status_dot.configure(foreground="#16a34a")
@@ -1071,6 +1224,7 @@ class DebugLauncherApp:
             return
         self.closing = True
         self.launch_cancel.set()
+        self._cancel_window_layout()
         for callback_id in self.root.tk.splitlist(self.root.tk.call("after", "info")):
             self.root.after_cancel(callback_id)
         close_errors: list[str] = []

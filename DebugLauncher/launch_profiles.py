@@ -190,6 +190,7 @@ class LauncherConfig:
     client_delay_seconds: float = DEFAULT_CLIENT_DELAY_SECONDS
     window_geometry: str = ""
     client_count: int = 1
+    auto_tile_windows: bool = True
 
     @classmethod
     def default(cls) -> LauncherConfig:
@@ -231,6 +232,8 @@ class LauncherConfig:
             raise ConfigurationError(f"Client 数量必须是 1 到 {MAX_CLIENT_COUNT} 之间的整数。")
         if not isinstance(self.window_geometry, str) or not is_valid_window_geometry(self.window_geometry):
             raise ConfigurationError("窗口位置格式无效。")
+        if not isinstance(self.auto_tile_windows, bool):
+            raise ConfigurationError("自动平铺窗口必须是布尔值。")
 
     def profile(self, profile_id: str | None) -> LaunchProfile | None:
         return next((profile for profile in self.profiles if profile.id == profile_id), None)
@@ -336,6 +339,7 @@ class ProfileStore:
             client_delay_seconds=raw.get("client_delay_seconds", DEFAULT_CLIENT_DELAY_SECONDS),  # type: ignore[arg-type]
             window_geometry=raw.get("window_geometry", ""),  # type: ignore[arg-type]
             client_count=raw.get("client_count", 1),  # type: ignore[arg-type]
+            auto_tile_windows=raw.get("auto_tile_windows", True),  # type: ignore[arg-type]
         )
 
     @staticmethod
@@ -439,4 +443,5 @@ class ProfileStore:
             "client_delay_seconds": config.client_delay_seconds,
             "client_count": config.client_count,
             "window_geometry": config.window_geometry,
+            "auto_tile_windows": config.auto_tile_windows,
         })

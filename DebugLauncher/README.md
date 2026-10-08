@@ -50,11 +50,12 @@ AICore 按开发账号加锁，同一台机器上每个进程必须用不同账�
 - **打开日志**（或双击实例行）：用系统关联程序打开该实例的日志文件。路径按 AICore `WinGameStart.cpp` 的规则推算，位于 EXE 所在目录：`-AICoreLogFile` 指定的文件名优先；其次 `-AICoreNetRole Dedicated` 为 `AICoreApp-server.log`、`Client` 为 `AICoreApp-client-<PID>.log`；再次 `-MGFDevAccount N` 为 `AICoreApp_devN.log`；否则 `AICoreApp.log`。文件尚不存在时提示路径，并可打开所在目录。注意同一开发账号的实例共用一个日志文件。
 - **等待 Lua 调试器**：追加 `-script-debug-wait-client`，新建配置默认关闭。勾选后 App 会停在启动阶段，直到 IDE 通过 Attach Lua 连接后才继续运行。
 - **Attach 状态**：从 `.run/Lua.run.xml` 读取配置名和端口；两个状态图片分别显示 IDE 到 DAP/桥接、桥接到 App ScriptDebugger 的连接情况。缺失调试组件时只提示一次，App 仍可正常启动。
-- **窗口记忆**：保存激活配置、Client 数量、双端启动间隔和窗口位置。
+- **窗口记忆**：保存激活配置、Client 数量、双端启动间隔和启动器窗口位置。
+- **自动平铺 App 窗口**：主界面的开关默认开启。单独启动、批量启动、一键启动或重启完成后，会把本启动器管理的全部游戏窗口按 Host 在前、Client 按实例顺序排列到启动器当前所在显示器的可用工作区，并避开任务栏。每个窗口按平铺前的宽高比等比缩放，从工作区左上角开始逐行紧挨排列，不会拉伸变形；控制台窗口不参与平铺。游戏窗口延迟创建或无法定位时只写入日志，不影响 App 进程运行。
 
 ## 配置存储与迁移
 
-配置保存在本目录的 `settings.local.json`（版本 4，已被 Git 忽略），包含具名配置集合（旧存档里的 `uin` 字段读取时忽略、`auto_uin` 沿用为 `auto_dev_account`）、激活的 Host / Client 配置（`selected_host` / `selected_client`）、Client 数量（`client_count`）、双端启动间隔和窗口位置。配置用稳定标识关联，改名后激活状态保持不变。
+配置保存在本目录的 `settings.local.json`（版本 4，已被 Git 忽略），包含具名配置集合（旧存档里的 `uin` 字段读取时忽略、`auto_uin` 沿用为 `auto_dev_account`）、激活的 Host / Client 配置（`selected_host` / `selected_client`）、Client 数量（`client_count`）、双端启动间隔、启动器窗口位置和自动平铺开关（`auto_tile_windows`）。配置用稳定标识关联，改名后激活状态保持不变；旧版本 4 配置缺少自动平铺字段时默认开启。
 
 首次读取旧版本配置时自动迁移为“默认 Host”和“默认 Client”：
 

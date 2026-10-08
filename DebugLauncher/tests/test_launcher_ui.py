@@ -4,6 +4,7 @@ import json
 from pathlib import Path
 import sys
 import tempfile
+import threading
 import time
 import tkinter as tk
 import unittest
@@ -20,10 +21,27 @@ from launcher_core import (  # noqa: E402
     DEFAULT_EXECUTABLE, DebugPortAllocator, LauncherController, NetworkRole,
 )
 from test_launcher_core import FakeFactory  # noqa: E402
+from window_layout import LayoutResult  # noqa: E402
 
 
 HOST = NetworkRole.HOST
 CLIENT = NetworkRole.CLIENT
+
+
+class FakeWindowLayoutService:
+    def __init__(self) -> None:
+        self.calls: list[tuple[tuple[object, ...], int, threading.Event]] = []
+        self.block = False
+
+    def arrange(self, targets, anchor_hwnd, cancel):
+        targets = tuple(targets)
+        self.calls.append((targets, anchor_hwnd, cancel))
+        if self.block:
+            cancel.wait(2)
+        return LayoutResult(
+            moved=tuple(target.instance_id for target in targets),
+            cancelled=cancel.is_set(),
+        )
 
 
 @unittest.skipUnless(sys.platform == "win32", "Windows launcher UI")
@@ -53,7 +71,8 @@ class LauncherUiTests(unittest.TestCase):
     def open_app(self) -> None:
         self.root = tk.Tk()
         self.root.withdraw()
-        self.app = launcher.DebugLauncherApp(self.root)
+        self.layout_service = FakeWindowLayoutService()
+        self.app = launcher.DebugLauncherApp(self.root, self.layout_service)
         self.addCleanup(self.close_app, self.app)
         self.factory = FakeFactory()
         self.app.controller = LauncherController(self.factory, DebugPortAllocator(lambda _: True))
@@ -80,6 +99,14 @@ class LauncherUiTests(unittest.TestCase):
             time.sleep(0.01)
         self.assertFalse(self.app.busy, "Launch operation did not complete")
         self.show_error.assert_not_called()
+
+    def wait_for_layout(self, call_count: int) -> None:
+        deadline = time.monotonic() + 3
+        while len(self.layout_service.calls) < call_count and time.monotonic() < deadline:
+            self.root.update()
+            time.sleep(0.01)
+        self.assertEqual(len(self.layout_service.calls), call_count)
+        self.root.update()
 
     def activate(self, name: str, active: bool = True) -> None:
         manager = self.manager()
@@ -141,6 +168,85 @@ class LauncherUiTests(unittest.TestCase):
         self.wait_until_idle()
         self.assertEqual([row[6] for row in self.tree_values()][4:], ["5", "6", "7"])
         self.assertEqual(self.app.store.load().client_count, 3)
+
+    def test_auto_tile_setting_is_persisted(self) -> None:
+        self.assertTrue(self.app.auto_tile_windows_var.get())
+        self.app.auto_tile_windows_button.invoke()
+        self.assertFalse(self.app.auto_tile_windows_var.get())
+        self.assertFalse(self.app.store.load().auto_tile_windows)
+        self.close_app(self.app)
+        self.open_app()
+        self.assertFalse(self.app.auto_tile_windows_var.get())
+
+    def test_single_host_requests_window_layout(self) -> None:
+        self.app.role_controls[HOST].start_button.invoke()
+        self.wait_until_idle()
+        self.wait_for_layout(1)
+        targets, anchor_hwnd, _cancel = self.layout_service.calls[0]
+        self.assertEqual([(target.instance_id, target.pid) for target in targets], [(1, 1000)])
+        self.assertGreater(anchor_hwnd, 0)
+
+    def test_client_batch_requests_one_layout(self) -> None:
+        self.app.client_count_var.set("3")
+        self.app.role_controls[CLIENT].start_button.invoke()
+        self.wait_until_idle()
+        self.wait_for_layout(1)
+        targets = self.layout_service.calls[0][0]
+        self.assertEqual([target.instance_id for target in targets], [1, 2, 3])
+
+    def test_pair_requests_one_layout_after_clients_finish(self) -> None:
+        self.app.client_count_var.set("3")
+        self.app.start_pair_button.invoke()
+        self.wait_until_idle()
+        self.wait_for_layout(1)
+        targets = self.layout_service.calls[0][0]
+        self.assertEqual([target.instance_id for target in targets], [1, 2, 3, 4])
+
+    def test_layout_orders_host_before_older_client(self) -> None:
+        self.app.role_controls[CLIENT].start_button.invoke()
+        self.wait_until_idle()
+        self.wait_for_layout(1)
+        self.app.role_controls[HOST].start_button.invoke()
+        self.wait_until_idle()
+        self.wait_for_layout(2)
+        targets = self.layout_service.calls[1][0]
+        self.assertEqual([target.instance_id for target in targets], [2, 1])
+
+    def test_restart_layout_uses_new_pid_and_keeps_instance_id(self) -> None:
+        self.app.role_controls[HOST].start_button.invoke()
+        self.wait_until_idle()
+        self.wait_for_layout(1)
+        item = self.app.instance_tree.get_children()[0]
+        self.app.instance_tree.selection_set(item)
+        self.root.update()
+        self.app.restart_button.invoke()
+        self.wait_until_idle()
+        self.wait_for_layout(2)
+        target = self.layout_service.calls[1][0][0]
+        self.assertEqual((target.instance_id, target.pid), (1, 1001))
+
+    def test_disabled_auto_tile_does_not_request_layout(self) -> None:
+        self.app.auto_tile_windows_button.invoke()
+        self.app.role_controls[HOST].start_button.invoke()
+        self.wait_until_idle()
+        deadline = time.monotonic() + 0.4
+        while time.monotonic() < deadline:
+            self.root.update()
+            time.sleep(0.01)
+        self.assertEqual(self.layout_service.calls, [])
+
+    def test_stop_cancels_window_layout_wait(self) -> None:
+        self.layout_service.block = True
+        self.app.role_controls[HOST].start_button.invoke()
+        self.wait_until_idle()
+        self.wait_for_layout(1)
+        cancel = self.layout_service.calls[0][2]
+        item = self.app.instance_tree.get_children()[0]
+        self.app.instance_tree.selection_set(item)
+        self.root.update()
+        self.app.stop_button.invoke()
+        self.wait_until_idle()
+        self.assertTrue(cancel.is_set())
 
     def test_fixed_account_client_cannot_start_several(self) -> None:
         self.seed(
@@ -207,6 +313,10 @@ class LauncherUiTests(unittest.TestCase):
         self.assertIn("启动程序不存在", message)
         self.assertIn("本机 Host", message)
         self.assertEqual(len(self.tree_values()), 1)
+        self.wait_for_layout(1)
+        self.assertEqual(
+            [target.instance_id for target in self.layout_service.calls[0][0]], [1],
+        )
 
     def test_open_log_opens_the_instance_log_file(self) -> None:
         bin_dir = Path(self.directory.name) / "Bin64"

@@ -118,6 +118,7 @@ class LauncherConfigTests(unittest.TestCase):
         self.assertEqual(pair_mismatches(host_profile, client_profile), ())
         self.assertFalse(host_profile.debug_wait)
         self.assertEqual(config.client_delay_seconds, 2.0)
+        self.assertTrue(config.auto_tile_windows)
 
     def test_names_must_be_unique_ignoring_case(self) -> None:
         config = LauncherConfig((host("Local"),))
@@ -161,6 +162,11 @@ class LauncherConfigTests(unittest.TestCase):
             with self.subTest(delay=delay), self.assertRaises(ConfigurationError):
                 LauncherConfig(client_delay_seconds=delay)  # type: ignore[arg-type]
 
+    def test_invalid_auto_tile_setting_is_rejected(self) -> None:
+        for value in (0, 1, "true", None):
+            with self.subTest(value=value), self.assertRaises(ConfigurationError):
+                LauncherConfig(auto_tile_windows=value)  # type: ignore[arg-type]
+
     def test_activation_replaces_the_previous_profile_of_the_role(self) -> None:
         a, b, c = host("A"), host("B"), client("C")
         config = LauncherConfig((a, b, c), a.id, c.id)
@@ -193,10 +199,13 @@ class ProfileStoreTests(unittest.TestCase):
         config = LauncherConfig(
             profiles, profiles[1].id, profiles[3].id,
             client_delay_seconds=3.5, window_geometry="1100x911+100-30", client_count=4,
+            auto_tile_windows=False,
         )
         self.store.save(config)
         self.assertEqual(self.store.load(), config)
-        self.assertEqual(json.loads(self.path.read_text(encoding="utf-8"))["version"], 4)
+        payload = json.loads(self.path.read_text(encoding="utf-8"))
+        self.assertEqual(payload["version"], 4)
+        self.assertFalse(payload["auto_tile_windows"])
 
     def test_v2_host_migrates_to_default_host_and_client(self) -> None:
         ConfigStore(self.path).save(LauncherSettings(
@@ -270,6 +279,7 @@ class ProfileStoreTests(unittest.TestCase):
         host_profile, client_profile = config.selected(NetworkRole.HOST), config.selected(NetworkRole.CLIENT)
         self.assertEqual((host_profile.dev_account, client_profile.dev_account), (1, 2))
         self.assertFalse(client_profile.auto_dev_account)
+        self.assertTrue(config.auto_tile_windows)
         self.assertNotIn("-MGFNetUin", client_profile.settings().arguments)
         self.store.save(config)
         saved = json.loads(self.path.read_text(encoding="utf-8"))["profiles"][1]
