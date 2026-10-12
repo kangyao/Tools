@@ -457,6 +457,12 @@ class MainWindow(QMainWindow):
         self.update_controls()
         self.worker.start()
 
+    def _repo_name(self, repo_id: str) -> str:
+        try:
+            return self.profile.repo(repo_id).name
+        except StopIteration:
+            return repo_id
+
     def handle_event(self, kind: str, payload):
         if kind == "snapshot":
             self.snapshots[payload.repo_id] = payload
@@ -496,8 +502,25 @@ class MainWindow(QMainWindow):
             elif self.worker and self.worker.stop_requested.is_set():
                 text += "；等待已开始的检查结束"
             self.message.setText(text)
+        elif kind == "lfs_started":
+            repo_id = payload["repo_id"]
+            self.progress.setRange(0, 0)
+            self.message.setText(f"正在下载 LFS：{self._repo_name(repo_id)}")
+        elif kind == "lfs_progress":
+            repo_id = payload["repo_id"]
+            percent = payload["percent"]
+            self.progress.setRange(0, 100)
+            self.progress.setValue(percent)
+            self.message.setText(
+                f"正在下载 LFS：{self._repo_name(repo_id)}，"
+                f"{payload['completed']} / {payload['total']} 个对象（{percent}%）"
+            )
+        elif kind == "lfs_finished":
+            self.progress.setRange(0, 0)
+            self.message.setText(f"LFS 传输已结束，正在处理：{self._repo_name(payload['repo_id'])}")
         elif kind == "started" and self.operation not in {"local", "check"}:
             name = self.profile.repo(payload).name if payload in self.items else "构建环境"
+            self.progress.setRange(0, 0)
             self.message.setText("正在处理：" + name)
         elif kind == "log":
             self.append_log(*payload)

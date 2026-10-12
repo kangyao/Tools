@@ -15,6 +15,26 @@ def test_live_output_and_real_exit_code(tmp_path):
     assert any("开始" in line for line in lines)
 
 
+def test_carriage_return_progress_is_streamed_as_separate_updates(tmp_path):
+    lines = []
+    result = ProcessRunner(output=lines.append).run(
+        sys.executable,
+        ["-u", "-c", (
+            "import sys; sys.stdout.write("
+            "'Downloading LFS objects: 0% (0/2)\\r'"
+            "+'Downloading LFS objects: 50% (1/2)\\r'"
+            "+'Downloading LFS objects: 100% (2/2)\\n'); sys.stdout.flush()"
+        )],
+        tmp_path,
+    )
+    assert result.returncode == 0
+    assert lines == [
+        "Downloading LFS objects: 0% (0/2)",
+        "Downloading LFS objects: 50% (1/2)",
+        "Downloading LFS objects: 100% (2/2)",
+    ]
+
+
 def test_timeout_and_cancel(tmp_path):
     runner = ProcessRunner()
     result = runner.run(sys.executable, ["-c", "import time; time.sleep(20)"], tmp_path, timeout=0.2)

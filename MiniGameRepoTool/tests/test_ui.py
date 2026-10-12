@@ -26,6 +26,27 @@ def wait_job(window, qapp, timeout=30):
     qapp.processEvents()
 
 
+def test_lfs_progress_updates_the_main_progress_bar(qapp, tmp_path):
+    p = make_profile(tmp_path / "checkout", tmp_path / "remote")
+    data = tmp_path / "app"
+    ProfileStore(data).save(ProfileDocument(1, p.id, [p]))
+    window = MainWindow(data, auto_scan=False)
+    window.handle_event("lfs_started", {"repo_id": "root"})
+    assert window.message.text() == "正在下载 LFS：Root"
+    assert window.progress.minimum() == 0
+    assert window.progress.maximum() == 0
+    window.handle_event("lfs_progress", {
+        "repo_id": "root", "completed": 2, "total": 5, "percent": 40,
+    })
+    assert window.progress.maximum() == 100
+    assert window.progress.value() == 40
+    assert window.message.text() == "正在下载 LFS：Root，2 / 5 个对象（40%）"
+    window.job_finished()
+    assert window.progress.maximum() == 1
+    assert window.progress.value() == 1
+    window.close()
+
+
 def test_real_gui_clone_and_recheck(qapp, tmp_path):
     remote = tmp_path / "remote"
     remote.mkdir()

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 import threading
 from dataclasses import replace
 from pathlib import Path
@@ -15,8 +16,27 @@ from .process import ProcessResult, ProcessRunner, redact
 from .setup import SetupRunner
 from .storage import RunJournal, RunLock
 
-# Checkout leaves LFS pointers; one batched `git lfs pull` then downloads them concurrently.
+# Checkout leaves LFS pointers; one batched `git lfs pull` downloads them concurrently.
 SKIP_SMUDGE = {"GIT_LFS_SKIP_SMUDGE": "1"}
+LFS_PROGRESS_PATTERN = re.compile(
+    r"\b(?:downloading|fetching)\s+lfs(?:\s+[^:\r\n]+)?\s*:\s*"
+    r"(?P<percent>\d{1,3})%\s*\(\s*(?P<completed>\d+)\s*/\s*(?P<total>\d+)\s*\)",
+    re.IGNORECASE,
+)
+
+
+def parse_lfs_progress(line: str) -> dict[str, int] | None:
+    """Parse the object progress emitted by supported Git LFS versions."""
+
+    match = LFS_PROGRESS_PATTERN.search(line)
+    if match is None:
+        return None
+    percent = int(match.group("percent"))
+    completed = int(match.group("completed"))
+    total = int(match.group("total"))
+    if percent > 100 or total <= 0 or completed > total:
+        return None
+    return {"percent": percent, "completed": completed, "total": total}
 
 
 class RepoService:
@@ -29,7 +49,7 @@ class RepoService:
         self.current = ""
         self.journal: RunJournal | None = None
         self.runner = ProcessRunner(self._log, self.cancel)
-        self.git = GitClient(self.runner)
+        self.git = GitClient(self.runner, self._lfs_event)
         self.inspector = Inspector(self.git)
         self.journal_lock = threading.Lock()
         self.lfs_available: bool | None = None
@@ -38,6 +58,12 @@ class RepoService:
         line = redact(line)
         self._journal_log(self.current, line)
         self.emit("log", (self.current, line))
+        progress = parse_lfs_progress(line)
+        if progress is not None:
+            self.emit("lfs_progress", {"repo_id": self.current, **progress})
+
+    def _lfs_event(self, kind: str) -> None:
+        self.emit(kind, {"repo_id": self.current})
 
     def _journal_log(self, repo_id: str, line: str) -> None:
         journal = self.journal

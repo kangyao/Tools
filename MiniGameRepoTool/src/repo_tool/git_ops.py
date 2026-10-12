@@ -5,6 +5,7 @@ import re
 import shutil
 from datetime import datetime
 from pathlib import Path
+from typing import Callable
 from urllib.parse import unquote, urlsplit
 
 from .models import Profile, RepoSpec, Snapshot, canonical
@@ -51,17 +52,28 @@ def remote_identity(remote: str) -> str:
 
 
 class GitClient:
-    def __init__(self, runner: ProcessRunner):
+    def __init__(self, runner: ProcessRunner, lfs_event: Callable[[str], None] | None = None):
         self.runner = runner
+        self.lfs_event = lfs_event
         self.program = shutil.which("git") or "git"
 
     def run(self, args: list[str], cwd: Path | None = None, network: bool = False,
             stream: bool = False, environment: dict[str, str | None] | None = None,
             unbounded: bool = False) -> ProcessResult:
-        # Network and bulk local work (checkout, object copy) have no fixed time limit.
-        return self.runner.run(self.program, ["-c", "core.quotepath=false", *args], cwd,
-                               timeout=None if network or unbounded else 60, stream=stream,
-                               environment=environment)
+        # Git LFS otherwise suppresses progress when the GUI captures output through a pipe.
+        lfs_transfer = stream and args[:2] in (["lfs", "pull"], ["lfs", "fetch"])
+        if lfs_transfer:
+            environment = {**(environment or {}), "GIT_LFS_FORCE_PROGRESS": "1"}
+            if self.lfs_event:
+                self.lfs_event("lfs_started")
+        try:
+            # Network and bulk local work (checkout, object copy) have no fixed time limit.
+            return self.runner.run(self.program, ["-c", "core.quotepath=false", *args], cwd,
+                                   timeout=None if network or unbounded else 60, stream=stream,
+                                   environment=environment)
+        finally:
+            if lfs_transfer and self.lfs_event:
+                self.lfs_event("lfs_finished")
 
     def branches(self, remote: str) -> list[str]:
         result = self.run(["ls-remote", "--heads", remote], network=True)

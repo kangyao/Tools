@@ -78,6 +78,8 @@ class WindowBackend(Protocol):
 
     def work_area_for_window(self, hwnd: int) -> Rect: ...
 
+    def primary_work_area(self) -> Rect: ...
+
     def place_window(self, hwnd: int, rect: Rect) -> None: ...
 
 
@@ -143,9 +145,10 @@ def calculate_packed_layout(
             left = work_area.left
         else:
             left = layout[-1].right
-        width = max(1, row_height * source_width // source_height)
+        height = min(row_height, source_height)
+        width = max(1, height * source_width // source_height)
         top = work_area.top + row * row_height
-        rect = Rect(left, top, left + width, top + row_height)
+        rect = Rect(left, top, left + width, top + height)
         if rect.right > work_area.right or rect.bottom > work_area.bottom:
             raise ValueError("显示器工作区太小，无法排列窗口。")
         layout.append(rect)
@@ -255,7 +258,11 @@ class WindowLayoutService:
         if cancel.is_set():
             return LayoutResult(missing=missing, cancelled=True)
 
-        work_area = self.backend.work_area_for_window(anchor_hwnd)
+        work_area = (
+            self.backend.primary_work_area()
+            if hasattr(self.backend, "primary_work_area")
+            else self.backend.work_area_for_window(anchor_hwnd)
+        )
         layout = calculate_packed_layout(
             work_area,
             tuple(
@@ -301,6 +308,13 @@ class _MONITORINFO(ctypes.Structure):
 
 _WNDENUMPROC_TYPE = getattr(ctypes, "WINFUNCTYPE", ctypes.CFUNCTYPE)
 _WNDENUMPROC = _WNDENUMPROC_TYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+_MONITORENUMPROC = _WNDENUMPROC_TYPE(
+    wintypes.BOOL,
+    wintypes.HANDLE,
+    wintypes.HANDLE,
+    ctypes.POINTER(_RECT),
+    wintypes.LPARAM,
+)
 
 
 class Win32WindowBackend:
@@ -308,6 +322,7 @@ class Win32WindowBackend:
     GWL_STYLE = -16
     GWL_EXSTYLE = -20
     MONITOR_DEFAULTTONEAREST = 2
+    MONITORINFOF_PRIMARY = 1
     SW_RESTORE = 9
     SWP_NOZORDER = 0x0004
     SWP_NOACTIVATE = 0x0010
@@ -353,6 +368,10 @@ class Win32WindowBackend:
         self._get_window_long.restype = ctypes.c_ssize_t
         user32.MonitorFromWindow.argtypes = [wintypes.HWND, wintypes.DWORD]
         user32.MonitorFromWindow.restype = wintypes.HANDLE
+        user32.EnumDisplayMonitors.argtypes = [
+            wintypes.HANDLE, ctypes.POINTER(_RECT), _MONITORENUMPROC, wintypes.LPARAM,
+        ]
+        user32.EnumDisplayMonitors.restype = wintypes.BOOL
         user32.GetMonitorInfoW.argtypes = [wintypes.HANDLE, ctypes.POINTER(_MONITORINFO)]
         user32.GetMonitorInfoW.restype = wintypes.BOOL
         user32.IsIconic.argtypes = [wintypes.HWND]
@@ -436,15 +455,43 @@ class Win32WindowBackend:
             raise self._last_error("枚举 App 窗口失败")
         return tuple(windows)
 
-    def work_area_for_window(self, hwnd: int) -> Rect:
-        monitor = self.user32.MonitorFromWindow(hwnd, self.MONITOR_DEFAULTTONEAREST)
+    def _work_area_from_monitor(self, monitor: int, error: str) -> Rect:
         if not monitor:
-            raise self._last_error("查找启动器所在显示器失败")
+            raise self._last_error(error)
         info = _MONITORINFO()
         info.cbSize = ctypes.sizeof(info)
         if not self.user32.GetMonitorInfoW(monitor, ctypes.byref(info)):
             raise self._last_error("读取显示器工作区失败")
         return self._rect(info.rcWork)
+
+    def primary_work_area(self) -> Rect:
+        """Return the primary monitor work area, excluding the taskbar."""
+
+        primary: list[int] = []
+
+        @_MONITORENUMPROC
+        def callback(
+            monitor: int, _hdc: int, _monitor_rect: object, _lparam: int,
+        ) -> bool:
+            info = _MONITORINFO()
+            info.cbSize = ctypes.sizeof(info)
+            if self.user32.GetMonitorInfoW(monitor, ctypes.byref(info)) and (
+                info.dwFlags & self.MONITORINFOF_PRIMARY
+            ):
+                primary.append(int(monitor))
+                return True
+            return True
+
+        ctypes.set_last_error(0)
+        if not self.user32.EnumDisplayMonitors(None, None, callback, 0):
+            raise self._last_error("枚举显示器失败")
+        if not primary:
+            raise self._last_error("找不到主显示器")
+        return self._work_area_from_monitor(primary[0], "查找主显示器失败")
+
+    def work_area_for_window(self, hwnd: int) -> Rect:
+        monitor = self.user32.MonitorFromWindow(hwnd, self.MONITOR_DEFAULTTONEAREST)
+        return self._work_area_from_monitor(monitor, "查找启动器所在显示器失败")
 
     def place_window(self, hwnd: int, rect: Rect) -> None:
         if self.user32.IsIconic(hwnd) or self.user32.IsZoomed(hwnd):

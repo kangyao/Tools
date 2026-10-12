@@ -116,6 +116,22 @@ class GridLayoutTests(unittest.TestCase):
         for rect in layout:
             self.assertLessEqual(abs(rect.width * 900 - rect.height * 1600), 900)
 
+    def test_packed_layout_never_enlarges_windows(self) -> None:
+        self.assertEqual(
+            calculate_packed_layout(Rect(0, 0, 1920, 1080), ((800, 600),)),
+            (Rect(0, 0, 800, 600),),
+        )
+        self.assertEqual(
+            calculate_packed_layout(
+                Rect(0, 0, 1800, 800),
+                ((400, 400), (1600, 1200)),
+            ),
+            (
+                Rect(0, 0, 400, 400),
+                Rect(400, 0, 1428, 771),
+            ),
+        )
+
     def test_packed_layout_supports_different_ratios_and_negative_coordinates(self) -> None:
         self.assertEqual(
             calculate_packed_layout(
@@ -174,6 +190,25 @@ class WindowLayoutServiceTests(unittest.TestCase):
             backend, clock=fake_time.clock, waiter=fake_time.wait,
         )
 
+    def test_uses_primary_work_area_when_backend_provides_one(self) -> None:
+        class PrimaryBackend(FakeBackend):
+            def __init__(self) -> None:
+                super().__init__((window(102, 10),))
+                self.primary_calls = 0
+
+            def primary_work_area(self) -> Rect:
+                self.primary_calls += 1
+                return Rect(100, 50, 1100, 650)
+
+        backend = PrimaryBackend()
+        result = self.service(backend, FakeTime()).arrange(
+            (LayoutTarget(1, 10),), 777, threading.Event(), stable_seconds=0,
+        )
+        self.assertEqual(result.moved, (1,))
+        self.assertEqual(backend.primary_calls, 1)
+        self.assertEqual(backend.anchor_hwnds, [])
+        self.assertEqual(backend.placements, [(102, Rect(100, 50, 900, 650))])
+
     def test_waits_for_stable_delayed_windows_and_preserves_target_order(self) -> None:
         splash = window(102, 10, 300, 200)
         host = window(102, 10, 1000, 700, title="Host")
@@ -221,7 +256,7 @@ class WindowLayoutServiceTests(unittest.TestCase):
         self.assertEqual(result.missing, (2,))
         self.assertEqual(
             backend.placements,
-            [(102, Rect(-1920, 0, -534, 1040))],
+            [(102, Rect(-1920, 0, -1120, 600))],
         )
 
     def test_cancellation_stops_waiting_without_moving_windows(self) -> None:

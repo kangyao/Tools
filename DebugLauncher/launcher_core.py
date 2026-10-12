@@ -18,7 +18,10 @@ import xml.etree.ElementTree as ET
 DEFAULT_EXECUTABLE = r"C:\MiniGame\Bin64\AICore_profile.exe"
 DEFAULT_ARGUMENTS = ("-script-debug-wait-client",)
 CONFIG_VERSION = 2
-WINDOW_GEOMETRY_PATTERN = re.compile(r"^[1-9]\d*x[1-9]\d*[+-]\d+[+-]\d+$")
+WINDOW_GEOMETRY_PATTERN = re.compile(
+    r"^(?P<width>[1-9]\d*)x(?P<height>[1-9]\d*)"
+    r"(?P<left>[+-]\d+)(?P<top>[+-]\d+)$"
+)
 DEBUG_WAIT_ARGUMENT = "-script-debug-wait-client"
 LUA_DEBUG_PORT_ARGUMENT = "-lua-debug-port"
 MCP_CLIENT_NAME_ENVIRONMENT_VARIABLE = "MINIGAME_MCP_CLIENT_NAME"
@@ -252,6 +255,24 @@ class LauncherSettings:
 
 def is_valid_window_geometry(value: str) -> bool:
     return not value or WINDOW_GEOMETRY_PATTERN.fullmatch(value) is not None
+
+
+def center_window_geometry_on_screen(
+    geometry: str, screen_width: int, screen_height: int,
+) -> str:
+    """Keep a saved window size while centering it inside one screen."""
+
+    match = WINDOW_GEOMETRY_PATTERN.fullmatch(geometry)
+    if match is None:
+        raise ValueError("窗口几何必须是“宽x高+X+Y”格式。")
+    if screen_width <= 0 or screen_height <= 0:
+        raise ValueError("屏幕尺寸必须是正整数。")
+
+    width = min(int(match.group("width")), screen_width)
+    height = min(int(match.group("height")), screen_height)
+    left = max(0, (screen_width - width) // 2)
+    top = max(0, (screen_height - height) // 2)
+    return f"{width}x{height}+{left}+{top}"
 
 
 class ConfigStore:

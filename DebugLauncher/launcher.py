@@ -23,6 +23,7 @@ from launcher_core import (
     LauncherSettings,
     NetworkRole,
     PairLaunchResult,
+    center_window_geometry_on_screen,
     is_valid_window_geometry,
     load_attach_configuration,
     resolve_app_log_path,
@@ -43,6 +44,7 @@ from window_layout import LayoutResult, LayoutTarget, WindowLayoutService
 TOOL_DIR = Path(__file__).resolve().parent
 CONFIG_PATH = TOOL_DIR / "settings.local.json"
 RUN_CONFIGURATION_PATH = TOOL_DIR.parents[1] / ".run" / "Lua.run.xml"
+DEFAULT_WINDOW_GEOMETRY = "1100x820+0+0"
 
 
 @dataclass
@@ -110,7 +112,7 @@ class DebugLauncherApp:
 
     def _configure_window(self) -> None:
         self.root.title("Host / Client 启动器")
-        self.root.geometry("1100x820")
+        self.root.geometry(DEFAULT_WINDOW_GEOMETRY)
         self.root.minsize(960, 720)
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
         self.root.bind("<Configure>", self._remember_window_geometry, add="+")
@@ -362,9 +364,14 @@ class DebugLauncherApp:
         self.client_delay_var.set(f"{self.config.client_delay_seconds:g}")
         self.client_count_var.set(str(self.config.client_count))
         self.auto_tile_windows_var.set(self.config.auto_tile_windows)
-        if self.config.window_geometry:
-            self.normal_window_geometry = self.config.window_geometry
-            self.root.geometry(self.config.window_geometry)
+        saved_geometry = self.config.window_geometry or DEFAULT_WINDOW_GEOMETRY
+        startup_geometry = center_window_geometry_on_screen(
+            saved_geometry,
+            self.root.winfo_screenwidth(),
+            self.root.winfo_screenheight(),
+        )
+        self.normal_window_geometry = startup_geometry
+        self.root.geometry(startup_geometry)
         self._refresh_profile_choices()
         self._append_log(f"已加载 {len(self.config.profiles)} 份启动配置。")
 

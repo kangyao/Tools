@@ -5,7 +5,7 @@ from pathlib import Path
 import pytest
 
 from repo_tool.models import Profile, RepoSpec, SetupOptions
-from repo_tool.service import RepoService
+from repo_tool.service import RepoService, parse_lfs_progress
 
 
 def git(path, *args, check=True):
@@ -132,6 +132,60 @@ def test_auto_setup_requires_unselected_required_repositories(tmp_path, remote):
 
 def service(tmp_path, **kwargs):
     return RepoService(tmp_path / "app", **kwargs)
+
+
+@pytest.mark.parametrize(
+    ("line", "expected"),
+    [
+        (
+            "Downloading LFS objects: 42% (10/24), 1.2 GB | 8.4 MB/s",
+            {"percent": 42, "completed": 10, "total": 24},
+        ),
+        (
+            "downloading lfs files: 100% (2/2), done",
+            {"percent": 100, "completed": 2, "total": 2},
+        ),
+        ("fetch: Fetching reference refs/heads/main", None),
+        ("Downloading LFS objects: 120% (3/2)", None),
+    ],
+)
+def test_parse_lfs_progress(line, expected):
+    assert parse_lfs_progress(line) == expected
+
+
+def test_lfs_progress_is_emitted_alongside_original_log(tmp_path):
+    events = []
+    svc = service(tmp_path, emit=lambda kind, payload: events.append((kind, payload)))
+    svc.current = "root"
+    svc._log("Downloading LFS objects: 50% (1/2)")
+    assert ("log", ("root", "Downloading LFS objects: 50% (1/2)")) in events
+    assert ("lfs_progress", {
+        "repo_id": "root", "percent": 50, "completed": 1, "total": 2,
+    }) in events
+
+
+@pytest.mark.parametrize("command", [["lfs", "pull"], ["lfs", "fetch", "origin", "HEAD"]])
+def test_lfs_transfer_events_and_force_progress(tmp_path, monkeypatch, command):
+    from repo_tool.process import ProcessResult
+
+    events, calls = [], []
+    svc = service(tmp_path, emit=lambda kind, payload: events.append((kind, payload)))
+    svc.current = "root"
+
+    def run(*args, **kwargs):
+        calls.append(kwargs)
+        svc._log("Downloading LFS objects: 50% (1/2)")
+        return ProcessResult(1, "transfer failed", 0)
+
+    monkeypatch.setattr(svc.runner, "run", run)
+    environment = {"EXTRA": "kept"}
+    result = svc.git.run(command, tmp_path, network=True, stream=True, environment=environment)
+    assert result.returncode == 1
+    assert calls[0]["environment"] == {"EXTRA": "kept", "GIT_LFS_FORCE_PROGRESS": "1"}
+    assert environment == {"EXTRA": "kept"}
+    assert events[0] == ("lfs_started", {"repo_id": "root"})
+    assert events[-1] == ("lfs_finished", {"repo_id": "root"})
+    assert [kind for kind, _ in events] == ["lfs_started", "log", "lfs_progress", "lfs_finished"]
 
 
 def test_clone_empty_directory_nested_in_parent_is_own_repo(tmp_path, remote):

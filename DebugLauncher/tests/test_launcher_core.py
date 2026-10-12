@@ -29,6 +29,7 @@ from launcher_core import (  # noqa: E402
     apply_network_preset,
     build_launch_arguments,
     build_process_environment_overrides,
+    center_window_geometry_on_screen,
     format_argument_text,
     format_command_preview,
     load_attach_configuration,
@@ -67,6 +68,26 @@ class AttachConfigurationTests(unittest.TestCase):
 
             self.assertEqual(load_attach_configuration(missing), AttachConfiguration())
             self.assertEqual(load_attach_configuration(invalid), AttachConfiguration())
+
+
+class WindowGeometryTests(unittest.TestCase):
+    def test_centers_saved_size_on_primary_screen(self) -> None:
+        self.assertEqual(
+            center_window_geometry_on_screen("1100x820-1920+40", 1920, 1080),
+            "1100x820+410+130",
+        )
+
+    def test_clamps_oversized_window_to_primary_screen(self) -> None:
+        self.assertEqual(
+            center_window_geometry_on_screen("2560x1440+200+100", 1920, 1080),
+            "1920x1080+0+0",
+        )
+
+    def test_rejects_invalid_geometry_or_screen_size(self) -> None:
+        with self.assertRaises(ValueError):
+            center_window_geometry_on_screen("1100x820", 1920, 1080)
+        with self.assertRaises(ValueError):
+            center_window_geometry_on_screen("1100x820+0+0", 0, 1080)
 
 
 class ConfigStoreTests(unittest.TestCase):
