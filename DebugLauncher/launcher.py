@@ -427,7 +427,10 @@ class DebugLauncherApp:
         count = self._client_count()
         clients = "Client" if count in (None, 1) else f"{count} 个 Client"
         self.role_controls[NetworkRole.CLIENT].start_button.configure(text=f"启动 {clients}")
-        self.start_pair_button.configure(text=f"一键启动 Host + {clients}")
+        host = self.config.selected(NetworkRole.HOST)
+        title = "DS" if host is not None and host.server_mode == "CloudServer" else "Host"
+        self.role_controls[NetworkRole.HOST].start_button.configure(text=f"启动 {title}")
+        self.start_pair_button.configure(text=f"一键启动 {title} + {clients}")
 
     def _open_profile_manager(self) -> None:
         if self.profile_manager is None:
@@ -469,6 +472,7 @@ class DebugLauncherApp:
             and snapshot.pid > 0
             and snapshot.settings is not None
             and snapshot.settings.network.role in role_order
+            and not snapshot.settings.network.is_dedicated
         ]
         snapshots.sort(key=lambda snapshot: (
             role_order[snapshot.settings.network.role],  # type: ignore[union-attr]
@@ -1113,6 +1117,13 @@ class DebugLauncherApp:
         self.status_var.set(f"运行实例：{len(snapshots)}")
         self._render_instances()
         self._update_buttons()
+        empty_hosts = self.controller.empty_dedicated_host_ids()
+        if empty_hosts and not self.busy:
+            self._run_async(
+                "最后一个 Client 已退出，正在关闭本次 DS…",
+                lambda: tuple(self.controller.stop(instance_id) for instance_id in empty_hosts),
+                lambda stopped: tuple(self._on_instance_stopped(item) for item in stopped),
+            )
         self.status_after_id = self.root.after(500, self._refresh_status)
 
     def _update_buttons(self) -> None:
@@ -1150,7 +1161,7 @@ class DebugLauncherApp:
             network = settings.network
             role = network.role
             if role is NetworkRole.HOST:
-                endpoint, room, account = f"监听 :{network.port}", network.room_id, network.dev_account or "—"
+                endpoint, room, account = f"监听 :{network.port}", network.room_id, "mock" if network.is_dedicated else network.dev_account or "—"
             elif role is NetworkRole.CLIENT:
                 endpoint, room, account = f"{network.host}:{network.port}", network.room_id, network.dev_account or "—"
             else:
@@ -1172,7 +1183,7 @@ class DebugLauncherApp:
                 values=(
                     instance_id,
                     snapshot.label or "—",
-                    role_labels[role],
+                    "DS" if network.is_dedicated else role_labels[role],
                     snapshot.pid or "—",
                     endpoint,
                     room,

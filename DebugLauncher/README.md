@@ -12,18 +12,22 @@ python .\launcher.py
 
 主界面只负责启动，配置的编辑和激活都在 **配置管理** 窗口中完成。详细设计见 [CONFIGURATION_PLAN.md](CONFIGURATION_PLAN.md)。
 
-1. 点击 **配置管理**，新建或编辑 Host、Client 配置：填写配置名称、类型、程序路径、端口、房间和开发账号序号，Client 另有主机地址和“多开时自动分配不同账号”。点击 **保存** 后才会生效。
+1. 点击 **配置管理**，新建或编辑 Host、Client 配置：填写配置名称、类型、服务端模式、程序路径、端口和房间；Client 与 Listen Host 使用开发账号序号，Client 另有主机地址和“多开时自动分配不同账号”。点击 **保存** 后才会生效。
 2. 在配置管理中为 Host、Client 各勾选一份 **激活**（列表中以 ✓ 标记）。每种类型只能激活一份，勾选后立即在主界面显示，无需点保存。
-3. 主界面显示激活的 Host、Client 配置及参数摘要。设置 Client **数量** 后，点击 **启动 Host**、**启动 N 个 Client** 单独启动，或点击 **一键启动 Host + N 个 Client**：先启动 Host（已有相同配置的受管 Host 时直接复用），等待设定的间隔（默认 2 秒）后依次启动 N 个 Client。该间隔只是启动间隔，不代表已确认 Host 网络就绪。激活状态、数量和间隔都会被记住。
+3. 主界面显示激活的 Host、Client 配置及参数摘要。设置 Client **数量** 后，点击 **启动 Host**、**启动 N 个 Client** 单独启动，或点击 **一键启动 Host + N 个 Client**：先启动 Host（已有相同配置的受管 Host 时直接复用），等待设定的间隔（默认 2 秒）后依次启动 N 个 Client。启动器还会确认该受管服务端 PID 已监听配置的 UDP 端口（最多 30 秒），未就绪时不启动 Client。激活状态、数量和间隔都会被记住。
 
-网络字段生成与 AIGamePlay `Tools/Start-NetDebug.ps1` 一致的参数：
+默认服务端模式为 `CloudServer`，与 AIGamePlay `StartGame.bat` 一致；配置类型 Host 表示服务端配置，运行实例中 DS 显示为 **DS / mock**。需要本地主机玩家时，把两端服务端模式都改为 `Host`。
+
+默认 AICore 程序会自动补 `-AICoreRoot C:\MiniGame\Source\AIGamePlay`；显式填写的工程路径和自选 EXE 保留。
+
+默认网络参数：
 
 ```text
--MGFDevAccount 1 -MGFNetRole Host -MGFNetPort 7000 -MGFNetRoomId 1
--MGFDevAccount 2 -MGFNetRole Client -MGFNetHost 127.0.0.1 -MGFNetPort 7000 -MGFNetRoomId 1
+-MGFNetRole CloudServer -MGFNetPort 7000 -MGFNetRoomId 1
+-MGFDevAccount 2 -MGFNetRole Client -MGFNetHost 127.0.0.1 -MGFNetPort 7000 -MGFNetRoomId 1 -MGFNetServer CloudServer
 ```
 
-`-MGFDevAccount N` 选 `AIGamePlay/.dev/account.json` 的第 N 个开发账号登录（Host 默认 1、Client 默认 2）。除云服外所有角色都要真实登录，联机身份取登录账号的 uin；旧的 `-MGFNetUin` 已被 AICore 移除，传入会判 `NetLaunchInvalid: uin`，启动器读取旧配置时自动丢弃，额外参数中填写会提示删除。
+`-MGFDevAccount N` 选 `AIGamePlay/.project/account.json` 的第 N 个开发账号登录（Listen Host 默认 1、Client 默认 2；DS 为 mock，不占开发账号）。除云服外所有角色都要真实登录，联机身份取登录账号的 uin；旧的 `-MGFNetUin` 已被 AICore 移除，传入会判 `NetLaunchInvalid: uin`，启动器读取旧配置时自动丢弃，额外参数中填写会提示删除。
 
 **额外参数** 用于填写其他 App 参数，含空格的值用双引号；按 Windows 命令行规则解析，不通过 shell 执行。额外参数中不能重复填写 `-MGFNet*` 网络参数与 `-MGFDevAccount`、`-script-debug-wait-client` 或 `-lua-debug-port`，应改用对应的表单字段或选项。命令预览与实际启动使用同一份参数列表。
 
@@ -37,14 +41,17 @@ python .\launcher.py
 - 修改已激活配置的类型后，它不再是原类型的激活配置。
 - 当前有未保存修改时勾选“激活”，会先提示保存、放弃或继续编辑；新建的配置在保存时按勾选状态激活。
 
-一键启动前会检查激活的 Client 是否能连接激活的 Host：地址须为本机（`127.0.0.1`、`localhost`、`::1`），端口和房间须与 Host 一致，否则列出不匹配的字段。Host 启动失败时不会启动 Client；Client 启动失败时 Host 继续由启动器管理，可单独重试 Client 或关闭 Host。
+一键启动前会检查激活的 Client 是否能连接激活的 Host：地址须为本机（`127.0.0.1`、`localhost`、`::1`），端口、房间和服务端模式须与 Host 一致，否则列出不匹配的字段。Host 启动失败时不会启动 Client；Client 启动失败时 Host 继续由启动器管理，可单独重试 Client 或关闭 Host。
 
-AICore 按开发账号加锁，同一台机器上每个进程必须用不同账号。启用自动分配时，Client 从配置的账号序号开始，跳过本启动器管理的所有实例（含 Host，不论房间）已占用的序号；实际序号只属于本次实例，保存的配置不会被递增。关闭自动分配时使用固定序号，与已运行实例冲突时给出错误，且 Client 数量只能为 1。多个 Client 中某个启动失败时停止后续启动，已启动的保留，并提示已启动的数量。
+AICore 按开发账号加锁，同一台机器上每个进程必须用不同账号。启用自动分配时，Client 从配置的账号序号开始，跳过本启动器管理的所有实例（含 Host，不论房间）已占用的序号，并用与 StartGame 相同的全局 dev<N>.lock 检查避开其他启动器占用的账号；实际序号只属于本次实例，保存的配置不会被递增。关闭自动分配时使用固定序号，与已运行实例冲突时给出错误，且 Client 数量只能为 1。多个 Client 中某个启动失败时停止后续启动，已启动的保留，并提示已启动的数量。
 
 其他功能：
 
+- **DS 自动收尾**：同一受管 DS 的最后一个本机 Client 退出后自动正常停服；多开时首个 Client 退出不会关闭 DS。单独启动且尚无 Client 的 DS 保留，供后续连接。另一房间或其他启动器创建的 DS 不受影响。
+- **DS 窗口**：DS 没有游戏窗口，不参与平铺；取消“显示控制台”时追加 `-AICoreNoConsole`。
+
 - **运行实例**：显示配置名称、角色、PID、网络端点、房间、实际开发账号序号、App 状态，以及调试端口、Attach 连接和调试服务状态；列表空间不足时可滚动。
-- **关闭选中实例 / 关闭全部**：结束本启动器创建的指定实例或全部实例及其子进程。
+- **关闭选中实例 / 关闭全部**：优先通过已验证 PID / instance_id / 工程的 AICore HTTP 正常停止；不支持或超时才结束受管 Job 进程树。
 - **重启选中实例**：使用该实例的启动快照（参数、实际开发账号、调试端口），不受之后的配置编辑影响。要使用修改后的配置，关闭旧实例后重新启动。
 - **查看启动命令**：显示所选实例实际传递的完整命令，包括自动分配的 `-lua-debug-port`，可复制。
 - **打开日志**（或双击实例行）：用系统关联程序打开该实例的日志文件。路径按 AICore `WinGameStart.cpp` 的规则推算，位于 EXE 所在目录：`-AICoreLogFile` 指定的文件名优先；其次 `-AICoreNetRole Dedicated` 为 `AICoreApp-server.log`、`Client` 为 `AICoreApp-client-<PID>.log`；再次 `-MGFDevAccount N` 为 `AICoreApp_devN.log`；否则 `AICoreApp.log`。文件尚不存在时提示路径，并可打开所在目录。注意同一开发账号的实例共用一个日志文件。
@@ -55,7 +62,7 @@ AICore 按开发账号加锁，同一台机器上每个进程必须用不同账�
 
 ## 配置存储与迁移
 
-配置保存在本目录的 `settings.local.json`（版本 4，已被 Git 忽略），包含具名配置集合（旧存档里的 `uin` 字段读取时忽略、`auto_uin` 沿用为 `auto_dev_account`）、激活的 Host / Client 配置（`selected_host` / `selected_client`）、Client 数量（`client_count`）、双端启动间隔、启动器窗口尺寸（保存的旧位置在启动时忽略）和自动平铺开关（`auto_tile_windows`）。配置用稳定标识关联，改名后激活状态保持不变；旧版本 4 配置缺少自动平铺字段时默认开启。
+配置保存在本目录的 `settings.local.json`（版本 5，已被 Git 忽略），包含具名配置集合（旧存档里的 `uin` 字段读取时忽略、`auto_uin` 沿用为 `auto_dev_account`）、激活的 Host / Client 配置（`selected_host` / `selected_client`）、Client 数量（`client_count`）、双端启动间隔、启动器窗口尺寸（保存的旧位置在启动时忽略）和自动平铺开关（`auto_tile_windows`）。配置新增 `server_mode`；旧版本 4 读取时默认 CloudServer，保留名称、标识、路径和激活状态。配置用稳定标识关联，改名后激活状态保持不变。
 
 首次读取旧版本配置时自动迁移为“默认 Host”和“默认 Client”：
 
@@ -105,6 +112,15 @@ GUI 运行日志出现 `AIFramework offline; waiting for restart` 表示正在�
 ## 进程安全边界
 
 启动器使用 Windows Job Object 管理进程树，只能关闭当前 GUI 实例亲自启动的进程，不会按名称查找或终止其他 App 实例。关闭启动器窗口时，它管理的 App、常驻调试桥和 Node DAP 也会被关闭。
+
+## 验证记录
+
+1. `pass`（2026-10-14）：160 项 Python 回归测试；DS 参数、旧配置迁移、Listen Host、错 PID / 工程 / 实例拒绝与自动收尾均覆盖。
+2. `pass / RealTransport / Dedicated`：GUI 分三轮各启动 1 DS + 2 Client；HTTP 回读 Dedicated、大厅 Running、2 个认证玩家。
+   关闭首个游戏窗口时 DS 保留；最后一个退出后 DS 自动关闭；直接关闭 GUI 也正常收尾。
+   隐藏 DS 与显示控制台两种模式均验证；所有测试 App 退出码为 0，独立 DS 保持运行；证据在 AIGamePlay 的 `.local/debug-launcher-ds-evidence.json`。
+3. `blocked`：既有 IDE 配置测试缺少 `D:\git\skills\.run\Lua.run.xml`，与本次改动无关。
+4. 当前桌面旧启动器来自 W 盘，D / W 是独立副本；使用本次修改需关闭旧窗口，重新双击 D 盘 `run_launcher.bat`。
 
 ## 测试
 

@@ -146,7 +146,7 @@ class LauncherUiTests(unittest.TestCase):
         self.assertEqual(self.app.role_controls[HOST].name.get(), "Debug Host")
         self.assertEqual(self.app.role_controls[CLIENT].name.get(), "本机 Client")
         self.assertEqual(self.app.client_count_var.get(), "3")
-        self.assertEqual(str(self.app.start_pair_button.cget("text")), "一键启动 Host + 3 个 Client")
+        self.assertEqual(str(self.app.start_pair_button.cget("text")), "一键启动 DS + 3 个 Client")
 
     def test_deactivating_disables_that_role_only(self) -> None:
         self.activate("默认 Client", False)
@@ -162,8 +162,8 @@ class LauncherUiTests(unittest.TestCase):
         self.app.start_pair_button.invoke()
         self.wait_until_idle()
         rows = self.tree_values()
-        self.assertEqual([row[2] for row in rows], ["Host", "Client", "Client", "Client"])
-        self.assertEqual([row[6] for row in rows], ["1", "2", "3", "4"])
+        self.assertEqual([row[2] for row in rows], ["DS", "Client", "Client", "Client"])
+        self.assertEqual([row[6] for row in rows], ["mock", "2", "3", "4"])
         self.app.role_controls[CLIENT].start_button.invoke()
         self.wait_until_idle()
         self.assertEqual([row[6] for row in self.tree_values()][4:], ["5", "6", "7"])
@@ -179,6 +179,8 @@ class LauncherUiTests(unittest.TestCase):
         self.assertFalse(self.app.auto_tile_windows_var.get())
 
     def test_single_host_requests_window_layout(self) -> None:
+        self.seed(LaunchProfile(name="Listen Host", role=HOST, server_mode="Host"),
+                  LaunchProfile(name="Client", role=CLIENT, server_mode="Host"))
         self.app.role_controls[HOST].start_button.invoke()
         self.wait_until_idle()
         self.wait_for_layout(1)
@@ -200,9 +202,11 @@ class LauncherUiTests(unittest.TestCase):
         self.wait_until_idle()
         self.wait_for_layout(1)
         targets = self.layout_service.calls[0][0]
-        self.assertEqual([target.instance_id for target in targets], [1, 2, 3, 4])
+        self.assertEqual([target.instance_id for target in targets], [2, 3, 4])
 
     def test_layout_orders_host_before_older_client(self) -> None:
+        self.seed(LaunchProfile(name="Listen Host", role=HOST, server_mode="Host"),
+                  LaunchProfile(name="Client", role=CLIENT, server_mode="Host"))
         self.app.role_controls[CLIENT].start_button.invoke()
         self.wait_until_idle()
         self.wait_for_layout(1)
@@ -213,6 +217,8 @@ class LauncherUiTests(unittest.TestCase):
         self.assertEqual([target.instance_id for target in targets], [2, 1])
 
     def test_restart_layout_uses_new_pid_and_keeps_instance_id(self) -> None:
+        self.seed(LaunchProfile(name="Listen Host", role=HOST, server_mode="Host"),
+                  LaunchProfile(name="Client", role=CLIENT, server_mode="Host"))
         self.app.role_controls[HOST].start_button.invoke()
         self.wait_until_idle()
         self.wait_for_layout(1)
@@ -236,6 +242,8 @@ class LauncherUiTests(unittest.TestCase):
         self.assertEqual(self.layout_service.calls, [])
 
     def test_stop_cancels_window_layout_wait(self) -> None:
+        self.seed(LaunchProfile(name="Listen Host", role=HOST, server_mode="Host"),
+                  LaunchProfile(name="Client", role=CLIENT, server_mode="Host"))
         self.layout_service.block = True
         self.app.role_controls[HOST].start_button.invoke()
         self.wait_until_idle()
@@ -266,18 +274,18 @@ class LauncherUiTests(unittest.TestCase):
         self.assertEqual(str(self.app.start_pair_button.cget("state")), tk.DISABLED)
         controls[HOST].start_button.invoke()
         self.wait_until_idle()
-        self.assertEqual(self.factory.calls[0][1][3], "Host")
+        self.assertEqual(self.factory.calls[0][1][1], "CloudServer")
 
     def test_one_click_launches_pair_then_reuses_host_with_new_dev_account(self) -> None:
         self.app.start_pair_button.invoke()
         self.wait_until_idle()
-        self.assertEqual([call[1][3] for call in self.factory.calls], ["Host", "Client"])
+        self.assertEqual([call[1][call[1].index("-MGFNetRole") + 1] for call in self.factory.calls], ["CloudServer", "Client"])
         self.app.start_pair_button.invoke()
         self.wait_until_idle()
         self.assertEqual(len(self.factory.created), 3)
         rows = self.tree_values()
         self.assertEqual([row[1] for row in rows], ["默认 Host", "默认 Client", "默认 Client"])
-        self.assertEqual([row[6] for row in rows], ["1", "2", "3"])
+        self.assertEqual([row[6] for row in rows], ["mock", "2", "3"])
         self.assertEqual(self.app.store.load().selected(CLIENT).dev_account, 2)
 
     def test_pair_mismatch_is_reported_without_launching(self) -> None:
@@ -313,10 +321,7 @@ class LauncherUiTests(unittest.TestCase):
         self.assertIn("启动程序不存在", message)
         self.assertIn("本机 Host", message)
         self.assertEqual(len(self.tree_values()), 1)
-        self.wait_for_layout(1)
-        self.assertEqual(
-            [target.instance_id for target in self.layout_service.calls[0][0]], [1],
-        )
+        self.assertEqual(self.layout_service.calls, [], "DS has no game window to tile")
 
     def test_open_log_opens_the_instance_log_file(self) -> None:
         bin_dir = Path(self.directory.name) / "Bin64"
@@ -354,7 +359,7 @@ class LauncherUiTests(unittest.TestCase):
             self.app._on_instance_double_click(type("Event", (), {"y": 5})())
         open_log.assert_called_once_with()
         self.assertEqual(
-            self.app._instance_log_path(1).name, "AICoreApp_dev1.log",
+            self.app._instance_log_path(1).name, "AICoreApp.log",
         )
 
     def test_view_command_shows_actual_dev_account_and_debug_port(self) -> None:
@@ -485,7 +490,7 @@ class LauncherUiTests(unittest.TestCase):
         manager._finish_command_edit()
         self.assertEqual(
             manager.preview_var.get(),
-            f"{DEFAULT_EXECUTABLE} -MGFDevAccount 1 -MGFNetRole Host -MGFNetPort 7200 -MGFNetRoomId 1 -extra \"a b\"",
+            f"{DEFAULT_EXECUTABLE} -MGFDevAccount 1 -MGFNetRole Host -MGFNetPort 7200 -MGFNetRoomId 1 -extra \"a b\" -AICoreRoot C:\\MiniGame\\Source\\AIGamePlay",
         )
         self.assertTrue(manager.is_dirty)
         self.assertTrue(manager.save())
@@ -565,6 +570,35 @@ class LauncherUiTests(unittest.TestCase):
         self.app._on_close()
         self.assertTrue(self.app.closing)
         self.assertEqual(self.app.store.load().selected(HOST).port, 7000)
+
+    def test_last_client_exit_stops_only_its_dedicated_server(self) -> None:
+        self.app.client_count_var.set("2")
+        self.app.start_pair_button.invoke()
+        self.wait_until_idle()
+        independent = self.app.controller.start(LaunchProfile(name="Independent DS", role=HOST, port=7201).settings())
+        self.app._on_instance_started(independent)
+        self.factory.created[1].exit_code = 0
+        self.app._refresh_status(force=True)
+        self.assertFalse(self.factory.created[0].terminated)
+        self.factory.created[2].exit_code = 0
+        self.app._refresh_status(force=True)
+        self.wait_until_idle()
+        self.assertTrue(self.factory.created[0].terminated)
+        self.assertFalse(self.factory.created[3].terminated)
+        self.assertEqual([item.instance_id for item in self.app.controller.snapshots()], [independent.instance_id])
+        self.assertEqual([int(row[0]) for row in self.tree_values()], [independent.instance_id])
+
+    def test_cloud_server_mode_updates_preview_and_disables_account(self) -> None:
+        manager = self.manager()
+        manager.select_profile(self.app.config.selected_host_id)
+        self.assertIn("-MGFNetRole CloudServer", manager.preview_var.get())
+        self.assertNotIn("-MGFDevAccount", manager.preview_var.get())
+        self.assertEqual(str(manager.account_entry.cget("state")), "disabled")
+        manager.form.server_mode.set("Host")
+        self.assertIn("-MGFNetRole Host", manager.preview_var.get())
+        self.assertEqual(str(manager.account_entry.cget("state")), "normal")
+        self.assertTrue(manager.save())
+        self.assertEqual(self.app.store.load().selected(HOST).server_mode, "Host")
 
 
 if __name__ == "__main__":

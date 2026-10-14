@@ -44,6 +44,7 @@ class _FormVars:
     extra_arguments: tk.StringVar
     show_console: tk.BooleanVar
     debug_wait: tk.BooleanVar
+    server_mode: tk.StringVar
 
     @classmethod
     def create(cls, master: tk.Misc) -> _FormVars:
@@ -51,6 +52,7 @@ class _FormVars:
             tk.StringVar(master), tk.StringVar(master, value="Host"), tk.StringVar(master),
             tk.StringVar(master), tk.StringVar(master), tk.StringVar(master), tk.StringVar(master),
             tk.BooleanVar(master), tk.StringVar(master), tk.BooleanVar(master), tk.BooleanVar(master),
+            tk.StringVar(master, value="CloudServer"),
         )
 
     def all(self) -> tuple[tk.Variable, ...]:
@@ -160,7 +162,12 @@ class ProfileManagerWindow:
         ttk.Entry(form, textvariable=f.room_id, width=10).grid(row=5, column=3, sticky=tk.W, pady=3)
         # 开发账号序号：AIGamePlay/.dev/account.json 的第 N 项，生成 -MGFDevAccount N；Host 与 Client 都需要登录。
         self._label(form, "开发账号序号", 6)
-        ttk.Entry(form, textvariable=f.dev_account, width=10).grid(row=6, column=1, sticky=tk.W, pady=3)
+        self.account_entry = ttk.Entry(form, textvariable=f.dev_account, width=10)
+        self.account_entry.grid(row=6, column=1, sticky=tk.W, pady=3)
+        ttk.Label(form, text="服务端模式").grid(row=6, column=2, sticky=tk.W, padx=(16, 6))
+        ttk.Combobox(form, textvariable=f.server_mode, values=("CloudServer", "Host"), state="readonly", width=14).grid(
+            row=6, column=3, columnspan=2, sticky=tk.W, pady=3,
+        )
         auto_dev_account = ttk.Checkbutton(
             form, text="多开时自动分配不同账号（本机每个进程须用不同账号）", variable=f.auto_dev_account,
         )
@@ -234,6 +241,7 @@ class ProfileManagerWindow:
             f = self.form
             f.name.set(profile.name)
             f.role.set(ROLE_TITLES[profile.role])
+            f.server_mode.set(profile.server_mode)
             f.executable.set(profile.executable)
             f.host.set(profile.host)
             f.port.set(str(profile.port))
@@ -288,6 +296,7 @@ class ProfileManagerWindow:
         if self.loading:
             return
         is_client = ROLE_BY_TITLE.get(self.form.role.get()) is NetworkRole.CLIENT
+        self.account_entry.configure(state="normal" if is_client or self.form.server_mode.get() == "Host" else "disabled")
         for widget in self.client_only:
             if is_client:
                 widget.grid()
@@ -333,6 +342,7 @@ class ProfileManagerWindow:
             return
         f = self.form
         f.role.set(ROLE_TITLES[profile.role])
+        f.server_mode.set(profile.server_mode)
         f.executable.set(profile.executable)
         if profile.role is NetworkRole.CLIENT:
             f.host.set(profile.host)
@@ -399,10 +409,11 @@ class ProfileManagerWindow:
         # Host 不使用地址和自动分配开关，隐藏字段中的内容不参与校验。
         return LaunchProfile(
             id=self.current_id or new_profile_id(),
-            name=f.name.get(), role=role, executable=f.executable.get(),
+            name=f.name.get(), role=role, executable=f.executable.get(), server_mode=f.server_mode.get(),
             host=f.host.get() if is_client else DEFAULT_NETWORK_HOST,
             port=integer(f.port, "端口"), room_id=integer(f.room_id, "房间号"),
-            dev_account=integer(f.dev_account, "开发账号序号"),
+            dev_account=(integer(f.dev_account, "开发账号序号") if is_client or f.server_mode.get() == "Host"
+                         else int(f.dev_account.get().strip()) if f.dev_account.get().strip().isdigit() else 0),
             auto_dev_account=bool(f.auto_dev_account.get()) if is_client else True,
             extra_arguments=parse_argument_text(f.extra_arguments.get()),
             show_console=bool(f.show_console.get()), debug_wait=bool(f.debug_wait.get()),

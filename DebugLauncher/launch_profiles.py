@@ -11,6 +11,7 @@ from launcher_core import (
     ConfigurationError,
     DEBUG_WAIT_ARGUMENT,
     DEFAULT_EXECUTABLE,
+    DEFAULT_PROJECT_ROOT,
     DEFAULT_NETWORK_HOST,
     DEFAULT_NETWORK_PORT,
     DEFAULT_NETWORK_ROOM_ID,
@@ -30,7 +31,7 @@ from launcher_core import (
 )
 
 
-PROFILE_CONFIG_VERSION = 4
+PROFILE_CONFIG_VERSION = 5
 LAUNCH_ROLES = (NetworkRole.HOST, NetworkRole.CLIENT)
 ROLE_TITLES = {NetworkRole.HOST: "Host", NetworkRole.CLIENT: "Client"}
 LOCAL_HOSTS = frozenset(("127.0.0.1", "localhost", "::1"))
@@ -62,6 +63,7 @@ class LaunchProfile:
     show_console: bool = True
     debug_wait: bool = False
     id: str = field(default_factory=new_profile_id)
+    server_mode: str = "CloudServer"
 
     def __post_init__(self) -> None:
         if not isinstance(self.id, str) or not self.id.strip():
@@ -71,6 +73,8 @@ class LaunchProfile:
             if not isinstance(value, str) or not value.strip():
                 raise ConfigurationError(f"{label}不能为空。")
             object.__setattr__(self, name, value.strip())
+        if self.server_mode not in ("CloudServer", "Host"):
+            raise ConfigurationError("服务端模式必须是 CloudServer 或 Host。")
         if self.role not in LAUNCH_ROLES:
             raise ConfigurationError("配置类型必须是 Host 或 Client。")
         if not _is_integer(self.port) or not 1 <= self.port <= MAX_PORT:
@@ -108,11 +112,18 @@ class LaunchProfile:
 
     @property
     def network(self) -> NetworkOptions:
-        return NetworkOptions(self.role, self.host, self.port, self.room_id, self.dev_account)
+        return NetworkOptions(self.role, self.host, self.port, self.room_id, self.dev_account, self.server_mode)
 
     def settings(self) -> LauncherSettings:
         """Build the argv shared by previews and launches, in the .bat script order."""
         arguments = self.network.arguments() + self.extra_arguments
+        # Match StartGame.bat's project; preserve explicitly chosen programs/projects.
+        from os.path import normcase, normpath
+        if (normcase(normpath(self.executable)) == normcase(normpath(DEFAULT_EXECUTABLE))
+                and not any(a.casefold() == "-aicoreroot" for a in arguments)):
+            arguments += ("-AICoreRoot", DEFAULT_PROJECT_ROOT)
+        if self.network.is_dedicated and not self.show_console and "-AICoreNoConsole" not in arguments:
+            arguments += ("-AICoreNoConsole",)
         if self.debug_wait:
             arguments += (DEBUG_WAIT_ARGUMENT,)
         return LauncherSettings(
@@ -123,7 +134,7 @@ class LaunchProfile:
         if self.role is NetworkRole.HOST:
             parts = [
                 Path(self.executable).name, f"端口 {self.port}", f"房间 {self.room_id}",
-                f"账号 {self.dev_account}",
+                "DS · mock 账号" if self.network.is_dedicated else f"账号 {self.dev_account}",
             ]
         else:
             account = f"起始账号 {self.dev_account}" if self.auto_dev_account else f"固定账号 {self.dev_account}"
@@ -150,10 +161,10 @@ def profile_from_command(command: str, base: LaunchProfile) -> LaunchProfile:
             )
     network = parse_network_arguments(arguments)
     if network.role not in LAUNCH_ROLES:
-        raise ConfigurationError("命令中需要 -MGFNetRole Host 或 -MGFNetRole Client。")
+        raise ConfigurationError("命令中需要 -MGFNetRole CloudServer、Host 或 -MGFNetRole Client。")
     extras = apply_network_preset(arguments, NetworkRole.STANDALONE)
     return replace(
-        base, role=network.role, executable=executable,
+        base, role=network.role, executable=executable, server_mode=network.server_mode,
         host=network.host if network.role is NetworkRole.CLIENT else DEFAULT_NETWORK_HOST,
         port=network.port, room_id=network.room_id, dev_account=network.dev_account or 0,
         extra_arguments=tuple(argument for argument in extras if argument != DEBUG_WAIT_ARGUMENT),
@@ -166,6 +177,8 @@ def pair_mismatches(host: LaunchProfile, client: LaunchProfile) -> tuple[str, ..
     mismatches = []
     if client.host.casefold() not in LOCAL_HOSTS:
         mismatches.append(f"主机地址 {client.host} 不是本机地址（127.0.0.1）")
+    if client.server_mode != host.server_mode:
+        mismatches.append(f"服务端模式 {client.server_mode} 与 Host 的 {host.server_mode} 不一致")
     if client.port != host.port:
         mismatches.append(f"端口 {client.port} 与 Host 端口 {host.port} 不一致")
     if client.room_id != host.room_id:
@@ -327,7 +340,7 @@ class ProfileStore:
             return self._migrate_single(ConfigStore.parse_settings(raw))
         if version == 3:
             return self._migrate_pair(raw)
-        if version != PROFILE_CONFIG_VERSION:
+        if version not in (4, PROFILE_CONFIG_VERSION):
             raise ConfigurationError(f"不支持的配置版本：{version!r}。")
         profiles = raw.get("profiles")
         if not isinstance(profiles, list):
@@ -365,6 +378,7 @@ class ProfileStore:
                 auto_dev_account=raw.get("auto_dev_account", raw.get("auto_uin", True)),  # type: ignore[arg-type]
                 extra_arguments=tuple(extras),
                 show_console=raw.get("show_console", True),  # type: ignore[arg-type]
+                server_mode=raw.get("server_mode", "CloudServer"),
                 debug_wait=raw.get("debug_wait", False),  # type: ignore[arg-type]
             )
         except ConfigurationError as exc:
@@ -426,6 +440,7 @@ class ProfileStore:
                     "id": profile.id,
                     "name": profile.name,
                     "role": profile.role.value,
+                    "server_mode": profile.server_mode,
                     "executable": profile.executable,
                     "host": profile.host,
                     "port": profile.port,

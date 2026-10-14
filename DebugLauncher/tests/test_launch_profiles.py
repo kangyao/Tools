@@ -32,16 +32,17 @@ class LaunchProfileTests(unittest.TestCase):
         profile = client(extra_arguments=("-client-only", "a b"), debug_wait=True)
         self.assertEqual(profile.settings().arguments, (
             "-MGFDevAccount", "2", "-MGFNetRole", "Client", "-MGFNetHost", "127.0.0.1", "-MGFNetPort", "7000",
-            "-MGFNetRoomId", "1",
-            "-client-only", "a b", "-script-debug-wait-client",
+            "-MGFNetRoomId", "1", "-MGFNetServer", "CloudServer",
+            "-client-only", "a b", "-AICoreRoot", r"C:\MiniGame\Source\AIGamePlay", "-script-debug-wait-client",
         ))
         self.assertEqual(host().settings().arguments, (
-            "-MGFDevAccount", "1", "-MGFNetRole", "Host", "-MGFNetPort", "7000", "-MGFNetRoomId", "1",
+            "-MGFNetRole", "CloudServer", "-MGFNetPort", "7000", "-MGFNetRoomId", "1",
+            "-AICoreRoot", r"C:\MiniGame\Source\AIGamePlay",
         ))
         self.assertIn('"a b"', format_command_preview(profile.settings()))
 
     def test_summary_shows_key_parameters(self) -> None:
-        self.assertEqual(host().summary(), "AICore_profile.exe · 端口 7000 · 房间 1 · 账号 1")
+        self.assertEqual(host().summary(), "AICore_profile.exe · 端口 7000 · 房间 1 · DS · mock 账号")
         self.assertEqual(client().summary(), "127.0.0.1:7000 · 房间 1 · 起始账号 2")
         self.assertIn("固定账号 5", client(dev_account=5, auto_dev_account=False).summary())
         self.assertIn("等待调试器", host(debug_wait=True).summary())
@@ -91,7 +92,7 @@ class LaunchProfileTests(unittest.TestCase):
     def test_invalid_commands_are_explained(self) -> None:
         cases = {
             "程序路径": "-MGFNetRole Host",
-            "-MGFNetRole Host 或": "App.exe -MGFNetPort 7000",
+            "-MGFNetRole CloudServer": "App.exe -MGFNetPort 7000",
             "已移除": "App.exe -MGFNetRole Client -MGFNetUin 10001",
             "缺少值": "App.exe -MGFNetRole Host -MGFNetPort",
             "-lua-debug-port": "App.exe -MGFNetRole Host -lua-debug-port 3382",
@@ -204,7 +205,7 @@ class ProfileStoreTests(unittest.TestCase):
         self.store.save(config)
         self.assertEqual(self.store.load(), config)
         payload = json.loads(self.path.read_text(encoding="utf-8"))
-        self.assertEqual(payload["version"], 4)
+        self.assertEqual(payload["version"], 5)
         self.assertFalse(payload["auto_tile_windows"])
 
     def test_v2_host_migrates_to_default_host_and_client(self) -> None:
@@ -295,6 +296,30 @@ class ProfileStoreTests(unittest.TestCase):
         self.path.write_text('{"version": 4, "profiles": {}}', encoding="utf-8")
         with self.assertRaises(ConfigurationError):
             self.store.load()
+
+
+class DedicatedProfilesTests(unittest.TestCase):
+    def test_dedicated_server_uses_mock_and_client_targets_cloud_server(self) -> None:
+        server = host(dev_account=7).settings()
+        target = client().settings()
+        self.assertTrue(server.network.is_dedicated)
+        self.assertEqual(server.network.dev_account, 0)
+        self.assertNotIn("-MGFDevAccount", server.arguments)
+        self.assertIn("CloudServer", target.arguments)
+        self.assertEqual(pair_mismatches(host(), client(server_mode="Host"))[0],
+                         "服务端模式 Host 与 Host 的 CloudServer 不一致")
+
+    def test_listen_host_remains_explicitly_available(self) -> None:
+        profile = host(server_mode="Host", dev_account=5)
+        self.assertFalse(profile.settings().network.is_dedicated)
+        self.assertEqual(profile.settings().network.dev_account, 5)
+        self.assertEqual(pair_mismatches(profile, client(server_mode="Host")), ())
+        self.assertEqual(profile_from_command(format_command_preview(profile.settings()), profile).server_mode, "Host")
+
+    def test_explicit_project_path_is_preserved(self) -> None:
+        profile = host(extra_arguments=("-AICoreRoot", "D:/custom project"))
+        self.assertEqual(profile.settings().arguments.count("-AICoreRoot"), 1)
+        self.assertIn("D:/custom project", profile.settings().arguments)
 
 
 if __name__ == "__main__":

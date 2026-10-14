@@ -6,6 +6,7 @@ import sys
 import tempfile
 import threading
 import unittest
+from unittest.mock import patch
 
 
 TOOL_DIR = Path(__file__).resolve().parents[1]
@@ -836,6 +837,76 @@ class WindowsJobProcessTests(unittest.TestCase):
             self.assertEqual(process.poll(), 23)
         finally:
             process.close()
+
+
+class AICoreGracefulStopTests(unittest.TestCase):
+    def info(self, **values):
+        return dict(pid=1234, instance_id="session-1", project_path="C:/test-project", **values)
+
+    def test_verified_owned_instance_gets_one_stop_request(self) -> None:
+        from aicore_control import request_stop
+        info = self.info()
+        for project in ("C:/test-project", "../test-project"):
+            with self.subTest(project=project), patch("aicore_control.owned_ports", return_value=(9050,)), patch(
+                "aicore_control._http", side_effect=[info, info, {"state": "accepted"}]
+            ) as http:
+                self.assertTrue(request_stop(1234, ("-AICoreRoot", project), lambda: True, working_directory="C:/Bin64"))
+                self.assertEqual(http.call_args.args[2], {"instance_id": "session-1", "operation": "runtime.stop"})
+
+    def test_other_pid_or_project_cannot_receive_stop(self) -> None:
+        from aicore_control import request_stop
+        for change in ({"pid": 9876}, {"project_path": "D:/other-project"}):
+            info = {**self.info(), **change}
+            with self.subTest(change=change), patch("aicore_control.owned_ports", return_value=(9050,)), patch(
+                "aicore_control._http", return_value=info
+            ) as http:
+                self.assertFalse(request_stop(1234, ("-AICoreRoot", "C:/test-project"), lambda: True))
+                self.assertEqual(http.call_count, 1)
+
+    def test_instance_replaced_during_discovery_cannot_receive_stop(self) -> None:
+        from aicore_control import request_stop
+        with patch("aicore_control.owned_ports", return_value=(9050,)), patch(
+            "aicore_control._http", side_effect=[self.info(), {**self.info(), "instance_id": "session-2"}]
+        ) as http:
+            self.assertFalse(request_stop(1234, ("-AICoreRoot", "C:/test-project"), lambda: True))
+            self.assertEqual(http.call_count, 2)
+
+    def test_original_process_exit_cancels_stop_before_mutation(self) -> None:
+        from aicore_control import request_stop
+        with patch("aicore_control.owned_ports", return_value=(9050,)), patch(
+            "aicore_control._http", side_effect=[self.info(), self.info()]
+        ) as http:
+            self.assertFalse(request_stop(1234, ("-AICoreRoot", "C:/test-project"), iter((True, False)).__next__))
+            self.assertEqual(http.call_count, 2)
+
+
+@unittest.skipUnless(sys.platform == "win32", "Windows exclusive dev account locks")
+class GlobalDevAccountTests(unittest.TestCase):
+    def test_external_lock_and_account_limit_match_start_game(self) -> None:
+        import ctypes
+        from ctypes import wintypes
+        from aicore_control import available_dev_account
+        with tempfile.TemporaryDirectory() as directory:
+            project = Path(directory) / "project"
+            (project / ".project").mkdir(parents=True)
+            (project / ".project/account.json").write_text(json.dumps({"accounts": [{}, {}, {}]}), encoding="utf-8")
+            lock_directory = Path(directory) / "miniw_devaccount"
+            lock_directory.mkdir()
+            kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+            kernel.CreateFileW.argtypes = (wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD,
+                ctypes.c_void_p, wintypes.DWORD, wintypes.DWORD, wintypes.HANDLE)
+            kernel.CreateFileW.restype = wintypes.HANDLE
+            kernel.CloseHandle.argtypes = (wintypes.HANDLE,)
+            handle = kernel.CreateFileW(str(lock_directory / "dev2.lock"), 0xC0000000, 0, None, 4, 0x80, None)
+            self.assertNotEqual(handle, ctypes.c_void_p(-1).value)
+            try:
+                with patch("aicore_control.tempfile.gettempdir", return_value=directory):
+                    args = ("-AICoreRoot", str(project))
+                    self.assertEqual(available_dev_account(2, set(), args, DEFAULT_EXECUTABLE), 3)
+                    with self.assertRaisesRegex(ValueError, "没有空闲开发账号"):
+                        available_dev_account(2, {3}, args, DEFAULT_EXECUTABLE)
+            finally:
+                kernel.CloseHandle(handle)
 
 
 if __name__ == "__main__":

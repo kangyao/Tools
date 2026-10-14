@@ -11,10 +11,15 @@ import re
 import socket
 import subprocess
 import threading
+import time
 from typing import Callable, Mapping, Protocol, Sequence
 import xml.etree.ElementTree as ET
 
 
+from aicore_control import available_dev_account, owned_ports, request_stop
+
+
+DEFAULT_PROJECT_ROOT = r"C:\MiniGame\Source\AIGamePlay"
 DEFAULT_EXECUTABLE = r"C:\MiniGame\Bin64\AICore_profile.exe"
 DEFAULT_ARGUMENTS = ("-script-debug-wait-client",)
 CONFIG_VERSION = 2
@@ -29,11 +34,11 @@ DEFAULT_NETWORK_HOST = "127.0.0.1"
 DEFAULT_NETWORK_PORT = 7000
 DEFAULT_NETWORK_ROOM_ID = 1
 DEV_ACCOUNT_ARGUMENT = "-MGFDevAccount"
-# 开发账号序号（AIGamePlay/.dev/account.json 的数组位置，1 起）：Host 默认 1，Client 默认 2。
+# 开发账号序号（AIGamePlay/.project/account.json 的数组位置，1 起）：Host 默认 1，Client 默认 2。
 # AICore 按账号加锁，同一台机器上每个进程必须用不同的账号。
 DEFAULT_DEV_ACCOUNTS = {"host": 1, "client": 2}
 NETWORK_ARGUMENTS = (
-    DEV_ACCOUNT_ARGUMENT, "-MGFNetRole", "-MGFNetHost", "-MGFNetPort", "-MGFNetRoomId",
+    DEV_ACCOUNT_ARGUMENT, "-MGFNetRole", "-MGFNetHost", "-MGFNetPort", "-MGFNetRoomId", "-MGFNetServer",
 )
 # 已移除的旧参数：客机身份改取登录账号，AICore 收到会判 NetLaunchInvalid: uin；读取旧参数时丢弃。
 LEGACY_NETWORK_ARGUMENTS = ("-MGFNetUin",)
@@ -128,10 +133,23 @@ class NetworkOptions:
     room_id: int = DEFAULT_NETWORK_ROOM_ID
     # None 表示取角色默认值（Host 1、Client 2、单机不传）。
     dev_account: int | None = None
+    server_mode: str = "Host"
 
     def __post_init__(self) -> None:
-        if self.dev_account is None:
+        if self.server_mode not in ("Host", "CloudServer"):
+            raise ConfigurationError("服务端模式必须是 CloudServer 或 Host。")
+        if self.is_dedicated:
+            object.__setattr__(self, "dev_account", 0)
+        elif self.dev_account is None:
             object.__setattr__(self, "dev_account", default_dev_account(self.role))
+
+    @property
+    def is_dedicated(self) -> bool:
+        return self.role is NetworkRole.HOST and self.server_mode == "CloudServer"
+
+    @property
+    def native_role(self) -> str:
+        return "CloudServer" if self.is_dedicated else self.role.value.title()
 
     def arguments(self) -> tuple[str, ...]:
         """Match AIGamePlay Tools/Start-NetDebug.ps1 argument order (dev account first)."""
@@ -140,12 +158,14 @@ class NetworkOptions:
         arguments: list[str] = []
         if self.dev_account:
             arguments.extend((DEV_ACCOUNT_ARGUMENT, str(self.dev_account)))
-        arguments.extend(("-MGFNetRole", self.role.value.title()))
+        arguments.extend(("-MGFNetRole", self.native_role))
         if self.role is NetworkRole.CLIENT:
             arguments.extend(("-MGFNetHost", self.host))
         arguments.extend((
             "-MGFNetPort", str(self.port), "-MGFNetRoomId", str(self.room_id),
         ))
+        if self.role is NetworkRole.CLIENT and self.server_mode == "CloudServer":
+            arguments.extend(("-MGFNetServer", "CloudServer"))
         return tuple(arguments)
 
 
@@ -170,9 +190,11 @@ def parse_network_arguments(arguments: Sequence[str]) -> NetworkOptions:
         index += 1
 
     try:
-        role = NetworkRole(values.get("-MGFNetRole", "standalone").casefold())
+        native_role = values.get("-MGFNetRole", "standalone").casefold()
+        role = NetworkRole.HOST if native_role == "cloudserver" else NetworkRole(native_role)
+        server_mode = "CloudServer" if native_role == "cloudserver" else values.get("-MGFNetServer", "Host")
     except ValueError as exc:
-        raise ConfigurationError("-MGFNetRole 必须是 Host、Client 或 Standalone。") from exc
+        raise ConfigurationError("-MGFNetRole 必须是 CloudServer、Host、Client 或 Standalone。") from exc
     host = values.get("-MGFNetHost", DEFAULT_NETWORK_HOST).strip()
     if not host:
         raise ConfigurationError("-MGFNetHost 必须是非空地址。")
@@ -194,7 +216,7 @@ def parse_network_arguments(arguments: Sequence[str]) -> NetworkOptions:
         dev_account = positive_integer(DEV_ACCOUNT_ARGUMENT, 1)
     else:
         dev_account = default_dev_account(role)
-    return NetworkOptions(role, host, port, room_id, dev_account)
+    return NetworkOptions(role, host, port, room_id, dev_account, server_mode)
 
 
 def apply_network_preset(
@@ -721,11 +743,13 @@ class WindowsJobProcess:
     WAIT_TIMEOUT = 0x00000102
     STILL_ACTIVE = 259
 
-    def __init__(self, process_handle: int, job_handle: int, pid: int) -> None:
+    def __init__(self, process_handle: int, job_handle: int, pid: int, executable: str = "", arguments: Sequence[str] = ()) -> None:
         self._kernel32 = _load_kernel32()
         self._process_handle = process_handle
         self._job_handle = job_handle
         self._pid = pid
+        self._executable = executable
+        self._arguments = tuple(arguments)
         self._exit_code: int | None = None
         self._lock = threading.RLock()
 
@@ -773,14 +797,20 @@ class WindowsJobProcess:
 
             startup = _STARTUPINFOW()
             startup.cb = ctypes.sizeof(startup)
+            dedicated_aicore = (executable_path.stem.casefold() in ("aicore", "aicore_profile", "aicore_d")
+                                and parse_network_arguments(arguments).is_dedicated)
+            if dedicated_aicore and not show_console:
+                startup.dwFlags |= 1  # STARTF_USESHOWWINDOW, as Start-Process -WindowStyle Hidden
+                startup.wShowWindow = 0
             command_line = subprocess.list2cmdline(
                 [str(executable_path), *list(arguments)]
             )
             command_buffer = ctypes.create_unicode_buffer(command_line)
             creation_flags = cls.CREATE_SUSPENDED | cls.CREATE_NEW_PROCESS_GROUP
-            creation_flags |= (
-                cls.CREATE_NEW_CONSOLE if show_console else cls.CREATE_NO_WINDOW
-            )
+            # AICore DS allocates and initializes its own log console / Ctrl+C handler.
+            # Precreating a console makes its AllocConsole fail and skips that setup.
+            if not (dedicated_aicore and show_console):
+                creation_flags |= cls.CREATE_NEW_CONSOLE if show_console else cls.CREATE_NO_WINDOW
             environment_pointer = None
             environment_buffer = None
             if environment_overrides:
@@ -829,6 +859,7 @@ class WindowsJobProcess:
                 process_handle=process_info.hProcess,
                 job_handle=job_handle,
                 pid=int(process_info.dwProcessId),
+                executable=str(executable_path), arguments=arguments,
             )
         except Exception as original_error:
             cleanup_errors: list[str] = []
@@ -879,6 +910,11 @@ class WindowsJobProcess:
         with self._lock:
             if not self._job_handle or self.poll() is not None:
                 return
+            if (Path(self._executable).stem.casefold() in ("aicore", "aicore_profile", "aicore_d")
+                    and request_stop(self.pid, self._arguments, lambda: self.poll() is None,
+                                     working_directory=str(Path(self._executable).parent))
+                    and self.wait(15000)):
+                return
             if not self._kernel32.TerminateJobObject(self._job_handle, exit_code):
                 raise _windows_error("关闭 App 进程树失败")
 
@@ -895,6 +931,18 @@ class WindowsJobProcess:
             if wait_result == self.WAIT_TIMEOUT:
                 return False
             raise _windows_error("等待 App 退出失败")
+
+    def wait_network_ready(self, port: int, cancel: threading.Event, timeout: float = 30) -> None:
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if self.poll() is not None:
+                raise LauncherError(f"服务端（PID {self.pid}）已退出，查看实例日志。")
+            if cancel.is_set():
+                raise LauncherError("已取消后续 Client 启动。")
+            if port in owned_ports(self.pid, udp=True):
+                return
+            cancel.wait(0.2)
+        raise LauncherError(f"服务端（PID {self.pid}）未在 {timeout:g} 秒内监听 UDP {port}。")
 
     def close(self) -> None:
         with self._lock:
@@ -1022,6 +1070,7 @@ class _ManagedInstance:
     arguments: tuple[str, ...]
     process: ManagedProcess
     label: str = ""
+    had_clients: bool = False
 
 
 MAX_CLIENT_COUNT = 16
@@ -1046,6 +1095,7 @@ class LauncherController:
         port_allocator: DebugPortAllocator | None = None,
     ) -> None:
         self._process_factory = process_factory or WindowsJobProcess.launch
+        self._native_process_factory = process_factory is None
         self._port_allocator = port_allocator or DebugPortAllocator()
         self._instances: dict[int, _ManagedInstance] = {}
         self._debug_slots: list[DebugPortBundle] = []
@@ -1135,6 +1185,10 @@ class LauncherController:
                 label,
             )
             self._instances[instance_id] = instance
+            if settings.network.role is NetworkRole.CLIENT:
+                for server in self._instances.values():
+                    if self._client_matches_server(instance, server):
+                        server.had_clients = True
             return self._snapshot(instance)
 
     def ensure_host(
@@ -1181,8 +1235,14 @@ class LauncherController:
                     if instance.settings.network.dev_account
                 }
                 dev_account = network.dev_account or default_dev_account(NetworkRole.CLIENT)
-                while dev_account in used:
-                    dev_account += 1
+                if self._native_process_factory and Path(settings.executable).stem.casefold() in ("aicore", "aicore_profile", "aicore_d"):
+                    try:
+                        dev_account = available_dev_account(dev_account, used, settings.enabled_arguments, settings.executable)
+                    except (OSError, ValueError) as exc:
+                        raise LauncherError(str(exc)) from None
+                else:
+                    while dev_account in used:
+                        dev_account += 1
                 if dev_account != network.dev_account:
                     arguments = replace(network, dev_account=dev_account).arguments() + apply_network_preset(
                         settings.enabled_arguments, NetworkRole.STANDALONE,
@@ -1242,6 +1302,11 @@ class LauncherController:
             if cancel.wait(0 if reused else delay_seconds):
                 raise LauncherError("已取消后续 Client 启动。")
             self.snapshot(snapshot.instance_id)  # Host may have exited during the delay.
+            with self._lock:
+                server_process = self._instances[snapshot.instance_id].process
+            wait_ready = getattr(server_process, "wait_network_ready", None)
+            if wait_ready is not None:
+                wait_ready(host.network.port, cancel)
             launched = self.start_clients(
                 client, client_count, auto_dev_account=auto_dev_account,
                 label=client_label, cancel=cancel,
@@ -1339,6 +1404,21 @@ class LauncherController:
             self._port_allocator.release(debug_ports)
         self._debug_slots.clear()
         self._idle_debug_slots.clear()
+
+    @staticmethod
+    def _client_matches_server(client: _ManagedInstance, server: _ManagedInstance) -> bool:
+        source, target = client.settings.network, server.settings.network
+        return (target.is_dedicated and source.role is NetworkRole.CLIENT
+                and source.server_mode == "CloudServer" and source.host.casefold() in ("127.0.0.1", "localhost", "::1")
+                and source.port == target.port and source.room_id == target.room_id)
+
+    def empty_dedicated_host_ids(self) -> tuple[int, ...]:
+        """The UI closes these in a worker, after the last matching client exits."""
+        with self._lock:
+            self._reap_finished_processes()
+            return tuple(server.instance_id for server in self._instances.values()
+                         if server.settings.network.is_dedicated and server.had_clients
+                         and not any(self._client_matches_server(client, server) for client in self._instances.values()))
 
     def _validate_network_identity(self, settings: LauncherSettings) -> None:
         network = settings.network
