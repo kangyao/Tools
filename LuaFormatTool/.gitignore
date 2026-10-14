@@ -1,0 +1,4 @@
+__pycache__/
+bin/
+settings.local.json
+*.luaformat.bak
