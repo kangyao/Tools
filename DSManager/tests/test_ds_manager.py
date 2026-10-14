@@ -5,6 +5,7 @@ from pathlib import Path
 import subprocess
 import sys
 import threading
+import time
 import unittest
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from unittest.mock import patch
@@ -32,6 +33,7 @@ class State:
         self.matches = []
         self.player_world = 1
         self.return_pending = False
+        self.players = None
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -60,7 +62,7 @@ class Handler(BaseHTTPRequestHandler):
                 state.world_reads += 1
                 worlds = [{**state.world, "state": "Loading" if state.world_reads < 2 else "Running"}]
             return self.respond({"role": state.role, "state": "Running", "accepting_players": True,
-                                 "players": [{"player_id": 42, "world_id": state.player_world}], "worlds": worlds,
+                                 "players": state.players if state.players is not None else [{"player_id": 42, "world_id": state.player_world}], "worlds": worlds,
                                  "maps": [{"map_id": "Test Map"}], "matchmaking": {"available": state.matching_enabled,
                                     "queued_players": state.queued, "matches": state.matches, "lobby_world_id": 1}})
         if route.startswith("commands?id="):
@@ -83,9 +85,9 @@ class Handler(BaseHTTPRequestHandler):
             state.result = {"state": "kicked", "player_id": body["args"]["player_id"]}
         elif operation.startswith("ds.match."):
             if operation == "ds.match.join":
-                state.queued = [body["args"]["player_id"]]
+                state.queued.append(body["args"]["player_id"])
             elif operation == "ds.match.cancel":
-                state.queued = []
+                state.queued.remove(body["args"]["player_id"])
             elif not state.return_pending:
                 state.player_world = 1
             state.result = {"player_id": body["args"]["player_id"], "lobby_world_id": 1,
@@ -263,6 +265,127 @@ class ProtocolTests(unittest.TestCase):
         self.state.queued = {}
         self.assertEqual(self.client.execute("matches"), [])
         self.assertEqual(self.client.execute("queue"), [])
+
+    def test_batch_stops_on_unknown_result_without_posting_remaining_players(self):
+        self.state.players = [{"player_id": p, "world_id": 1} for p in (42, 43, 44)]
+        self.state.pending = True
+        self.client.timeout = 0.1
+        result = ds.match_batch(self.client, "match", [42, 43, 44])
+        self.assertEqual(result[0]["state"], "unknown")
+        self.assertEqual([p["args"]["player_id"] for p in self.state.posts], [42])
+
+    def test_batch_rechecks_players_and_only_returns_each_match_once(self):
+        self.state.players = [{"player_id": p, "world_id": 9} for p in (42, 43, 44, 45)]
+        self.state.matches = [{"id": 7, "state": "Playing", "players": [42, 43, 44, 45]}]
+        # The return operation waits for one member, even if the other members' snapshot lags.
+        self.state.players[0]["world_id"] = 1
+        ds.match_batch(self.client, "return", [42, 43, 44, 45])
+        self.assertEqual(len(self.state.posts), 1)
+        ds.match_batch(self.client, "match", [43, 999])
+        self.assertEqual(len(self.state.posts), 1, "non-lobby and disconnected players must not be posted")
+
+
+class WindowTests(unittest.TestCase):
+    """Exercise Tk selection and async state transitions against a private HTTP service."""
+    @classmethod
+    def setUpClass(cls):
+        cls.server = start_server()
+        cls.thread = threading.Thread(target=cls.server.serve_forever, daemon=True)
+        cls.thread.start()
+
+    def setUp(self):
+        ProtocolTests.setUp(self)
+        import tkinter as tk
+        self.root = tk.Tk()
+        self.root.withdraw()
+        self.root.report_callback_exception = self.callback_error
+        self.errors = []
+        self.window = ds.ManagerWindow(self.root)
+        self.window.auto_refresh.set(False)
+        self.scan_patch = patch.object(ds, "scan_instances", return_value=[self.instance])
+        self.scan_patch.start()
+        self.state.players = [{"player_id": p, "world_id": 1} for p in (42, 43, 44, 45)]
+        self.wait_for(lambda: self.window.view and not self.window.busy)
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.server.shutdown()
+        cls.server.server_close()
+        cls.thread.join()
+
+    def callback_error(self, kind, error, trace):
+        self.errors.append(error)
+
+    def wait_for(self, check, timeout=5):
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            self.root.update()
+            if self.errors:
+                raise self.errors[0]
+            if check():
+                return
+            time.sleep(0.01)
+        self.fail("GUI state timed out: " + self.window.feedback.get())
+
+    def tearDown(self):
+        self.wait_for(lambda: not self.window.busy)
+        self.window.close()
+        self.scan_patch.stop()
+
+    def test_dashboard_autoconnect_multiselect_and_selection_survives_refresh(self):
+        window = self.window
+        self.assertEqual(window.selected, self.instance)
+        self.assertEqual(window.tabs.select(), str(window.dashboard))
+        table = window.tables["players"]
+        table.selection_set(("42", "43"))
+        self.root.update()
+        self.assertFalse(window.match_buttons["match"].instate(["disabled"]))
+        window.match_selected("match")
+        self.wait_for(lambda: not window.busy)
+        self.assertEqual(self.state.queued, [42, 43])
+        self.assertEqual(set(table.selection()), {"42", "43"})
+        self.assertEqual(table.item("42", "values")[1], "排队中")
+        self.assertEqual(window.tabs.select(), str(window.dashboard))
+        window.match_selected("cancel")
+        self.wait_for(lambda: not window.busy)
+        self.assertEqual(self.state.queued, [])
+
+    def test_quick_match_only_fills_missing_players_and_error_disables_actions(self):
+        window = self.window
+        self.state.queued = [42]
+        window.refresh()
+        self.wait_for(lambda: not window.busy)
+        self.assertIn("补 3 人", window.quick_button["text"])
+        window.quick_match()
+        self.wait_for(lambda: not window.busy)
+        self.assertEqual([p["args"]["player_id"] for p in self.state.posts], [43, 44, 45])
+        self.assertTrue(window.quick_button.instate(["disabled"]))
+        with patch.object(ds.Client, "read", side_effect=ds.ManagerError("offline")):
+            window.refresh()
+            self.wait_for(lambda: not window.busy)
+        self.assertTrue(window.refresh_error)
+        self.assertTrue(window.match_buttons["cancel"].instate(["disabled"]))
+        window.refresh()
+        self.wait_for(lambda: not window.busy)
+        self.assertFalse(window.refresh_error)
+        self.assertIn("恢复", window.feedback.get())
+
+    def test_return_button_confirms_group_size_and_never_returns_same_match_twice(self):
+        window = self.window
+        self.state.matches = [{"id": 7, "state": "Playing", "worldId": 9, "players": [42, 43, 44, 45]}]
+        # Target member is already back while the match list still contains the whole group.
+        window.refresh()
+        self.wait_for(lambda: not window.busy)
+        window.tables["matches"].selection_set("7")
+        self.root.update()
+        with patch("tkinter.messagebox.askokcancel", return_value=False):
+            window.end_button.invoke()
+        self.assertEqual(self.state.posts, [])
+        with patch("tkinter.messagebox.askokcancel", return_value=True) as confirm:
+            window.end_button.invoke()
+            self.assertIn("4 名成员", confirm.call_args.args[1])
+        self.wait_for(lambda: not window.busy)
+        self.assertEqual([p["operation"] for p in self.state.posts], ["ds.match.return"])
 
 
 if __name__ == "__main__":

@@ -419,6 +419,68 @@ class Client:
         raise ManagerError("命令或参数不正确，输入 help 查看用法")
 
 
+MATCH_SIZE = 4
+
+
+def lobby_view(admin):
+    """Project one authoritative snapshot into UI state; never infer ready from World alone."""
+    matching = admin.get("matchmaking", {})
+    matches = matching.get("matches", [])
+    queued = set(matching.get("queued_players", []))
+    memberships = {pid: match for match in matches for pid in match.get("players", [])}
+    travel = {item.get("player_id"): item for item in admin.get("travel", {}).get("clients", [])}
+    players = []
+    for player in admin.get("players", []):
+        pid = player["player_id"]
+        match = memberships.get(pid)
+        moving = bool(player.get("travel_state")) or travel.get(pid, {}).get("state") in ("Preparing", "Committing")
+        failed = travel.get(pid, {}).get("state") == "Failed"
+        in_lobby = matching.get("lobby_world_id") is not None and player.get("world_id") == matching["lobby_world_id"]
+        can_join = bool(matching.get("available") and admin.get("accepting_players") and in_lobby
+                        and not moving and not failed and pid not in queued and match is None)
+        if failed:
+            state = "切换失败"
+        elif moving:
+            state = "切换中"
+        elif pid in queued:
+            state = "排队中"
+        elif match:
+            state = {"Playing": "比赛中", "Returning": "返回中"}.get(match.get("state"), "准备比赛")
+        else:
+            state = "大厅空闲" if in_lobby else "其他 World"
+        players.append({**player, "status": state, "match_id": match.get("id", "") if match else "",
+                        "can_join": can_join, "can_cancel": pid in queued,
+                        "can_return": bool(match and match.get("state") not in ("Returning", "Closing") and not moving)})
+    return {"players": players, "matches": matches, "queued": queued, "available": bool(matching.get("available")),
+            "needed": max(0, MATCH_SIZE - len(queued))}
+
+
+def match_batch(client, verb, player_ids):
+    """Execute a captured selection sequentially; stop on ambiguous results, never retry writes."""
+    completed = []
+    handled_matches = set()
+    for pid in dict.fromkeys(player_ids):
+        try:
+            view = lobby_view(client.dedicated())
+            player = next((p for p in view["players"] if p["player_id"] == pid), None)
+            if verb == "return" and player and player["match_id"] in handled_matches:
+                continue
+            if not player or not player.get({"match": "can_join", "cancel": "can_cancel", "return": "can_return"}[verb]):
+                completed.append({"player_id": pid, "state": "skipped", "reason": "玩家状态已变化"})
+                continue
+            result = client.execute(f"{verb} {pid}")
+            completed.append({"player_id": pid, "state": "completed", "result": result})
+            client.log(f"玩家 {pid}：{verb} 已完成")
+            if verb == "return":
+                handled_matches.add(player["match_id"])
+        except IdentityError:
+            raise
+        except ManagerError as exc:
+            completed.append({"player_id": pid, "state": "unknown" if isinstance(exc, PendingError) else "failed", "reason": str(exc)})
+            break
+    return completed
+
+
 class ManagerWindow:
     def __init__(self, root):
         import tkinter as tk
@@ -432,9 +494,13 @@ class ManagerWindow:
         self.history = []
         self.history_index = 0
         self.closed = False
+        self.timers = set()
+        self.admin = None
+        self.view = None
+        self.refresh_error = False
         root.title("DS 管理工具")
-        root.geometry("1120x780")
-        root.minsize(840, 600)
+        root.geometry("1180x860")
+        root.minsize(940, 720)
         style = ttk.Style(root)
         if "vista" in style.theme_names():
             style.theme_use("vista")
@@ -447,13 +513,14 @@ class ManagerWindow:
         ttk.Label(top, text="指定端口：").pack(side="left")
         self.port = tk.StringVar()
         ttk.Entry(top, textvariable=self.port, width=8).pack(side="left")
-        ttk.Button(top, text="查找", command=self.scan).pack(side="left", padx=5)
+        self.find_button = ttk.Button(top, text="查找", command=self.scan)
+        self.find_button.pack(side="left", padx=5)
         self.status = tk.StringVar(value="准备扫描…")
         ttk.Label(top, textvariable=self.status).pack(side="right")
         frame = ttk.Frame(root, padding=(12, 0, 12, 8))
         frame.pack(fill="x")
         columns = ("pid", "http", "game", "role", "project")
-        self.tree = ttk.Treeview(frame, columns=columns, show="headings", height=5, selectmode="browse")
+        self.tree = ttk.Treeview(frame, columns=columns, show="headings", height=3, selectmode="browse")
         for name, title, width in zip(columns, ("PID", "管理 HTTP", "游戏 UDP", "角色", "工程"), (90, 95, 95, 110, 560)):
             self.tree.heading(name, text=title)
             self.tree.column(name, width=width, minwidth=60, stretch=name == "project")
@@ -463,45 +530,66 @@ class ManagerWindow:
         ttk.Label(root, textvariable=self.target, padding=(12, 4)).pack(fill="x")
         buttons = ttk.Frame(root, padding=(12, 4))
         buttons.pack(fill="x")
-        self.command_buttons = []
-        for text, command in (("刷新状态", "status"), ("查看玩家", "players"), ("查看 World", "worlds"),
-                              ("查看比赛", "matches"), ("匹配队列", "queue"), ("地图模板", "maps"), ("帮助", "help")):
+        self.command_buttons = [self.find_button]
+        ttk.Button(buttons, text="刷新大厅", command=self.refresh).pack(side="left", padx=(0, 6))
+        self.auto_refresh = tk.BooleanVar(value=True)
+        ttk.Checkbutton(buttons, text="每 3 秒自动刷新", variable=self.auto_refresh).pack(side="left", padx=(0, 18))
+        for text, command in (("World 管理", "worlds"), ("地图模板", "maps"), ("帮助", "help")):
             button = ttk.Button(buttons, text=text, command=lambda c=command: self.run(c))
             button.pack(side="left", padx=(0, 6))
             self.command_buttons.append(button)
         self.tabs = ttk.Notebook(root)
         self.tabs.pack(fill="both", expand=True, padx=12, pady=8)
-        console_frame = ttk.Frame(self.tabs)
-        self.tabs.add(console_frame, text="命令与结果")
-        self.output = ScrolledText(console_frame, wrap="word", font=("Consolas", 11), state="disabled", padx=10, pady=8)
-        self.output.pack(fill="both", expand=True)
+        self.dashboard = ttk.Frame(self.tabs, padding=10)
+        self.tabs.add(self.dashboard, text="大厅与匹配")
+        self.summary = tk.StringVar(value="选择 DS 后自动显示大厅玩家与比赛")
+        ttk.Label(self.dashboard, textvariable=self.summary, font=("Microsoft YaHei UI", 12, "bold")).pack(fill="x", pady=(0, 5))
+        self.hint = tk.StringVar(value="只有 1 台 DS 时自动连接；有多台时点击上面的服务。")
+        ttk.Label(self.dashboard, textvariable=self.hint).pack(fill="x", pady=(0, 8))
+        actions = ttk.Frame(self.dashboard)
+        actions.pack(fill="x", pady=(0, 8))
+        self.quick_button = ttk.Button(actions, text="一键凑齐一局", command=self.quick_match)
+        self.quick_button.pack(side="left", padx=(0, 12))
+        self.match_buttons = {}
+        for title, verb in (("加入匹配", "match"), ("取消排队", "cancel"), ("返回大厅（整场）", "return")):
+            button = ttk.Button(actions, text=title, command=lambda v=verb: self.match_selected(v))
+            button.pack(side="left", padx=(0, 6))
+            self.match_buttons[verb] = button
+        self.selection_hint = tk.StringVar(value="支持 Ctrl / Shift 多选")
+        ttk.Label(actions, textvariable=self.selection_hint).pack(side="right")
+        self.feedback = tk.StringVar(value="操作结果会显示在这里；详细记录在“命令与日志”。")
+        ttk.Label(self.dashboard, textvariable=self.feedback, wraplength=1000).pack(fill="x", pady=(0, 6))
         self.tables = {}
+        self.pages = {}
+        self.make_table(self.dashboard, "players", ("player_id", "status", "world_id", "match_id"),
+                        ("玩家 ID", "当前状态", "World", "比赛 ID"), height=8, multiple=True)
+        self.tables["players"].bind("<<TreeviewSelect>>", lambda event: self.update_actions())
+        lower = ttk.Frame(self.dashboard)
+        lower.pack(fill="x", pady=5)
+        ttk.Label(lower, text="当前比赛 · 四人自动分两队，创建副本后切换客户端").pack(side="left")
+        self.kick_button = ttk.Button(lower, text="踢出单个玩家…", command=self.kick_selected)
+        self.kick_button.pack(side="right", padx=(6, 0))
+        self.end_button = ttk.Button(lower, text="结束选中比赛并返回大厅", command=self.return_match)
+        self.end_button.pack(side="right")
+        self.make_table(self.dashboard, "matches", ("id", "state", "worldId", "mapId", "players"),
+                        ("比赛 ID", "状态", "World", "地图", "玩家名单"), height=3)
+        self.tables["matches"].bind("<<TreeviewSelect>>", lambda event: self.update_actions())
+        console_frame = ttk.Frame(self.tabs)
+        self.output = ScrolledText(console_frame, wrap="word", font=("Consolas", 11), state="disabled", padx=10, pady=8)
         for key, title, cols in (
-                ("players", "玩家", ("player_id", "world_id", "connection_id", "travel_state")),
                 ("worlds", "World", ("world_id", "generation", "map_id", "state", "player_count", "actor_count", "tick_count")),
-                ("matches", "比赛", ("id", "worldId", "mapId", "state", "players", "teams")),
-                ("queue", "匹配队列", ("player_id",)),
                 ("maps", "地图模板", ("map_id",))):
             page = ttk.Frame(self.tabs)
             self.tabs.add(page, text=title)
-            table = ttk.Treeview(page, columns=cols, show="headings", selectmode="browse")
-            for col in cols:
-                table.heading(col, text=col)
-                table.column(col, width=120, minwidth=75)
-            scrollbar = ttk.Scrollbar(page, command=table.yview)
-            table.configure(yscrollcommand=scrollbar.set)
-            scrollbar.pack(side="right", fill="y")
-            table.pack(fill="both", expand=True)
-            self.tables[key] = table
-            if key == "players":
-                actions = ttk.Frame(page)
-                actions.pack(fill="x", pady=6)
-                for text, verb in (("加入匹配", "match"), ("取消匹配", "cancel"), ("返回大厅", "return")):
-                    ttk.Button(actions, text=text, command=lambda v=verb: self.match_selected(v)).pack(side="left", padx=4)
-                ttk.Button(actions, text="踢出选中的玩家", command=self.kick_selected).pack(side="right", padx=4)
+            self.pages[key] = page
+            self.make_table(page, key, cols, cols)
             if key == "maps":
-                ttk.Button(page, text="用选中的模板创建副本", command=self.create_selected).pack(anchor="e", pady=6)
-        entry_frame = ttk.Frame(root, padding=12)
+                button = ttk.Button(page, text="用选中的模板创建副本", command=self.create_selected)
+                button.pack(anchor="e", pady=6)
+                self.command_buttons.append(button)
+        self.console_page = console_frame
+        self.tabs.add(console_frame, text="命令与日志")
+        entry_frame = ttk.Frame(console_frame, padding=12)
         entry_frame.pack(fill="x")
         self.command = tk.StringVar()
         self.entry = ttk.Entry(entry_frame, textvariable=self.command, font=("Consolas", 12))
@@ -512,15 +600,136 @@ class ManagerWindow:
         self.execute_button = ttk.Button(entry_frame, text="执行", command=self.submit)
         self.execute_button.pack(side="left", padx=(8, 0))
         self.command_buttons.append(self.execute_button)
-        ttk.Label(root, text="示例：match 900000001  |  cancel 900000001  |  matches  |  return 900000001  |  stop", padding=(12, 0, 12, 10)).pack(fill="x")
+        ttk.Label(console_frame, text="高级命令：players  |  matches  |  kick <玩家ID>  |  stop；匹配可直接在首页操作。", padding=(12, 0, 12, 10)).pack(fill="x")
+        self.output.pack(fill="both", expand=True)
         self.append(HELP)
         root.protocol("WM_DELETE_WINDOW", self.close)
-        root.after(80, self.drain_events)
-        root.after(150, self.scan)
+        self.schedule(80, self.drain_events)
+        self.schedule(150, self.scan)
+        self.schedule(3000, self.refresh_tick)
+        self.update_actions()
+
+    def make_table(self, parent, key, columns, titles, height=10, multiple=False):
+        frame = self.ttk.Frame(parent)
+        frame.pack(fill="both", expand=True)
+        table = self.ttk.Treeview(frame, columns=columns, show="headings", height=height,
+                                  selectmode="extended" if multiple else "browse")
+        for col, title in zip(columns, titles):
+            table.heading(col, text=title)
+            table.column(col, width=140, minwidth=80, stretch=True)
+        scrollbar = self.ttk.Scrollbar(frame, command=table.yview)
+        table.configure(yscrollcommand=scrollbar.set)
+        scrollbar.pack(side="right", fill="y")
+        table.pack(fill="both", expand=True)
+        table.tag_configure("排队中", foreground="#986200")
+        table.tag_configure("比赛中", foreground="#176844")
+        table.tag_configure("切换中", foreground="#2867ad")
+        table.tag_configure("切换失败", foreground="#a42a2a")
+        self.tables[key] = table
+
+    def fill_table(self, key, rows, id_key):
+        table = self.tables[key]
+        selected = table.selection()
+        focused = table.focus()
+        scroll = table.yview()[0]
+        table.delete(*table.get_children())
+        for row in rows:
+            values = [row.get(col, "") for col in table["columns"]]
+            values = [json.dumps(value, ensure_ascii=False) if isinstance(value, (list, dict)) else value for value in values]
+            table.insert("", "end", iid=str(row[id_key]), values=values, tags=(row.get("status", ""),))
+        kept = [iid for iid in selected if table.exists(iid)]
+        if kept:
+            table.selection_set(kept)
+        if table.exists(focused):
+            table.focus(focused)
+        table.yview_moveto(scroll)
+
+    def apply_admin(self, admin):
+        if self.refresh_error:
+            self.feedback.set("连接已恢复，操作已重新启用。")
+        elif self.feedback.get().startswith("正在加载大厅"):
+            self.feedback.set("已连接。选择玩家加入匹配，或点击“一键凑齐一局”。")
+        elif self.feedback.get().endswith("正在更新大厅状态。"):
+            self.feedback.set(self.feedback.get().replace("正在更新大厅状态。", "已更新大厅状态。"))
+        self.admin, self.view = admin, lobby_view(admin)
+        self.refresh_error = False
+        self.fill_table("players", self.view["players"], "player_id")
+        self.fill_table("matches", self.view["matches"], "id")
+        for key, id_key in (("worlds", "world_id"), ("maps", "map_id")):
+            self.fill_table(key, admin.get(key, []), id_key)
+        idle = sum(p["can_join"] for p in self.view["players"])
+        queued = len(self.view["queued"])
+        self.summary.set(f"在线 {len(self.view['players'])} 人   ·   大厅空闲 {idle} 人   ·   排队 {queued} 人   ·   比赛 {len(self.view['matches'])} 场")
+        if admin.get("role") != "Dedicated":
+            self.hint.set("当前是客户端实例，请在上方选择 Dedicated DS 进行匹配管理。")
+        elif not self.view["available"]:
+            self.hint.set("此 DS 未启用大厅匹配；请启动带匹配支持的默认大厅。")
+        elif not admin.get("accepting_players"):
+            self.hint.set("DS 正在停止接收玩家；加入匹配暂不可用。")
+        else:
+            needed = self.view["needed"]
+            self.hint.set("排队人数已足够，等待服务器分配比赛；无需再加入玩家。" if needed == 0 else
+                          f"四人自动开局：{'已有 ' + str(queued) + ' 人排队，' if queued else ''}还需 {needed} 人。"
+                          + ("点击“一键凑齐一局”，或多选玩家加入匹配。" if idle >= needed else f"请再连接 {needed - idle} 个大厅客户端。"))
+        failure = admin.get("matchmaking", {}).get("last_failure") or admin.get("travel", {}).get("last_error")
+        if failure:
+            self.hint.set(self.hint.get() + f"  服务器最近失败：{failure}")
+        self.update_actions()
+
+    def update_actions(self):
+        available = bool(self.view and not self.busy and not self.refresh_error and self.selected
+                         and self.selected.role == "Dedicated")
+        selected = set(self.tables["players"].selection())
+        players = [p for p in self.view["players"] if str(p["player_id"]) in selected] if self.view else []
+        self.selection_hint.set(f"已选 {len(players)} 人 · Ctrl / Shift 多选")
+        for verb, flag in (("match", "can_join"), ("cancel", "can_cancel"), ("return", "can_return")):
+            enabled = available and any(p[flag] for p in players)
+            self.match_buttons[verb].configure(state="normal" if enabled else "disabled")
+        idle = sum(p["can_join"] for p in self.view["players"]) if self.view else 0
+        needed = self.view["needed"] if self.view else MATCH_SIZE
+        self.quick_button.configure(text=f"一键凑齐一局（补 {needed} 人）",
+                                    state="normal" if available and needed > 0 and idle >= needed else "disabled")
+        selected_matches = set(self.tables["matches"].selection())
+        enabled = available and any(p["can_return"] and str(p["match_id"]) in selected_matches for p in self.view["players"])
+        self.end_button.configure(state="normal" if enabled else "disabled")
+        self.kick_button.configure(state="normal" if available and len(players) == 1 else "disabled")
+
+    def refresh_tick(self):
+        if self.closed:
+            return
+        if self.auto_refresh.get() and self.selected and not self.busy:
+            self.refresh(automatic=True)
+        self.schedule(3000, self.refresh_tick)
+
+    def refresh(self, automatic=False):
+        if self.busy or self.selected is None:
+            return
+        client = Client(self.selected)
+        def done(admin):
+            self.apply_admin(admin)
+            self.status.set("更新于 " + time.strftime("%H:%M:%S"))
+        def failed(error):
+            self.refresh_error = True
+            self.feedback.set(f"连接失败，操作已禁用：{error}。可点击“刷新大厅”或重新扫描。")
+            if not automatic:
+                self.append(f"刷新失败：{error}")
+            self.update_actions()
+        self.launch(lambda: client.read("admin"), done, failed)
 
     def close(self):
         self.closed = True
+        for timer in self.timers:
+            self.root.after_cancel(timer)
+        self.timers.clear()
         self.root.destroy()
+
+    def schedule(self, milliseconds, callback):
+        def invoke():
+            self.timers.discard(timer)
+            if not self.closed:
+                callback()
+        timer = self.root.after(milliseconds, invoke)
+        self.timers.add(timer)
 
     def append(self, message):
         self.output.configure(state="normal")
@@ -530,7 +739,7 @@ class ManagerWindow:
         self.output.see("end")
         self.output.configure(state="disabled")
 
-    def launch(self, function, done):
+    def launch(self, function, done, failed=None):
         if self.busy:
             return
         self.busy = True
@@ -538,11 +747,12 @@ class ManagerWindow:
         self.scan_button.configure(state="disabled")
         for button in self.command_buttons:
             button.configure(state="disabled")
+        self.update_actions()
         def worker():
             try:
                 self.events.put(("done", done, function()))
             except Exception as exc:
-                self.events.put(("error", None, exc))
+                self.events.put(("error", failed, exc))
         threading.Thread(target=worker, daemon=True).start()
 
     def drain_events(self):
@@ -564,13 +774,18 @@ class ManagerWindow:
             if kind == "done":
                 done(result)
             else:
-                self.append(f"错误：{result}")
-                self.tabs.select(0)
+                self.refresh_error = True
+                if done:
+                    done(result)
+                else:
+                    self.append(f"错误：{result}")
+                    self.feedback.set(f"操作失败：{result}")
                 if isinstance(result, IdentityError):
                     self.selected = None
                     self.target.set("实例已失效，请重新扫描选择")
                     self.clear_tables()
-        self.root.after(80, self.drain_events)
+            self.update_actions()
+        self.schedule(80, self.drain_events)
 
     def scan(self):
         if self.busy:
@@ -586,14 +801,26 @@ class ManagerWindow:
                 self.clear_tables()
                 self.target.set("原实例已离线，请重新选择")
             self.render_instances()
+            visible = [i for i in items if not self.only_ds.get() or i.role == "Dedicated"]
+            if self.selected is None and len(visible) == 1:
+                self.tree.selection_set(str(self.instances.index(visible[0])))
+                self.choose()
+            elif self.selected is not None:
+                self.refresh()
             count = len([i for i in items if i.role == "Dedicated"])
-            self.status.set(f"发现 {count} 台 DS，{len(items)} 个服务")
+            if self.selected is None:
+                self.status.set(f"发现 {count} 台 DS，{len(items)} 个服务")
+                self.hint.set("未发现 DS：先启动 StartGame.bat -Clients 4，再点击“扫描本机服务”。" if not visible
+                              else "发现多个实例：点击上方需要管理的 DS。")
             self.append(f"扫描完成：{count} 台 DS / {len(items)} 个可连接 AICore 服务")
         self.launch(lambda: scan_instances(int(text) if text else None), done)
 
     def clear_tables(self):
+        self.admin = self.view = None
         for table in self.tables.values():
             table.delete(*table.get_children())
+        self.summary.set("尚未连接 DS")
+        self.update_actions()
 
     def render_instances(self):
         self.tree.delete(*self.tree.get_children())
@@ -624,7 +851,9 @@ class ManagerWindow:
         self.selected = item
         self.clear_tables()
         self.target.set(f"当前：PID {item.pid}  ·  UDP {item.game_port or '?'}  ·  HTTP {item.http_port}  ·  {item.role}  ·  {item.project}")
-        self.run("status")
+        self.feedback.set("正在加载大厅状态…")
+        self.tabs.select(self.dashboard)
+        self.refresh()
 
     def submit(self):
         line = self.command.get().strip()
@@ -645,7 +874,7 @@ class ManagerWindow:
             return
         if line.lower() == "help":
             self.append(HELP)
-            self.tabs.select(0)
+            self.tabs.select(self.console_page)
             return
         if line.lower() == "instances":
             self.scan()
@@ -664,47 +893,90 @@ class ManagerWindow:
             return
         if self.selected is None:
             self.append("请先选择一个服务")
+            self.feedback.set("请先在上方选择 DS 服务。")
             return
         target = self.selected
         self.append(f"DS[{target.pid} HTTP:{target.http_port}]> {line}")
         client = Client(target, log=lambda text: self.events.put(("log", None, text)))
         def done(result):
             self.append(result if isinstance(result, str) else json.dumps(result, ensure_ascii=False, indent=2))
+            self.feedback.set(f"命令 {line} 已完成，详细结果见“命令与日志”。")
             key = line.strip().lower()
-            if key in self.tables and isinstance(result, list):
-                table = self.tables[key]
-                table.delete(*table.get_children())
-                for row in result:
-                    values = [row.get(col, "") for col in table["columns"]]
-                    values = [json.dumps(value, ensure_ascii=False) if isinstance(value, (list, dict)) else value for value in values]
-                    table.insert("", "end", values=values)
-                self.tabs.select(list(self.tables).index(key) + 1)
-            else:
-                self.tabs.select(0)
+            if key in ("players", "matches", "queue", "worlds", "maps"):
+                self.tabs.select(self.pages.get(key, self.dashboard))
             if isinstance(result, dict) and result.get("state") == "stopped":
                 self.selected = None
                 self.clear_tables()
                 self.target.set("目标 DS 已停止，请扫描选择其他实例")
                 self.scan()
+            else:
+                self.refresh()
         self.launch(lambda: client.execute(line), done)
 
     def match_selected(self, verb):
-        if self.busy:
+        if self.busy or not self.view or self.refresh_error:
             return
-        rows = self.tables["players"].selection()
-        if not rows:
-            self.append("请先查看并选择玩家")
+        rows = set(self.tables["players"].selection())
+        flag = {"match": "can_join", "cancel": "can_cancel", "return": "can_return"}[verb]
+        players = [p["player_id"] for p in self.view["players"] if str(p["player_id"]) in rows and p[flag]]
+        if not players:
+            self.feedback.set("请先选择符合操作状态的玩家；支持 Ctrl / Shift 多选。")
             return
-        player_id = self.tables["players"].item(rows[0], "values")[0]
-        self.run(f"{verb} {player_id}")
+        self.start_batch(verb, players)
+
+    def quick_match(self):
+        if self.busy or not self.view or self.refresh_error:
+            return
+        players = [p["player_id"] for p in self.view["players"] if p["can_join"]]
+        needed = self.view["needed"]
+        if needed <= 0:
+            return
+        if len(players) < needed:
+            self.feedback.set(f"大厅人数不足，还需要连接 {needed - len(players)} 个客户端。")
+            return
+        self.start_batch("match", players[:needed])
+
+    def return_match(self):
+        if self.busy or not self.view or self.refresh_error:
+            return
+        matches = set(self.tables["matches"].selection())
+        players = [p["player_id"] for p in self.view["players"] if str(p["match_id"]) in matches and p["can_return"]]
+        if players:
+            self.start_batch("return", players)
+
+    def start_batch(self, verb, players):
+        if self.busy or not self.selected or self.selected.role != "Dedicated":
+            return
+        title = {"match": "加入匹配", "cancel": "取消排队", "return": "返回大厅"}[verb]
+        if verb == "return":
+            from tkinter import messagebox
+            matches = {p["match_id"] for p in self.view["players"] if p["player_id"] in players}
+            count = sum(len(m["players"]) for m in self.view["matches"] if m["id"] in matches)
+            if not messagebox.askokcancel("结束比赛并返回大厅", f"将结束 {len(matches)} 场比赛，{count} 名成员全部返回大厅。\n是否继续？", parent=self.root):
+                return
+            if self.busy:
+                self.feedback.set("正在刷新，请稍后再点击返回大厅。")
+                return
+        client = Client(self.selected, log=lambda text: self.events.put(("log", None, text)))
+        self.feedback.set(f"正在{title}：{len(players)} 名玩家…")
+        self.append(f"DS[{self.selected.pid}] 批量{title}：{players}")
+        def done(results):
+            self.append(json.dumps(results, ensure_ascii=False, indent=2))
+            completed = sum(r["state"] == "completed" for r in results)
+            skipped = sum(r["state"] == "skipped" for r in results)
+            error = next((r for r in results if r["state"] in ("failed", "unknown")), None)
+            self.feedback.set(f"{title}：完成 {completed} 项，跳过 {skipped} 项。"
+                              + (f"已停止后续操作：{error['reason']}" if error else "正在更新大厅状态。"))
+            self.refresh()
+        self.launch(lambda: match_batch(client, verb, players), done)
 
     def kick_selected(self):
         from tkinter import simpledialog
         if self.busy:
             return
         rows = self.tables["players"].selection()
-        if not rows:
-            self.append("请先查看并选择玩家")
+        if len(rows) != 1:
+            self.feedback.set("踢人请只选择一名玩家。")
             return
         player_id = self.tables["players"].item(rows[0], "values")[0]
         reason = simpledialog.askstring("踢出玩家", f"玩家 {player_id} 的踢出原因：", initialvalue="DS Manager", parent=self.root)
