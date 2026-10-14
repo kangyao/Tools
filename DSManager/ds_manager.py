@@ -22,6 +22,9 @@ from urllib.request import HTTPRedirectHandler, ProxyHandler, Request, build_ope
 HELP = """instances                     扫描本机服务
 use pid <PID> / use port <端口>  选择实例（游戏 UDP 或管理 HTTP 端口）
 status / players / worlds / maps 查看状态、玩家、World、地图模板
+match <玩家ID> / cancel <玩家ID> 加入匹配 / 取消排队（四人自动开局）
+matches / queue                查看比赛 / 排队玩家
+return <玩家ID>                返回大厅；当前规则会结束该玩家所在比赛
 info / caps / performance / memory 查看宿主信息与诊断
 create <模板ID>                创建临时副本；模板含空格时用双引号
 kick <玩家ID> [原因]           踢人，本局不能重入
@@ -254,6 +257,25 @@ class Client:
         result = http_json(self.instance.base_url, "/api/aicore/v1/" + route)
         if not isinstance(result, dict):
             raise ServiceError("管理接口返回的数据结构不受支持")
+        if route == "admin":
+            # Legacy serializers can emit {} for empty arrays, or [] for empty objects.
+            for key in ("matchmaking", "travel"):
+                value = result.get(key, {})
+                if value == [] or value is None:
+                    value = {}
+                if not isinstance(value, dict):
+                    raise ServiceError(f"管理快照中的 {key} 不是对象")
+                result[key] = value
+            for container, keys in ((result, ("players", "worlds", "maps")),
+                                    (result.get("matchmaking", {}), ("matches", "queued_players")),
+                                    (result.get("travel", {}), ("clients", "pawns"))):
+                for key in keys:
+                    value = container.get(key, [])
+                    if value == {} or value is None:
+                        value = []
+                    if not isinstance(value, list):
+                        raise ServiceError(f"管理快照中的 {key} 不是数组")
+                    container[key] = value
         self.validate()
         return result
 
@@ -331,6 +353,35 @@ class Client:
             return HELP
         if verb in ("info", "caps", "performance", "memory") and len(parts) == 1:
             return self.read(verb)
+        if verb in ("matches", "queue") and len(parts) == 1:
+            matching = self.dedicated().get("matchmaking", {})
+            if not matching.get("available"):
+                raise ManagerError("当前 DS 未启用大厅匹配，请使用带匹配支持的宿主和框架")
+            if verb == "matches":
+                return matching.get("matches", [])
+            return [{"player_id": player_id} for player_id in matching.get("queued_players", [])]
+        if verb in ("match", "join", "cancel", "return") and len(parts) == 2:
+            if not re.fullmatch(r"[1-9][0-9]*", parts[1]) or int(parts[1]) > 4294967295:
+                raise ManagerError("玩家 ID 必须为 1..4294967295 的整数")
+            self.dedicated()
+            operation = {"match": "join", "join": "join", "cancel": "cancel", "return": "return"}[verb]
+            result = self.write("ds.match." + operation, {"player_id": int(parts[1])})
+            if verb == "return":
+                deadline = time.monotonic() + self.timeout
+                while time.monotonic() < deadline:
+                    admin = self.dedicated()
+                    player = next((p for p in admin.get("players", []) if p.get("player_id") == int(parts[1])), None)
+                    lobby_id = result.get("lobby_world_id")
+                    travel_state = next((p for p in admin.get("travel", {}).get("clients", [])
+                                         if p.get("player_id") == int(parts[1])), None)
+                    client_ready = travel_state is None or (travel_state.get("world_id") == lobby_id and travel_state.get("state") == "Active")
+                    if player and lobby_id is not None and player.get("world_id") == lobby_id and not player.get("travel_state") and client_ready:
+                        return {**result, "state": "InLobby", "world_id": lobby_id}
+                    if player is None:
+                        raise ManagerError("返回大厅期间玩家已离线")
+                    time.sleep(0.2)
+                raise PendingError("返回大厅已受理，迁移尚未完成；输入 players / matches 查看进度，不要重复提交")
+            return result
         if verb in ("status", "players", "worlds", "maps") and len(parts) == 1:
             admin = self.read("admin")
             if verb != "status":
@@ -339,7 +390,8 @@ class Client:
                     "game_port": self.instance.game_port, "project": self.instance.project,
                     "role": admin.get("role"), "state": admin.get("state"),
                     "accepting_players": admin.get("accepting_players"),
-                    "player_count": len(admin.get("players", [])), "world_count": len(admin.get("worlds", []))}
+                    "player_count": len(admin.get("players", [])), "world_count": len(admin.get("worlds", [])),
+                    "matchmaking": admin.get("matchmaking", {}), "travel": admin.get("travel", {})}
         if verb == "request" and len(parts) == 2 and re.fullmatch(r"[1-9][0-9]*", parts[1]):
             return self.poll(parts[1])
         if verb == "create" and len(parts) == 2:
@@ -412,7 +464,8 @@ class ManagerWindow:
         buttons = ttk.Frame(root, padding=(12, 4))
         buttons.pack(fill="x")
         self.command_buttons = []
-        for text, command in (("刷新状态", "status"), ("查看玩家", "players"), ("查看 World", "worlds"), ("地图模板", "maps"), ("帮助", "help")):
+        for text, command in (("刷新状态", "status"), ("查看玩家", "players"), ("查看 World", "worlds"),
+                              ("查看比赛", "matches"), ("匹配队列", "queue"), ("地图模板", "maps"), ("帮助", "help")):
             button = ttk.Button(buttons, text=text, command=lambda c=command: self.run(c))
             button.pack(side="left", padx=(0, 6))
             self.command_buttons.append(button)
@@ -426,6 +479,8 @@ class ManagerWindow:
         for key, title, cols in (
                 ("players", "玩家", ("player_id", "world_id", "connection_id", "travel_state")),
                 ("worlds", "World", ("world_id", "generation", "map_id", "state", "player_count", "actor_count", "tick_count")),
+                ("matches", "比赛", ("id", "worldId", "mapId", "state", "players", "teams")),
+                ("queue", "匹配队列", ("player_id",)),
                 ("maps", "地图模板", ("map_id",))):
             page = ttk.Frame(self.tabs)
             self.tabs.add(page, text=title)
@@ -439,7 +494,11 @@ class ManagerWindow:
             table.pack(fill="both", expand=True)
             self.tables[key] = table
             if key == "players":
-                ttk.Button(page, text="踢出选中的玩家", command=self.kick_selected).pack(anchor="e", pady=6)
+                actions = ttk.Frame(page)
+                actions.pack(fill="x", pady=6)
+                for text, verb in (("加入匹配", "match"), ("取消匹配", "cancel"), ("返回大厅", "return")):
+                    ttk.Button(actions, text=text, command=lambda v=verb: self.match_selected(v)).pack(side="left", padx=4)
+                ttk.Button(actions, text="踢出选中的玩家", command=self.kick_selected).pack(side="right", padx=4)
             if key == "maps":
                 ttk.Button(page, text="用选中的模板创建副本", command=self.create_selected).pack(anchor="e", pady=6)
         entry_frame = ttk.Frame(root, padding=12)
@@ -453,7 +512,7 @@ class ManagerWindow:
         self.execute_button = ttk.Button(entry_frame, text="执行", command=self.submit)
         self.execute_button.pack(side="left", padx=(8, 0))
         self.command_buttons.append(self.execute_button)
-        ttk.Label(root, text="示例：players  |  create AIGamePlay.BattleA  |  kick 900000001 测试  |  stop", padding=(12, 0, 12, 10)).pack(fill="x")
+        ttk.Label(root, text="示例：match 900000001  |  cancel 900000001  |  matches  |  return 900000001  |  stop", padding=(12, 0, 12, 10)).pack(fill="x")
         self.append(HELP)
         root.protocol("WM_DELETE_WINDOW", self.close)
         root.after(80, self.drain_events)
@@ -616,7 +675,9 @@ class ManagerWindow:
                 table = self.tables[key]
                 table.delete(*table.get_children())
                 for row in result:
-                    table.insert("", "end", values=[row.get(col, "") for col in table["columns"]])
+                    values = [row.get(col, "") for col in table["columns"]]
+                    values = [json.dumps(value, ensure_ascii=False) if isinstance(value, (list, dict)) else value for value in values]
+                    table.insert("", "end", values=values)
                 self.tabs.select(list(self.tables).index(key) + 1)
             else:
                 self.tabs.select(0)
@@ -626,6 +687,16 @@ class ManagerWindow:
                 self.target.set("目标 DS 已停止，请扫描选择其他实例")
                 self.scan()
         self.launch(lambda: client.execute(line), done)
+
+    def match_selected(self, verb):
+        if self.busy:
+            return
+        rows = self.tables["players"].selection()
+        if not rows:
+            self.append("请先查看并选择玩家")
+            return
+        player_id = self.tables["players"].item(rows[0], "values")[0]
+        self.run(f"{verb} {player_id}")
 
     def kick_selected(self):
         from tkinter import simpledialog

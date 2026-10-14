@@ -27,6 +27,11 @@ class State:
         self.world_reads = 0
         self.world = None
         self.stoppable = False
+        self.matching_enabled = True
+        self.queued = []
+        self.matches = []
+        self.player_world = 1
+        self.return_pending = False
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -47,15 +52,17 @@ class Handler(BaseHTTPRequestHandler):
             return self.respond({"instance_id": state.instance_id, "pid": os.getpid(),
                                  "project_path": state.project, "net_role": state.role, "game_port": "7777"})
         if route == "caps":
-            return self.respond({"protocol": "aicore/v1", "commands": ["ds.kick", "ds.world.create", "runtime.stop"]})
+            return self.respond({"protocol": "aicore/v1", "commands": ["ds.kick", "ds.world.create", "runtime.stop",
+                                                                      "ds.match.join", "ds.match.cancel", "ds.match.return"]})
         if route == "admin":
             worlds = []
             if state.world and not state.missing_world:
                 state.world_reads += 1
                 worlds = [{**state.world, "state": "Loading" if state.world_reads < 2 else "Running"}]
             return self.respond({"role": state.role, "state": "Running", "accepting_players": True,
-                                 "players": [{"player_id": 42, "world_id": 1}], "worlds": worlds,
-                                 "maps": [{"map_id": "Test Map"}]})
+                                 "players": [{"player_id": 42, "world_id": state.player_world}], "worlds": worlds,
+                                 "maps": [{"map_id": "Test Map"}], "matchmaking": {"available": state.matching_enabled,
+                                    "queued_players": state.queued, "matches": state.matches, "lobby_world_id": 1}})
         if route.startswith("commands?id="):
             return self.respond({"state": "pending"} if state.pending else state.result, 202 if state.pending else 200)
         return self.respond("unknown_route", 404, False)
@@ -74,6 +81,15 @@ class Handler(BaseHTTPRequestHandler):
             state.result = {**state.world, "state": "Loading"}
         elif operation == "ds.kick":
             state.result = {"state": "kicked", "player_id": body["args"]["player_id"]}
+        elif operation.startswith("ds.match."):
+            if operation == "ds.match.join":
+                state.queued = [body["args"]["player_id"]]
+            elif operation == "ds.match.cancel":
+                state.queued = []
+            elif not state.return_pending:
+                state.player_world = 1
+            state.result = {"player_id": body["args"]["player_id"], "lobby_world_id": 1,
+                            "state": "Returning" if operation == "ds.match.return" else "completed"}
         elif operation == "runtime.stop" and state.stoppable:
             self.respond({"state": "accepted"}, 202)
             threading.Timer(0.3, lambda: os._exit(0)).start()
@@ -211,6 +227,42 @@ class ProtocolTests(unittest.TestCase):
                 child.terminate()
                 child.wait(timeout=3)
             child.stdout.close()
+
+    def test_join_cancel_and_matches(self):
+        self.client.execute("match 42")
+        self.assertEqual(self.client.execute("queue"), [{"player_id": 42}])
+        self.client.execute("cancel 42")
+        self.assertEqual(self.client.execute("queue"), [])
+        self.state.matches = [{"id": 9, "worldId": 3, "state": "Playing", "players": [42, 43, 44, 45]}]
+        self.assertEqual(self.client.execute("matches")[0]["worldId"], 3)
+        self.assertEqual([p["operation"] for p in self.state.posts], ["ds.match.join", "ds.match.cancel"])
+
+    def test_return_checks_membership(self):
+        self.state.player_world = 9
+        self.assertEqual(self.client.execute("return 42")["state"], "InLobby")
+        self.state.player_world = 9
+        self.state.return_pending = True
+        self.client.timeout = 0.1
+        with self.assertRaises(ds.PendingError):
+            self.client.execute("return 42")
+        self.assertEqual(len(self.state.posts), 2, "timeout must not submit a second return command")
+
+    def test_match_commands_reject_wrong_role_and_invalid_ids(self):
+        self.state.role = "Client"
+        for command in ("match 42", "cancel 42", "return 42", "match 0", "match 4294967296"):
+            with self.subTest(command=command), self.assertRaises(ds.ManagerError):
+                self.client.execute(command)
+        self.assertEqual(self.state.posts, [])
+        self.state.role = "Dedicated"
+        self.state.matching_enabled = False
+        with self.assertRaisesRegex(ds.ManagerError, "未启用"):
+            self.client.execute("matches")
+
+    def test_lua_empty_arrays_clear_match_and_queue_lists(self):
+        self.state.matches = {}
+        self.state.queued = {}
+        self.assertEqual(self.client.execute("matches"), [])
+        self.assertEqual(self.client.execute("queue"), [])
 
 
 if __name__ == "__main__":
