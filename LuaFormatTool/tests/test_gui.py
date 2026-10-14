@@ -42,7 +42,7 @@ class GuiTests(unittest.TestCase):
     def tearDown(self):
         self.window.cancel.set()
         self.wait_idle()
-        self.root.destroy()
+        self.window.close()
         self.save.stop()
         self.dialog.stop()
         self.temp.cleanup()
@@ -81,7 +81,11 @@ class GuiTests(unittest.TestCase):
         source.write_bytes(b"local x=1\n")
         self.window.scan()
         self.wait_idle()
-        self.window.variables["indent_width"].set("2")
+        self.window.open_config_panel()
+        self.window.config_variables["indent_width"].set("2")
+        self.assertEqual(self.window.get_settings().indent_width, 4)
+        self.window.apply_config_panel()
+        self.assertIsNone(self.window.config_panel)
         with patch("gui.messagebox.showinfo") as show:
             self.window.format_files(True)
         self.assertIn("重新扫描", show.call_args.args[1])
@@ -90,13 +94,20 @@ class GuiTests(unittest.TestCase):
     def test_import_and_export_rules(self):
         source = self.directory / "custom.toml"
         source.write_text('indent_type = "Tabs"\nquote_style = "ForceSingle"', encoding="utf-8")
+        self.window.open_config_panel()
+        panel = self.window.config_panel
+        self.window.open_config_panel()
+        self.assertIs(self.window.config_panel, panel)
         with patch("gui.filedialog.askopenfilename", return_value=str(source)):
             self.window.import_rules()
-        self.assertEqual(self.window.get_settings().indent_type, "Tabs")
+        self.assertEqual(self.window.get_settings().indent_type, "Spaces")
+        self.assertEqual(self.window.get_settings(self.window.config_variables).indent_type, "Tabs")
         output = self.directory / "exported.toml"
         with patch("gui.filedialog.asksaveasfilename", return_value=str(output)):
             self.window.export_rules()
         self.assertIn('quote_style = "ForceSingle"', output.read_text(encoding="utf-8"))
+        self.window.close_config_panel()
+        self.assertEqual(self.window.get_settings().indent_type, "Spaces")
 
     def test_write_failure_visible_and_original_protected(self):
         source = self.directory / "test.lua"

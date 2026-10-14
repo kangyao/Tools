@@ -44,10 +44,16 @@ class LuaFormatWindow:
         self.only_problems = tk.BooleanVar(value=True)
         self.status = tk.StringVar(value="选择 Lua 目录或文件，然后点击“开始扫描”。扫描不会修改文件。")
         self.variables = {name: tk.StringVar(value=str(value)) for name, value in asdict(FormatSettings()).items()}
+        self.config_panel: tk.Toplevel | None = None
+        self.config_variables: dict[str, tk.StringVar] = {}
+        self.config_options: dict[str, tk.Variable] = {}
+        self.config_notice = tk.StringVar()
+        self.rule_summary = tk.StringVar()
         self.load_local()
+        self.update_rule_summary()
         self.build_ui()
         self.root.protocol("WM_DELETE_WINDOW", self.close)
-        self.root.after(80, self.poll)
+        self.poll_timer = self.root.after(80, self.poll)
 
     def button(self, parent, text, command, **kwargs):
         widget = ttk.Button(parent, text=text, command=command, **kwargs)
@@ -71,29 +77,11 @@ class LuaFormatWindow:
         ttk.Label(top, text="用逗号分隔，如 vendor, **/*.d.lua").grid(row=2, column=2, columnspan=2, sticky="w")
         top.columnconfigure(1, weight=1)
 
-        rules = ttk.LabelFrame(self.root, text="格式规则（修改后重新扫描；可导入/导出 StyLua TOML）", padding=8)
-        rules.pack(fill="x", padx=10)
-        for index, (name, variable) in enumerate(self.variables.items()):
-            row, column = divmod(index, 5)
-            frame = ttk.Frame(rules)
-            frame.grid(row=row, column=column, sticky="ew", padx=5, pady=4)
-            ttk.Label(frame, text=FIELD_LABELS[name]).pack(anchor="w")
-            if name in CHOICES:
-                ttk.Combobox(frame, textvariable=variable, values=CHOICES[name], state="readonly", width=23).pack(fill="x")
-            else:
-                ttk.Entry(frame, textvariable=variable, width=12).pack(fill="x")
-            rules.columnconfigure(column, weight=1)
-        options = ttk.Frame(rules)
-        options.grid(row=2, column=0, columnspan=5, sticky="ew", pady=5)
-        ttk.Label(options, text="源文件编码").pack(side="left")
-        ttk.Combobox(options, textvariable=self.encoding, values=("auto", "utf-8", "gb18030", "gbk"), state="readonly", width=10).pack(side="left", padx=6)
-        ttk.Checkbutton(options, text="包括 .luau", variable=self.include_luau).pack(side="left", padx=8)
-        ttk.Checkbutton(options, text="格式化时备份", variable=self.backup).pack(side="left", padx=8)
-        self.button(options, "导入规则", self.import_rules).pack(side="right", padx=4)
-        self.button(options, "导出规则", self.export_rules).pack(side="right", padx=4)
+        ttk.Label(self.root, textvariable=self.rule_summary, padding=(15, 4), wraplength=1200).pack(fill="x")
 
         actions = ttk.Frame(self.root, padding=10)
         actions.pack(fill="x")
+        self.button(actions, "格式配置", self.open_config_panel).pack(side="left", padx=3)
         self.button(actions, "开始扫描", self.scan).pack(side="left", padx=3)
         self.stop_button = ttk.Button(actions, text="停止", command=self.cancel.set, state="disabled")
         self.stop_button.pack(side="left", padx=3)
@@ -139,14 +127,112 @@ class LuaFormatWindow:
         self.progress.pack(fill="x", padx=10, pady=(8, 0))
         ttk.Label(self.root, textvariable=self.status, padding=10, wraplength=1200).pack(fill="x")
 
-    def get_settings(self) -> FormatSettings:
-        data = {name: variable.get() for name, variable in self.variables.items()}
+    def get_settings(self, variables: dict[str, tk.StringVar] | None = None) -> FormatSettings:
+        data = {name: variable.get() for name, variable in (self.variables if variables is None else variables).items()}
         for name in ("indent_width", "column_width"):
             try:
                 data[name] = int(data[name])
             except ValueError as exc:
                 raise FormatError(f"{FIELD_LABELS[name]}必须是整数") from exc
         return FormatSettings.from_mapping(data)
+
+    def update_rule_summary(self) -> None:
+        settings = self.get_settings()
+        indent = f"{settings.indent_width} 个空格" if settings.indent_type == "Spaces" else f"Tab（宽度 {settings.indent_width}）"
+        newline = "LF" if settings.line_endings == "Unix" else "CRLF"
+        self.rule_summary.set(f"当前格式：{settings.syntax} · {indent} · 行宽 {settings.column_width} · {newline} · {settings.quote_style}")
+
+    def open_config_panel(self) -> None:
+        if self.busy:
+            return
+        if self.config_panel is not None:
+            self.config_panel.lift()
+            self.config_panel.focus_set()
+            return
+        panel = tk.Toplevel(self.root)
+        self.config_panel = panel
+        panel.title("格式配置")
+        panel.transient(self.root)
+        panel.resizable(False, False)
+        self.config_variables = {name: tk.StringVar(master=panel, value=variable.get())
+                                 for name, variable in self.variables.items()}
+        self.config_options = {
+            "encoding": tk.StringVar(master=panel, value=self.encoding.get()),
+            "include_luau": tk.BooleanVar(master=panel, value=self.include_luau.get()),
+            "backup": tk.BooleanVar(master=panel, value=self.backup.get()),
+        }
+        self.config_notice.set("点击应用保存配置；修改格式规则后需要重新扫描。")
+        body = ttk.Frame(panel, padding=15)
+        body.pack(fill="both", expand=True)
+        rules = ttk.LabelFrame(body, text="格式规则", padding=10)
+        rules.pack(fill="x")
+        for index, (name, variable) in enumerate(self.config_variables.items()):
+            row, column = divmod(index, 2)
+            frame = ttk.Frame(rules)
+            frame.grid(row=row, column=column, sticky="ew", padx=8, pady=6)
+            ttk.Label(frame, text=FIELD_LABELS[name]).pack(anchor="w")
+            if name in CHOICES:
+                ttk.Combobox(frame, textvariable=variable, values=CHOICES[name], state="readonly", width=30).pack(fill="x")
+            else:
+                ttk.Entry(frame, textvariable=variable, width=30).pack(fill="x")
+        options = ttk.LabelFrame(body, text="文件处理", padding=10)
+        options.pack(fill="x", pady=(10, 0))
+        ttk.Label(options, text="源文件编码").pack(side="left")
+        ttk.Combobox(options, textvariable=self.config_options["encoding"],
+                     values=("auto", "utf-8", "gb18030", "gbk"), state="readonly", width=10).pack(side="left", padx=6)
+        ttk.Checkbutton(options, text="包括 .luau", variable=self.config_options["include_luau"]).pack(side="left", padx=8)
+        ttk.Checkbutton(options, text="格式化时备份", variable=self.config_options["backup"]).pack(side="left", padx=8)
+        ttk.Label(body, textvariable=self.config_notice, wraplength=580).pack(fill="x", pady=10)
+        actions = ttk.Frame(body)
+        actions.pack(fill="x")
+        ttk.Button(actions, text="导入规则", command=self.import_rules).pack(side="left", padx=3)
+        ttk.Button(actions, text="导出规则", command=self.export_rules).pack(side="left", padx=3)
+        ttk.Button(actions, text="取消", command=self.close_config_panel).pack(side="right", padx=3)
+        ttk.Button(actions, text="应用", command=self.apply_config_panel).pack(side="right", padx=3)
+        panel.protocol("WM_DELETE_WINDOW", self.close_config_panel)
+        panel.bind("<Escape>", lambda event: self.close_config_panel())
+        panel.update_idletasks()
+        self.root.update_idletasks()
+        width, height = panel.winfo_reqwidth(), panel.winfo_reqheight()
+        x = max(0, self.root.winfo_rootx() + (self.root.winfo_width() - width) // 2)
+        y = max(0, self.root.winfo_rooty() + (self.root.winfo_height() - height) // 2)
+        panel.geometry(f"+{x}+{y}")
+        panel.grab_set()
+        panel.focus_set()
+
+    def apply_config_panel(self) -> None:
+        if self.config_panel is None or self.busy:
+            return
+        previous: dict[str, object] = {}
+        try:
+            settings = self.get_settings(self.config_variables)
+            changed = settings != self.get_settings() or any(
+                name != "backup" and variable.get() != getattr(self, name).get()
+                for name, variable in self.config_options.items()
+            )
+            previous = {name: variable.get() for name, variable in self.variables.items()}
+            previous.update({name: getattr(self, name).get() for name in self.config_options})
+            for name, value in asdict(settings).items():
+                self.variables[name].set(str(value))
+            for name, variable in self.config_options.items():
+                getattr(self, name).set(variable.get())
+            self.save_local()
+        except (OSError, ValueError, FormatError) as exc:
+            for name, value in previous.items():
+                (self.variables[name] if name in self.variables else getattr(self, name)).set(value)
+            messagebox.showerror("应用配置失败", str(exc), parent=self.config_panel)
+            return
+        self.update_rule_summary()
+        self.close_config_panel()
+        self.status.set("格式配置已应用，请重新扫描。" if changed else "格式配置已保存。")
+
+    def close_config_panel(self) -> None:
+        if self.config_panel is not None:
+            self.config_panel.grab_release()
+            self.config_panel.destroy()
+            self.config_panel = None
+            self.config_variables = {}
+            self.config_options = {}
 
     def signature(self) -> tuple:
         if not self.path.get().strip():
@@ -291,7 +377,7 @@ class LuaFormatWindow:
                     self.status.set(f"{'已停止；' if self.cancel.is_set() else ''}已检查 {total} 个文件；格式正确 {counts['ok']}；格式问题 {counts['changed']}；检查失败 {counts['error']}；写入失败 {errors}")
                 elif self.scan_signature:
                     self.status.set("扫描完成，没有找到符合条件的 Lua 文件。")
-        self.root.after(80, self.poll)
+        self.poll_timer = self.root.after(80, self.poll)
 
     def render_row(self, key: str) -> None:
         result = self.results[key]
@@ -361,30 +447,41 @@ class LuaFormatWindow:
         self.set_text("格式化预览", result.preview)
 
     def import_rules(self) -> None:
-        filename = filedialog.askopenfilename(filetypes=[("StyLua 配置", "*.toml"), ("所有文件", "*.*")])
+        filename = filedialog.askopenfilename(parent=self.config_panel or self.root,
+                                             filetypes=[("StyLua 配置", "*.toml"), ("所有文件", "*.*")])
         if not filename:
             return
         try:
             settings = FormatSettings.load(Path(filename))
+            variables = self.config_variables if self.config_panel is not None else self.variables
             for name, value in asdict(settings).items():
-                self.variables[name].set(str(value))
-            self.save_local()
-            self.status.set("已导入规则，请重新扫描。")
+                variables[name].set(str(value))
+            if self.config_panel is not None:
+                self.config_notice.set("已导入规则，点击应用保存配置。")
+            else:
+                self.save_local()
+                self.update_rule_summary()
+                self.status.set("已导入规则，请重新扫描。")
         except (OSError, FormatError) as exc:
-            messagebox.showerror("导入失败", str(exc))
+            messagebox.showerror("导入失败", str(exc), parent=self.config_panel or self.root)
 
     def export_rules(self) -> None:
         try:
-            content = self.get_settings().to_toml()
-            filename = filedialog.asksaveasfilename(initialfile="stylua.toml", defaultextension=".toml", filetypes=[("StyLua 配置", "*.toml")])
+            variables = self.config_variables if self.config_panel is not None else self.variables
+            content = self.get_settings(variables).to_toml()
+            filename = filedialog.asksaveasfilename(parent=self.config_panel or self.root,
+                                                  initialfile="stylua.toml", defaultextension=".toml", filetypes=[("StyLua 配置", "*.toml")])
             if filename:
                 if Path(filename).resolve() in {result.path for result in self.results.values()}:
                     raise FormatError("配置文件不能覆盖扫描中的 Lua 源文件")
                 Path(filename).write_text(content, encoding="utf-8", newline="\n")
-                self.save_local()
-                self.status.set(f"已导出规则：{filename}")
+                if self.config_panel is not None:
+                    self.config_notice.set(f"已导出规则：{filename}")
+                else:
+                    self.save_local()
+                    self.status.set(f"已导出规则：{filename}")
         except (OSError, FormatError) as exc:
-            messagebox.showerror("导出失败", str(exc))
+            messagebox.showerror("导出失败", str(exc), parent=self.config_panel or self.root)
 
     def export_report(self) -> None:
         if not self.results:
@@ -435,6 +532,8 @@ class LuaFormatWindow:
             self.save_local()
         except (OSError, ValueError, FormatError):
             pass
+        self.close_config_panel()
+        self.root.after_cancel(self.poll_timer)
         self.root.destroy()
 
 
