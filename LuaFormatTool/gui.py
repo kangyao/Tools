@@ -12,6 +12,7 @@ from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 from tkinter.scrolledtext import ScrolledText
 
+from diff_view import SideBySideDiff
 from formatter import (APP_DIR, CHOICES, DEFAULT_EXCLUDES, STATUS_LABELS, FileResult,
                        FormatError, FormatSettings, Formatter, apply_result, resolve_stylua)
 
@@ -117,8 +118,28 @@ class LuaFormatWindow:
         notebook.pack(fill="both", expand=True)
         self.details = {}
         for name in ("问题原因", "修改差异", "原始内容", "格式化预览"):
-            widget = ScrolledText(notebook, wrap="none", font=("Consolas", 10), state="disabled")
-            notebook.add(widget, text=name)
+            page = ttk.Frame(notebook)
+            notebook.add(page, text=name)
+            if name == "修改差异":
+                mode = tk.StringVar(value="split")
+                toolbar = ttk.Frame(page)
+                toolbar.pack(fill="x")
+                content = ttk.Frame(page)
+                content.pack(fill="both", expand=True)
+                self.split_diff = SideBySideDiff(content)
+                widget = ScrolledText(content, wrap="none", font=("Consolas", 10), state="disabled")
+                def switch_diff():
+                    widget = self.details["修改差异"]
+                    widget.pack_forget()
+                    self.split_diff.pack_forget()
+                    (self.split_diff if mode.get() == "split" else widget).pack(fill="both", expand=True)
+                for label, value in (("左右对比", "split"), ("单栏差异", "unified")):
+                    ttk.Radiobutton(toolbar, text=label, variable=mode, value=value,
+                                    command=switch_diff).pack(side="left", padx=5, pady=4)
+                self.split_diff.pack(fill="both", expand=True)
+            else:
+                widget = ScrolledText(page, wrap="none", font=("Consolas", 10), state="disabled")
+                widget.pack(fill="both", expand=True)
             self.details[name] = widget
         self.details["修改差异"].tag_configure("removed", foreground="#b02020")
         self.details["修改差异"].tag_configure("added", foreground="#247140")
@@ -422,6 +443,7 @@ class LuaFormatWindow:
 
     def clear_detail(self) -> None:
         self.file_label.configure(text="点击左侧文件查看原因与修改预览")
+        self.split_diff.show()
         for name in self.details:
             self.set_text(name, "")
 
@@ -443,6 +465,7 @@ class LuaFormatWindow:
             lines.append("文件符合当前格式规则。")
         self.set_text("问题原因", "\n".join(lines))
         self.set_text("修改差异", result.diff())
+        self.split_diff.show(result.source, result.preview, result.error if result.status == "error" else "")
         self.set_text("原始内容", result.source)
         self.set_text("格式化预览", result.preview)
 
