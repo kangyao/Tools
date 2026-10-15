@@ -4,7 +4,7 @@
 
 ## 使用
 
-双击 [`run_launcher.bat`](run_launcher.bat)，或在本目录运行：
+双击 [`DebugLauncher.bat`](DebugLauncher.bat)，或在本目录运行：
 
 ```powershell
 python .\launcher.py
@@ -73,7 +73,7 @@ AICore 按开发账号加锁，同一台机器上每个进程必须用不同账�
 
 ## PyCharm / WebStorm 常驻调试
 
-常驻调试服务已经集成到 App 调试启动器。双击 `run_launcher.bat` 打开 GUI 后，启动器会自动在后台启动常驻桥和 Node DAP，不需要再单独运行 `persistent_debug_server.py`。
+常驻调试服务已经集成到 App 调试启动器。双击 `DebugLauncher.bat` 打开 GUI 后，启动器会自动在后台启动常驻桥和 Node DAP，不需要再单独运行 `persistent_debug_server.py`。
 
 默认 `127.0.0.1:4711` Attach 服务会在 App 尚未启动时先进入监听；可以先从 IDE Attach，再在 GUI 中启动实例。关闭或自然退出 App 只会让调试目标离线，不会关闭 Attach 服务或 IDE 会话。
 
@@ -100,7 +100,7 @@ PyCharm / WebStorm --DAP 4711--> LuauDebugAdapter --3383--> 常驻桥 --3382--> 
 首次使用时按以下顺序操作：
 
 1. 停止 PyCharm / WebStorm 之前启动的旧 Debug Adapter，确保 DAP 端口 `4711` 空闲。
-2. 双击 `run_launcher.bat`，等待界面显示“常驻调试：运行中”。
+2. 双击 `DebugLauncher.bat`，等待界面显示“常驻调试：运行中”。
 3. 在 PyCharm / WebStorm 中 Debug `Lua`；该配置使用 Attach 模式连接 `127.0.0.1:4711`，并将运行时 Lua 服务映射到 `Scripts` 目录。
 4. 用本 GUI 任意启动、关闭或重新启动 App。IDE 调试会话无需停止。
 
@@ -123,7 +123,7 @@ GUI 运行日志出现 `AIFramework offline; waiting for restart` 表示正在�
    关闭首个游戏窗口时 DS 保留；最后一个退出后 DS 自动关闭；直接关闭 GUI 也正常收尾。
    隐藏 DS 与显示控制台两种模式均验证；所有测试 App 退出码为 0，独立 DS 保持运行；证据在 AIGamePlay 的 `.local/debug-launcher-ds-evidence.json`。
 3. `blocked`：既有 IDE 配置测试缺少 `D:\git\skills\.run\Lua.run.xml`，与本次改动无关。
-4. 当前桌面旧启动器来自 W 盘，D / W 是独立副本；使用本次修改需关闭旧窗口，重新双击 D 盘 `run_launcher.bat`。
+4. 当前桌面旧启动器来自 W 盘，D / W 是独立副本；使用本次修改需关闭旧窗口，重新双击 D 盘 `DebugLauncher.bat`。
 
 ## 测试
 

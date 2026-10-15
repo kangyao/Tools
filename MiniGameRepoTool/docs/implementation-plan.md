@@ -40,7 +40,7 @@ Interfaces: MainWindow(data_dir) 持有 ProfileStore；JobThread 将 RepoService
 
 ## Task 3: 运行入口、交付与复核
 
-Files: pyproject.toml、run.py、Start.bat、Install.bat、README.md、docs/usage.md。
+Files: pyproject.toml、run.py、MiniGameRepoTool.bat、Install.bat、README.md、docs/usage.md。
 
 - [x] 提供虚拟环境安装与双击启动入口，以及独立配置目录参数。
 - [x] 更新设计差异和使用说明；执行真实界面启动、截图和完整测试。

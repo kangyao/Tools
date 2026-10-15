@@ -6,7 +6,7 @@ Python 桌面工具，选择目录后递归扫描 Lua 文件，查看格式问�
 
 需要 **Python 3.12+（包含 Tkinter）**，无需安装 Python 第三方依赖。
 
-双击 [Start.bat](Start.bat)，或者运行：
+双击 [LuaFormatTool.bat](LuaFormatTool.bat)，或者运行：
 
 ```powershell
 python D:\git\skills\Tools\LuaFormatTool\lua_format_tool.py

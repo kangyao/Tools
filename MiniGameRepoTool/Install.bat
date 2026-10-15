@@ -18,7 +18,7 @@ if errorlevel 1 goto failed
 :install
 ".venv\Scripts\python.exe" -m pip install -e "."
 if errorlevel 1 goto failed
-echo Installation completed. Run Start.bat to open the application.
+echo Installation completed. Run MiniGameRepoTool.bat to open the application.
 exit /b 0
 
 :missing_python

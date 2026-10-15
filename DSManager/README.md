@@ -1,6 +1,6 @@
 # DS 管理工具
 
-双击 `Start.bat` 打开桌面窗口。需要 Windows、Python 3.10 或更高版本以及 Tkinter；使用 Python 标准库，无须 pip 安装。工具直接连接 AICore 的现有 HTTP 管理接口，不需要在 MiniGame 工程中运行。
+双击 `DSManager.bat` 打开桌面窗口。需要 Windows、Python 3.10 或更高版本以及 Tkinter；使用 Python 标准库，无须 pip 安装。工具直接连接 AICore 的现有 HTTP 管理接口，不需要在 MiniGame 工程中运行。
 
 启动后自动扫描本机监听端口，验证 `/api/aicore/v1/info` 与 `caps`，显示实际可连接的 AICore 服务。默认仅显示 Dedicated Server，取消“仅显示 DS”可以查看客户端。扫描不限定工程，因此可以同时管理不同工程的 DS。不会扫描其他机器。
 
@@ -11,7 +11,7 @@
 最少操作进入一局：
 
 1. 启动 DS 和四个客户端：PowerShell 执行 `& "C:\MiniGame\Source\AIGamePlay\StartGame.bat" -Clients 4`。
-2. 双击本目录 `Start.bat`，等待出现四名“大厅空闲”玩家。
+2. 双击本目录 `DSManager.bat`，等待出现四名“大厅空闲”玩家。
 3. 点击“一键凑齐一局”：按列表顺序选择足够的空闲玩家补到四人；已有一人排队时只加入另外三人。四人齐备后服务器自动创建副本并切换真实客户端。
 4. 查看玩家状态从“排队中 / 切换中”变成“比赛中”，下方比赛显示 `Playing`。
 

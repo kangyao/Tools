@@ -2,7 +2,7 @@
 
 ## 第一次启动
 
-双击工程内的 Start.bat。内置方案为“MiniGame 开发”，根目录为 E:\MiniGame，包含 MiniGame、AssetRuntime、CommonResource、Source、SandboxEngine、AIGamePlay、RainbowEngine、Editor 共 8 个仓库。
+双击工程内的 MiniGameRepoTool.bat。内置方案为“MiniGame 开发”，根目录为 E:\MiniGame，包含 MiniGame、AssetRuntime、CommonResource、Source、SandboxEngine、AIGamePlay、RainbowEngine、Editor 共 8 个仓库。
 
 主窗口顶部显示当前方案、根目录和分支组。中部左侧是仓库树，右侧显示当前选中仓库的完整目录、远端、分支、检测时间和处理原因。底部可以切换执行计划与运行日志。
 

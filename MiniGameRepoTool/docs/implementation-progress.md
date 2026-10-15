@@ -29,7 +29,7 @@
 - pip check：No broken requirements found。
 - compileall：成功。
 - run.py --smoke-test：实际 Qt 窗口打开并退出，截图成功。
-- Start.bat --smoke-test：验证双击启动同一路径，窗口截图成功。
+- MiniGameRepoTool.bat --smoke-test：验证双击启动同一路径，窗口截图成功。
 
 ## 验证边界
 
