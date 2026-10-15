@@ -120,9 +120,11 @@ class SideBySideDiff(ttk.Frame):
         target.yview_scroll(units * 3, "units")
         return "break"
 
-    def show(self, source: str | None = None, preview: str = "", error: str = "") -> None:
+    def show(self, source: str | None = None, preview: str = "", error: str = "",
+             *, rows: list[DiffRow] | None = None) -> None:
         # 解析失败没有有效预览，不应把整个源文件标成删除。
-        rows = aligned_rows(source or "", (source or "") if error else preview)
+        if rows is None:
+            rows = aligned_rows(source or "", (source or "") if error else preview)
         self.change_lines = [index for index, row in enumerate(rows, 1)
                              if row.changed and (index == 1 or not rows[index - 2].changed)]
         self.current_change = -1

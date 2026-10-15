@@ -1,4 +1,4 @@
-"""Tkinter 界面，所有文件扫描和格式化均在后台线程执行。"""
+"""Tkinter 界面：后台列出文件，点击时检查，未修改的文件复用预览。"""
 
 from __future__ import annotations
 
@@ -7,14 +7,14 @@ import os
 import queue
 import threading
 import tkinter as tk
-from dataclasses import asdict
+from dataclasses import asdict, dataclass
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 from tkinter.scrolledtext import ScrolledText
 
-from diff_view import SideBySideDiff
+from diff_view import DiffRow, SideBySideDiff, aligned_rows
 from formatter import (APP_DIR, CHOICES, DEFAULT_EXCLUDES, OPTION_LABELS, STATUS_LABELS, FileResult,
-                       FormatError, FormatSettings, Formatter, apply_result, resolve_stylua)
+                       FormatError, FormatSettings, Formatter, apply_result, iter_lua_files)
 
 
 FIELD_LABELS = {
@@ -26,6 +26,28 @@ FIELD_LABELS = {
 }
 
 
+def file_stamp(path: Path) -> tuple | None:
+    try:
+        info = path.stat(follow_symlinks=False)
+        return (info.st_mtime_ns, info.st_ctime_ns, info.st_size, info.st_ino, info.st_mode)
+    except OSError:
+        return None
+
+
+@dataclass
+class FilePreview:
+    result: FileResult
+    signature: tuple
+    stamp: tuple | None
+    diff: str
+    rows: list[DiffRow]
+
+    @classmethod
+    def build(cls, result: FileResult, signature: tuple, stamp: tuple | None) -> FilePreview:
+        return cls(result, signature, stamp, result.error if result.status == "error" else result.diff(),
+                   aligned_rows(result.source, result.source if result.status == "error" else result.preview))
+
+
 class LuaFormatWindow:
     def __init__(self, root: tk.Tk):
         self.root = root
@@ -35,16 +57,23 @@ class LuaFormatWindow:
         self.events: queue.Queue = queue.Queue()
         self.cancel = threading.Event()
         self.busy = False
-        self.results: dict[str, FileResult] = {}
-        self.scan_signature: tuple | None = None
+        self.files: dict[str, Path] = {}
+        self.previews: dict[str, FilePreview] = {}
+        self.list_signature: tuple | None = None
+        self.preview_signature: tuple | None = None
+        self.load_timer: str | None = None
+        self.reload_pending = False
+        self.preview_pending: str | None = None
+        self.displayed_preview: FilePreview | None = None
+        self.worker_summary = False
         self.path = tk.StringVar()
         self.stylua = tk.StringVar()
         self.encoding = tk.StringVar(value="auto")
         self.excludes = tk.StringVar(value=", ".join(DEFAULT_EXCLUDES))
         self.include_luau = tk.BooleanVar(value=False)
         self.backup = tk.BooleanVar(value=True)
-        self.only_problems = tk.BooleanVar(value=True)
-        self.status = tk.StringVar(value="选择 Lua 目录或文件，然后点击“开始扫描”。扫描不会修改文件。")
+        self.only_problems = tk.BooleanVar(value=False)
+        self.status = tk.StringVar(value="选择 Lua 目录或文件，点击左侧文件查看修改差异；未修改的文件复用检查结果。")
         self.variables = {name: tk.StringVar(value=str(value)) for name, value in asdict(FormatSettings()).items()}
         self.config_panel: tk.Toplevel | None = None
         self.config_variables: dict[str, tk.StringVar] = {}
@@ -56,6 +85,10 @@ class LuaFormatWindow:
         self.build_ui()
         self.root.protocol("WM_DELETE_WINDOW", self.close)
         self.poll_timer = self.root.after(80, self.poll)
+        for variable in (self.path, self.excludes, self.include_luau):
+            variable.trace_add("write", self.schedule_load)
+        if self.path.get().strip():
+            self.schedule_load()
 
     def button(self, parent, text, command, **kwargs):
         widget = ttk.Button(parent, text=text, command=command, **kwargs)
@@ -66,12 +99,17 @@ class LuaFormatWindow:
         self.action_buttons: list[ttk.Button] = []
         top = ttk.Frame(self.root, padding=10)
         top.pack(fill="x")
-        ttk.Label(top, text="扫描路径").grid(row=0, column=0, sticky="w")
-        ttk.Entry(top, textvariable=self.path).grid(row=0, column=1, sticky="ew", padx=6)
+        ttk.Label(top, text="文件路径").grid(row=0, column=0, sticky="w")
+        entry = ttk.Entry(top, textvariable=self.path)
+        entry.grid(row=0, column=1, sticky="ew", padx=6)
+        entry.bind("<Return>", lambda event: self.load_files())
         self.button(top, "选择目录", self.choose_directory).grid(row=0, column=2, padx=3)
         self.button(top, "选择文件", self.choose_file).grid(row=0, column=3, padx=3)
         ttk.Label(top, text="StyLua 路径").grid(row=1, column=0, sticky="w", pady=6)
-        ttk.Entry(top, textvariable=self.stylua).grid(row=1, column=1, sticky="ew", padx=6)
+        entry = ttk.Entry(top, textvariable=self.stylua)
+        entry.grid(row=1, column=1, sticky="ew", padx=6)
+        entry.bind("<Return>", lambda event: self.settings_changed())
+        entry.bind("<FocusOut>", lambda event: self.settings_changed())
         self.button(top, "选择 StyLua", self.choose_stylua).grid(row=1, column=2, padx=3)
         self.button(top, "安装 StyLua", self.install).grid(row=1, column=3, padx=3)
         ttk.Label(top, text="排除规则").grid(row=2, column=0, sticky="w")
@@ -84,13 +122,12 @@ class LuaFormatWindow:
         actions = ttk.Frame(self.root, padding=10)
         actions.pack(fill="x")
         self.button(actions, "格式配置", self.open_config_panel).pack(side="left", padx=3)
-        self.button(actions, "开始扫描", self.scan).pack(side="left", padx=3)
-        self.stop_button = ttk.Button(actions, text="停止", command=self.cancel.set, state="disabled")
+        self.stop_button = ttk.Button(actions, text="停止", command=self.stop_work, state="disabled")
         self.stop_button.pack(side="left", padx=3)
         self.button(actions, "格式化选中文件", lambda: self.format_files(False)).pack(side="left", padx=3)
-        self.button(actions, "格式化全部问题文件", lambda: self.format_files(True)).pack(side="left", padx=3)
-        self.button(actions, "导出扫描报告", self.export_report).pack(side="left", padx=3)
-        ttk.Checkbutton(actions, text="仅显示问题", variable=self.only_problems, command=self.render_results).pack(side="right")
+        self.button(actions, "格式化已检查问题", lambda: self.format_files(True)).pack(side="left", padx=3)
+        self.button(actions, "导出已检查报告", self.export_report).pack(side="left", padx=3)
+        ttk.Checkbutton(actions, text="隐藏已通过文件", variable=self.only_problems, command=self.render_results).pack(side="right")
 
         panes = ttk.Panedwindow(self.root, orient="horizontal")
         panes.pack(fill="both", expand=True, padx=10)
@@ -110,18 +147,22 @@ class LuaFormatWindow:
         scroll.pack(side="right", fill="y")
         self.tree.pack(fill="both", expand=True)
         self.tree.bind("<<TreeviewSelect>>", self.show_detail)
+        self.tree.bind("<ButtonRelease-1>", self.show_detail)
+        self.tree.bind("<Return>", self.show_detail)
         panes.add(left, weight=2)
 
         right = ttk.Frame(panes)
         self.file_label = ttk.Label(right, text="点击左侧文件查看原因与修改预览", wraplength=650)
         self.file_label.pack(fill="x", pady=5)
         notebook = ttk.Notebook(right)
+        self.notebook = notebook
         notebook.pack(fill="both", expand=True)
         self.details = {}
         for name in ("问题原因", "修改差异", "原始内容", "格式化预览"):
             page = ttk.Frame(notebook)
             notebook.add(page, text=name)
             if name == "修改差异":
+                self.diff_page = page
                 mode = tk.StringVar(value="split")
                 toolbar = ttk.Frame(page)
                 toolbar.pack(fill="x")
@@ -142,6 +183,7 @@ class LuaFormatWindow:
                 widget = ScrolledText(page, wrap="none", font=("Consolas", 10), state="disabled")
                 widget.pack(fill="both", expand=True)
             self.details[name] = widget
+        notebook.select(self.diff_page)
         self.details["修改差异"].tag_configure("removed", foreground="#b02020")
         self.details["修改差异"].tag_configure("added", foreground="#247140")
         panes.add(right, weight=3)
@@ -186,7 +228,7 @@ class LuaFormatWindow:
             "include_luau": tk.BooleanVar(master=panel, value=self.include_luau.get()),
             "backup": tk.BooleanVar(master=panel, value=self.backup.get()),
         }
-        self.config_notice.set("点击应用保存配置；修改格式规则后需要重新扫描。")
+        self.config_notice.set("点击应用保存配置；修改规则后，当前文件自动更新差异，其他文件在点击时检查。")
         body = ttk.Frame(panel, padding=15)
         body.pack(fill="both", expand=True)
         rules = ttk.LabelFrame(body, text="格式规则", padding=10)
@@ -253,7 +295,10 @@ class LuaFormatWindow:
             return
         self.update_rule_summary()
         self.close_config_panel()
-        self.status.set("格式配置已应用，请重新扫描。" if changed else "格式配置已保存。")
+        self.status.set("格式配置已应用。" if changed else "格式配置已保存。")
+        self.settings_changed()
+        if self.path.get().strip() and self.list_signature != self.listing_signature():
+            self.schedule_load()
 
     def close_config_panel(self) -> None:
         if self.config_panel is not None:
@@ -263,11 +308,51 @@ class LuaFormatWindow:
             self.config_variables = {}
             self.config_options = {}
 
-    def signature(self) -> tuple:
+    @property
+    def results(self) -> dict[str, FileResult]:
+        return {key: preview.result for key, preview in self.previews.items() if key in self.files}
+
+    def listing_signature(self) -> tuple:
         if not self.path.get().strip():
-            raise FormatError("请选择扫描目录或 Lua 文件")
-        return (str(Path(self.path.get().strip()).absolute()), self.get_settings(),
-                self.stylua.get().strip(), self.encoding.get(), self.excludes.get(), self.include_luau.get())
+            raise FormatError("请选择目录或 Lua 文件")
+        return (str(Path(self.path.get().strip()).absolute()), self.excludes.get(), self.include_luau.get())
+
+    def format_signature(self) -> tuple:
+        stylua = self.stylua.get().strip()
+        return (self.get_settings(), stylua, self.encoding.get())
+
+    def list_is_current(self) -> bool:
+        try:
+            return self.list_signature == self.listing_signature()
+        except (ValueError, FormatError):
+            return False
+
+    def sync_settings(self) -> tuple:
+        signature = self.format_signature()
+        if signature != self.preview_signature:
+            self.preview_signature = signature
+            self.previews.clear()
+            self.render_results()
+            self.clear_detail()
+        return signature
+
+    def settings_changed(self) -> None:
+        try:
+            self.sync_settings()
+            if self.tree.selection():
+                self.show_detail()
+        except (ValueError, FormatError) as exc:
+            self.status.set(str(exc))
+
+    def schedule_load(self, *args) -> None:
+        if self.load_timer is not None:
+            self.root.after_cancel(self.load_timer)
+        self.load_timer = self.root.after(250, self.load_files)
+
+    def stop_work(self) -> None:
+        self.cancel.set()
+        self.preview_pending = None
+        self.reload_pending = False
 
     def choose_directory(self) -> None:
         value = filedialog.askdirectory(initialdir=self.initial_directory())
@@ -287,11 +372,14 @@ class LuaFormatWindow:
         value = filedialog.askopenfilename(title="选择 StyLua 可执行文件")
         if value:
             self.stylua.set(value)
+            self.settings_changed()
 
-    def start_worker(self, title: str, work) -> None:
+    def start_worker(self, title: str, work, *, kind: str = "check") -> None:
         if self.busy:
             return
         self.busy = True
+        self.worker_kind = kind
+        self.worker_summary = False
         self.cancel.clear()
         self.status.set(title)
         for button in self.action_buttons:
@@ -307,59 +395,89 @@ class LuaFormatWindow:
                 self.events.put(("done", None))
         threading.Thread(target=worker, daemon=True).start()
 
-    def scan(self) -> None:
+    def load_files(self) -> None:
+        if self.load_timer is not None:
+            self.root.after_cancel(self.load_timer)
+            self.load_timer = None
+        if self.busy:
+            self.reload_pending = True
+            return
+        self.reload_pending = False
         try:
-            signature = self.signature()
-            path, settings, stylua, encoding, excludes, luau = signature
-            resolve_stylua(stylua or None)
+            signature = self.listing_signature()
+            path, excludes, luau = signature
+            self.sync_settings()
             self.save_local()
         except (OSError, ValueError, FormatError) as exc:
-            messagebox.showerror("无法扫描", str(exc))
+            self.files.clear()
+            self.list_signature = None
+            self.render_results()
+            self.status.set(str(exc))
             return
-        self.results.clear()
-        self.scan_signature = signature
+        selected = self.tree.selection()
+        self.files.clear()
+        self.list_signature = signature
         self.render_results()
         self.clear_detail()
         def work():
-            with Formatter(settings, stylua or None, encoding) as formatter:
-                formatter.scan(Path(path), tuple(item.strip() for item in excludes.split(",") if item.strip()),
-                               luau, self.cancel, lambda result: self.events.put(("result", result)))
-        self.start_worker("正在扫描，可点击停止…", work)
+            count = 0
+            patterns = tuple(item.strip() for item in excludes.split(",") if item.strip())
+            for file in iter_lua_files(Path(path), patterns, luau, self.cancel):
+                if self.cancel.is_set():
+                    break
+                self.events.put(("file", (signature, file)))
+                count += 1
+            self.events.put(("listed", (signature, selected, count)))
+        self.start_worker("正在列出 Lua 文件…", work, kind="list")
 
     def format_files(self, all_files: bool) -> None:
+        if self.busy:
+            return
         try:
-            if self.scan_signature != self.signature():
-                raise FormatError("扫描路径、规则或编码已经改变，请重新扫描后格式化")
-            keys = list(self.results) if all_files else list(self.tree.selection())
-            targets = [self.results[key] for key in keys if self.results[key].status == "changed"]
+            signature = self.sync_settings()
+            if self.list_signature != self.listing_signature():
+                raise FormatError("文件路径或排除规则已经改变，请等待文件列表更新")
+            keys = list(self.files) if all_files else list(self.tree.selection())
+            if not all_files and any(key not in self.previews for key in keys):
+                raise FormatError("请先逐个点击选中文件查看差异，再执行格式化")
+            targets = [self.previews[key].result for key in keys
+                       if key in self.previews and self.previews[key].result.status == "changed"]
             if not targets:
-                raise FormatError("没有可格式化的文件，请先扫描并选中存在格式问题的文件")
+                raise FormatError("没有已检查的格式问题文件，请先点击文件查看差异")
         except (ValueError, FormatError) as exc:
             messagebox.showinfo("格式化", str(exc))
             return
-        _, settings, stylua, encoding, _, _ = self.scan_signature
         backup = self.backup.get()
         def work():
             written = 0
-            with Formatter(settings, stylua or None, encoding) as formatter:
-                for result in targets:
-                    if self.cancel.is_set():
-                        break
+            for result in targets:
+                if self.cancel.is_set():
+                    break
+                try:
+                    apply_result(result, backup)
+                    written += 1
+                    stamp = file_stamp(result.path)
                     try:
-                        apply_result(result, backup)
-                        written += 1
-                        self.events.put(("result", formatter.check(result.path)))
-                    except (OSError, FormatError) as exc:
-                        # 保存预览与原始内容，失败原因留在该文件详情里。
-                        self.events.put(("write_error", (str(result.path), str(exc))))
-            self.events.put(("summary", f"已格式化 {written}/{len(targets)} 个文件；已成功写入的文件已重新检查。"))
-        self.start_worker(f"正在格式化 {len(targets)} 个文件…", work)
+                        current = result.path.read_bytes() == result.formatted and stamp == file_stamp(result.path)
+                    except OSError:
+                        current = False
+                    if not current:
+                        self.events.put(("stale", str(result.path)))
+                        continue
+                    updated = FileResult(result.path, "ok", encoding=result.encoding,
+                                         original=result.formatted, formatted=result.formatted,
+                                         source=result.preview, preview=result.preview)
+                    self.events.put(("preview", FilePreview.build(updated, signature, stamp)))
+                except (OSError, FormatError) as exc:
+                    self.events.put(("write_error", (str(result.path), str(exc))))
+            self.events.put(("summary", f"已格式化 {written}/{len(targets)} 个已检查的问题文件。"))
+        self.start_worker(f"正在格式化 {len(targets)} 个文件…", work, kind="format")
 
     def install(self) -> None:
         def work():
             from install_stylua import install
             self.events.put(("installed", str(install())))
-        self.start_worker("正在下载并校验官方 StyLua 2.6.0…", work)
+        self.start_worker("正在下载并校验官方 StyLua 2.6.0…", work, kind="install")
         self.stop_button.configure(state="disabled")
 
     def poll(self) -> None:
@@ -370,22 +488,58 @@ class LuaFormatWindow:
             except queue.Empty:
                 break
             count += 1
-            if kind == "result":
-                self.results[str(value.path)] = value
-                self.render_row(str(value.path))
-                if str(value.path) in self.tree.selection():
-                    self.show_detail()
-                if self.busy:
-                    self.status.set(f"已检查 {len(self.results)} 个文件：{value.path.name}")
+            if kind == "file":
+                signature, path = value
+                if signature == self.list_signature and self.list_is_current():
+                    self.files[str(path)] = path
+                    self.render_row(str(path))
+            elif kind == "listed":
+                signature, selected, total = value
+                if signature == self.list_signature and self.list_is_current():
+                    if not self.tree.selection():
+                        self.tree.selection_set([key for key in selected if self.tree.exists(key)])
+                    self.status.set(f"{'已停止；' if self.cancel.is_set() else ''}已列出 {total} 个文件，点击文件查看修改差异。")
+                    self.worker_summary = True
+            elif kind == "preview":
+                key = str(value.result.path)
+                if value.signature == self.format_signature() and value.stamp == file_stamp(value.result.path):
+                    self.previews[key] = value
+                    if self.list_is_current() and key in self.files:
+                        self.render_row(key)
+                        if key == self.selected_key():
+                            self.render_detail(value)
+                        elif not self.tree.selection():
+                            self.clear_detail()
+                if self.preview_pending == key:
+                    self.preview_pending = None
+            elif kind == "stale":
+                self.previews.pop(value, None)
+                if value in self.files:
+                    self.render_row(value)
+                if self.preview_pending == value:
+                    self.preview_pending = None
+                if value == self.selected_key():
+                    self.clear_detail()
+                    self.file_label.configure(text=value)
+                    self.set_text("问题原因", "文件预览已失效，请再次点击文件更新差异。")
+                    self.status.set("文件已变化，请再次点击更新差异。")
+                    self.worker_summary = True
             elif kind == "write_error":
                 key, error = value
-                self.results[key].error = "写入失败：" + error
-                self.show_detail()
+                if key in self.previews:
+                    self.previews[key].result.error = "写入失败：" + error
+                    self.render_row(key)
+                    if key == self.selected_key():
+                        self.render_detail(self.previews[key], force=True)
             elif kind == "error":
-                self.scan_signature = None
-                messagebox.showerror("操作失败", value)
+                self.preview_pending = None
+                self.worker_summary = True
+                self.status.set(f"操作失败：{value}")
+                if self.worker_kind != "list":
+                    messagebox.showerror("操作失败", value)
             elif kind == "installed":
                 self.stylua.set(value)
+                self.settings_changed()
                 self.status.set(f"StyLua 已安装：{value}")
                 try:
                     self.save_local()
@@ -393,6 +547,7 @@ class LuaFormatWindow:
                     messagebox.showerror("保存设置失败", f"StyLua 已安装成功，但设置未保存：{exc}")
             elif kind == "summary":
                 self.status.set(value)
+                self.worker_summary = True
             elif kind == "done":
                 self.busy = False
                 self.progress.stop()
@@ -402,27 +557,37 @@ class LuaFormatWindow:
                 total = len(self.results)
                 counts = {name: sum(result.status == name for result in self.results.values()) for name in STATUS_LABELS}
                 errors = sum(bool(result.error) and result.status != "error" for result in self.results.values())
-                if total:
+                if not self.worker_summary:
                     self.status.set(f"{'已停止；' if self.cancel.is_set() else ''}已检查 {total} 个文件；格式正确 {counts['ok']}；格式问题 {counts['changed']}；检查失败 {counts['error']}；写入失败 {errors}")
-                elif self.scan_signature:
-                    self.status.set("扫描完成，没有找到符合条件的 Lua 文件。")
+                if self.reload_pending:
+                    self.load_files()
+                elif self.preview_pending and not self.cancel.is_set() and self.load_timer is None:
+                    self.preview_pending = None
+                    self.show_detail()
+                else:
+                    self.preview_pending = None
         self.poll_timer = self.root.after(80, self.poll)
 
     def render_row(self, key: str) -> None:
-        result = self.results[key]
-        visible = result.status != "ok" or not self.only_problems.get()
+        path = self.files[key]
+        cached = self.previews.get(key)
+        valid = cached and cached.signature == self.preview_signature and (
+            cached.stamp == file_stamp(path) or (cached.result.error and cached.result.status != "error"))
+        result = cached.result if valid else None
+        visible = result is None or result.status != "ok" or not self.only_problems.get()
         exists = self.tree.exists(key)
         if not visible:
             if exists:
                 self.tree.delete(key)
             return
-        root = Path(self.scan_signature[0]) if self.scan_signature else result.path.parent
+        root = Path(self.list_signature[0]) if self.list_signature else path.parent
         try:
-            label = str(result.path.relative_to(root)) if root != result.path else result.path.name
+            label = str(path.relative_to(root)) if root != path else path.name
         except ValueError:
-            label = str(result.path)
-        options = {"text": label, "values": ("写入失败" if result.error and result.status != "error" else STATUS_LABELS[result.status], len(result.issues)),
-                   "tags": ("error" if result.error else result.status,)}
+            label = str(path)
+        status = "未检查" if result is None else "写入失败" if result.error and result.status != "error" else STATUS_LABELS[result.status]
+        options = {"text": label, "values": (status, len(result.issues) if result else "—"),
+                   "tags": (("error" if result.error else result.status) if result else "pending",)}
         if exists:
             self.tree.item(key, **options)
         else:
@@ -432,7 +597,7 @@ class LuaFormatWindow:
         selected = self.tree.selection()
         for key in self.tree.get_children():
             self.tree.delete(key)
-        for key in self.results:
+        for key in self.files:
             self.render_row(key)
         self.tree.selection_set([key for key in selected if self.tree.exists(key)])
         if not self.tree.selection():
@@ -450,17 +615,75 @@ class LuaFormatWindow:
         widget.configure(state="disabled")
 
     def clear_detail(self) -> None:
+        self.displayed_preview = None
         self.file_label.configure(text="点击左侧文件查看原因与修改预览")
         self.split_diff.show()
         for name in self.details:
             self.set_text(name, "")
 
     def show_detail(self, event=None) -> None:
-        selected = self.tree.selection()
-        if not selected:
+        key = self.selected_key()
+        if key is None:
+            self.preview_pending = None
             self.clear_detail()
             return
-        result = self.results[selected[0]]
+        if event is not None:
+            self.notebook.select(self.diff_page)
+        try:
+            signature = self.sync_settings()
+            if self.list_signature != self.listing_signature():
+                self.schedule_load()
+                return
+        except (ValueError, FormatError) as exc:
+            self.status.set(str(exc))
+            return
+        path = self.files[key]
+        cached = self.previews.get(key)
+        if cached and cached.signature == signature and cached.stamp == file_stamp(path):
+            self.preview_pending = None
+            self.render_detail(cached)
+            self.status.set(f"使用缓存：{path.name}（文件和格式规则未修改）")
+            return
+        self.clear_detail()
+        self.file_label.configure(text=str(path))
+        self.set_text("问题原因", "正在检查当前文件并生成修改差异…")
+        if self.busy:
+            self.preview_pending = key
+            return
+        self.previews.pop(key, None)
+        self.render_row(key)
+        self.preview_pending = None
+        settings, stylua, encoding = signature
+        def work():
+            before = file_stamp(path)
+            if cached and cached.signature == signature and (cached.result.status != "error" or cached.result.original):
+                try:
+                    unchanged = path.read_bytes() == cached.result.original
+                except OSError:
+                    unchanged = False
+                if unchanged and before == file_stamp(path):
+                    cached.stamp = before
+                    self.events.put(("preview", cached))
+                    return
+            with Formatter(settings, stylua or None, encoding) as formatter:
+                result = formatter.check(path)
+            after = file_stamp(path)
+            if before == after:
+                self.events.put(("preview", FilePreview.build(result, signature, after)))
+            else:
+                self.events.put(("stale", key))
+        self.start_worker(f"正在检查 {path.name}…", work)
+
+    def selected_key(self) -> str | None:
+        selected = self.tree.selection()
+        focused = self.tree.focus()
+        return focused if focused in selected else selected[0] if selected else None
+
+    def render_detail(self, cached: FilePreview, *, force: bool = False) -> None:
+        if self.displayed_preview is cached and not force:
+            return
+        self.displayed_preview = cached
+        result = cached.result
         self.file_label.configure(text=str(result.path))
         lines = [f"状态：{STATUS_LABELS[result.status]}", f"源文件编码：{result.encoding or '未识别'}"]
         if result.error:
@@ -472,8 +695,8 @@ class LuaFormatWindow:
         if not result.issues and not result.error:
             lines.append("文件符合当前格式规则。")
         self.set_text("问题原因", "\n".join(lines))
-        self.set_text("修改差异", result.diff())
-        self.split_diff.show(result.source, result.preview, result.error if result.status == "error" else "")
+        self.set_text("修改差异", cached.diff)
+        self.split_diff.show(result.source, result.preview, result.error if result.status == "error" else "", rows=cached.rows)
         self.set_text("原始内容", result.source)
         self.set_text("格式化预览", result.preview)
 
@@ -493,7 +716,8 @@ class LuaFormatWindow:
             else:
                 self.save_local()
                 self.update_rule_summary()
-                self.status.set("已导入规则，请重新扫描。")
+                self.settings_changed()
+                self.status.set("已导入规则；当前文件更新差异，其他文件在点击时检查。")
         except (OSError, FormatError) as exc:
             messagebox.showerror("导入失败", str(exc), parent=self.config_panel or self.root)
 
@@ -504,8 +728,8 @@ class LuaFormatWindow:
             filename = filedialog.asksaveasfilename(parent=self.config_panel or self.root,
                                                   initialfile="stylua.toml", defaultextension=".toml", filetypes=[("LuaFormatTool / StyLua 配置", "*.toml")])
             if filename:
-                if Path(filename).resolve() in {result.path for result in self.results.values()}:
-                    raise FormatError("配置文件不能覆盖扫描中的 Lua 源文件")
+                if Path(filename).resolve() in set(self.files.values()):
+                    raise FormatError("配置文件不能覆盖列表中的 Lua 源文件")
                 Path(filename).write_text(content, encoding="utf-8", newline="\n")
                 if self.config_panel is not None:
                     self.config_notice.set(f"已导出规则：{filename}")
@@ -516,17 +740,25 @@ class LuaFormatWindow:
             messagebox.showerror("导出失败", str(exc), parent=self.config_panel or self.root)
 
     def export_report(self) -> None:
-        if not self.results:
-            messagebox.showinfo("导出报告", "请先扫描 Lua 文件")
+        self.sync_settings()
+        if not self.list_is_current():
+            messagebox.showinfo("导出报告", "请先选择目录或文件，并等待文件列表更新")
+            return
+        checked = {key: preview for key, preview in self.previews.items()
+                   if key in self.files and preview.stamp == file_stamp(preview.result.path)}
+        if not checked:
+            messagebox.showinfo("导出报告", "请先点击文件查看差异；报告仅包含已经检查且未修改的文件")
             return
         filename = filedialog.asksaveasfilename(initialfile="lua-format-report.json", defaultextension=".json", filetypes=[("JSON 报告", "*.json")])
         if filename:
             try:
-                if Path(filename).resolve() in {result.path for result in self.results.values()}:
-                    raise FormatError("报告不能覆盖扫描中的 Lua 源文件")
-                data = {"root": self.scan_signature[0] if self.scan_signature else None,
-                        "settings": asdict(self.scan_signature[1]) if self.scan_signature else None,
-                        "files": [result.to_dict(True) for result in self.results.values()]}
+                if Path(filename).resolve() in set(self.files.values()):
+                    raise FormatError("报告不能覆盖列表中的 Lua 源文件")
+                data = {"root": self.list_signature[0] if self.list_signature else None,
+                        "settings": asdict(self.preview_signature[0]), "scope": "checked_files_only",
+                        "total_files": len(self.files), "checked_files": len(checked),
+                        "unchecked": [key for key in self.files if key not in checked],
+                        "files": [dict(preview.result.to_dict(), diff=preview.diff) for preview in checked.values()]}
                 Path(filename).write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
                 self.status.set(f"已导出报告：{filename}")
             except (OSError, FormatError) as exc:
@@ -556,6 +788,11 @@ class LuaFormatWindow:
             temporary.unlink(missing_ok=True)
 
     def close(self) -> None:
+        if self.load_timer is not None:
+            self.root.after_cancel(self.load_timer)
+            self.load_timer = None
+        self.reload_pending = False
+        self.preview_pending = None
         if self.busy:
             self.cancel.set()
             self.status.set("正在停止任务，完成当前文件后即可关闭窗口。")

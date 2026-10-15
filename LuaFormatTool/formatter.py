@@ -381,9 +381,9 @@ def apply_result(result: FileResult, backup: bool = True) -> Path | None:
         raise FormatError("只能格式化已通过解析且存在格式问题的文件")
     path = result.path
     if path.is_symlink() or path.resolve() != path.absolute():
-        raise FormatError(f"路径已变化或成为符号链接，请重新扫描：{path}")
+        raise FormatError(f"路径已变化或成为符号链接，请更新预览：{path}")
     if path.read_bytes() != result.original:
-        raise FormatError(f"文件在扫描后已被修改，请重新扫描：{path}")
+        raise FormatError(f"文件在预览后已被修改，请更新预览再格式化：{path}")
     file_stat = path.stat()
     if not file_stat.st_mode & stat.S_IWUSR:
         raise FormatError(f"文件只读：{path}")
@@ -403,7 +403,7 @@ def apply_result(result: FileResult, backup: bool = True) -> Path | None:
             os.fsync(stream.fileno())
         os.chmod(temporary, stat.S_IMODE(file_stat.st_mode))
         if path.is_symlink() or path.resolve() != path.absolute() or path.read_bytes() != result.original:
-            raise FormatError(f"写入前源文件发生变化，请重新扫描：{path}")
+            raise FormatError(f"写入前源文件发生变化，请更新预览：{path}")
         os.replace(temporary, path)
     finally:
         if os.path.exists(temporary):
