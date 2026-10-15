@@ -750,6 +750,55 @@ class LauncherControllerTests(unittest.TestCase):
         self.assertEqual(self.controller.snapshots(), ())
         self.assertTrue(all(process.closed for process in self.factory.created))
 
+    def test_stop_all_sends_every_request_before_any_process_finishes(self) -> None:
+        for _ in range(3):
+            self.controller.start(self.settings)
+        entered = {process.pid: threading.Event() for process in self.factory.created}
+        release = threading.Event()
+        results = []
+        errors = []
+
+        for process in self.factory.created:
+            def terminate(exit_code=1, process=process):
+                entered[process.pid].set()
+                if not release.wait(5):
+                    raise LauncherError("测试等待释放退出超时")
+                FakeProcess.terminate(process, exit_code)
+            process.terminate = terminate
+
+        def stop_all():
+            try:
+                results.append(self.controller.stop_all())
+            except Exception as exc:
+                errors.append(exc)
+
+        worker = threading.Thread(target=stop_all, daemon=True)
+        worker.start()
+        try:
+            for requested in entered.values():
+                self.assertTrue(requested.wait(1), "其他实例的关闭请求被前一个退出等待阻塞")
+            self.assertFalse(any(process.closed for process in self.factory.created))
+        finally:
+            release.set()
+            worker.join(5)
+        self.assertFalse(worker.is_alive())
+        self.assertEqual(errors, [])
+        self.assertEqual([snapshot.instance_id for snapshot in results[0]], [1, 2, 3])
+        self.assertEqual(self.controller.snapshots(), ())
+
+    def test_stop_many_preserves_failed_and_unselected_instances(self) -> None:
+        for _ in range(4):
+            self.controller.start(self.settings)
+        self.factory.created[0].wait_result = False
+        result = self.controller.stop_many((3, 1, 2, 2, 999), timeout_ms=1)
+        self.assertEqual([snapshot.instance_id for snapshot in result.snapshots], [3, 2])
+        self.assertEqual(len(result.errors), 2)
+        self.assertIn("实例 1", result.errors[0])
+        self.assertIn("实例 999", result.errors[1])
+        self.assertEqual([snapshot.instance_id for snapshot in self.controller.snapshots()], [1, 4])
+        self.assertFalse(self.factory.created[0].closed)
+        self.assertFalse(self.factory.created[3].terminated)
+
     def test_stop_timeout_keeps_process_owned(self) -> None:
         process = FakeProcess(2000, wait_result=False)
         controller = LauncherController(

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import ctypes
 from ctypes import wintypes
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field, replace
 from enum import Enum
 import json
@@ -1035,6 +1036,12 @@ class ControllerSnapshot:
 
 
 @dataclass(frozen=True)
+class InstanceBatchResult:
+    snapshots: tuple[ControllerSnapshot, ...] = ()
+    errors: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
 class ClientLaunchResult:
     """Clients started by one batch; a failure stops the batch but keeps earlier Clients."""
 
@@ -1323,25 +1330,58 @@ class LauncherController:
             instance = self._instances.get(instance_id)
             if instance is None:
                 raise LauncherError(f"实例 {instance_id} 不存在或已退出。")
-            process = instance.process
-            process.terminate()
-            if not process.wait(timeout_ms):
-                raise LauncherError(
-                    f"等待 App（PID {process.pid}）退出超时。"
-                )
-            exit_code = process.poll()
-            process.close()
+            stopped = self._stop_process(instance, timeout_ms)
             del self._instances[instance_id]
             self._release_debug_slot(instance.debug_ports)
-            return ControllerSnapshot(
-                instance_id,
-                ControllerState.STOPPED,
-                exit_code=exit_code,
-                settings=instance.settings,
-                debug_ports=instance.debug_ports,
-                arguments=instance.arguments,
-                label=instance.label,
-            )
+            return stopped
+
+    @staticmethod
+    def _stop_process(instance: _ManagedInstance, timeout_ms: int) -> ControllerSnapshot:
+        process = instance.process
+        process.terminate()
+        if not process.wait(timeout_ms):
+            raise LauncherError(f"等待 App（PID {process.pid}）退出超时。")
+        exit_code = process.poll()
+        process.close()
+        return ControllerSnapshot(
+            instance.instance_id,
+            ControllerState.STOPPED,
+            exit_code=exit_code,
+            settings=instance.settings,
+            debug_ports=instance.debug_ports,
+            arguments=instance.arguments,
+            label=instance.label,
+        )
+
+    def stop_many(self, instance_ids: Sequence[int], timeout_ms: int = 5000) -> InstanceBatchResult:
+        """Issue independent graceful stops concurrently, then collect all outcomes."""
+        instance_ids = tuple(dict.fromkeys(instance_ids))
+        if not instance_ids:
+            return InstanceBatchResult()
+        with self._lock:
+            self._reap_finished_processes()
+            stopped: list[ControllerSnapshot] = []
+            errors: list[str] = []
+            # Retain ownership while workers wait on separate process handles. Workers must
+            # not call stop(): its controller lock would serialize the HTTP/exit waits again.
+            with ThreadPoolExecutor(max_workers=len(instance_ids), thread_name_prefix="app-stop") as executor:
+                futures = {
+                    instance_id: executor.submit(self._stop_process, self._instances[instance_id], timeout_ms)
+                    for instance_id in instance_ids if instance_id in self._instances
+                }
+                for instance_id in instance_ids:
+                    future = futures.get(instance_id)
+                    if future is None:
+                        errors.append(f"实例 {instance_id} 不存在或已退出。")
+                        continue
+                    try:
+                        stopped.append(future.result())
+                    except Exception as exc:
+                        errors.append(f"实例 {instance_id}：{exc}")
+                    else:
+                        instance = self._instances.pop(instance_id)
+                        self._release_debug_slot(instance.debug_ports)
+            return InstanceBatchResult(tuple(stopped), tuple(errors))
 
     def restart(self, instance_id: int, timeout_ms: int = 5000) -> ControllerSnapshot:
         with self._lock:
@@ -1377,17 +1417,11 @@ class LauncherController:
 
     def stop_all(self, timeout_ms: int = 5000) -> tuple[ControllerSnapshot, ...]:
         with self._lock:
-            instance_ids = tuple(self._instances)
-        stopped: list[ControllerSnapshot] = []
-        errors: list[str] = []
-        for instance_id in instance_ids:
-            try:
-                stopped.append(self.stop(instance_id, timeout_ms))
-            except LauncherError as exc:
-                errors.append(str(exc))
-        if errors:
-            raise LauncherError("关闭全部实例失败：" + "；".join(errors))
-        return tuple(stopped)
+            self._reap_finished_processes()
+            result = self.stop_many(tuple(self._instances), timeout_ms)
+        if result.errors:
+            raise LauncherError("关闭全部实例失败：" + "；".join(result.errors))
+        return result.snapshots
 
     def shutdown(self) -> None:
         with self._lock:

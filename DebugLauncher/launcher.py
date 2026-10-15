@@ -13,6 +13,7 @@ from typing import Callable
 
 from launcher_core import (
     ControllerSnapshot,
+    InstanceBatchResult,
     DEBUG_WAIT_ARGUMENT,
     DEFAULT_SCRIPT_DEBUG_PORT,
     DebugPortBundle,
@@ -58,12 +59,6 @@ class _RoleControls:
     name: tk.StringVar
     summary: tk.StringVar
     start_button: ttk.Button
-
-
-@dataclass(frozen=True)
-class _InstanceBatchResult:
-    snapshots: tuple[ControllerSnapshot, ...]
-    errors: tuple[str, ...]
 
 
 class DebugLauncherApp:
@@ -769,7 +764,7 @@ class DebugLauncherApp:
         self._cancel_window_layout()
         self._run_async(
             f"正在批量关闭 {len(instance_ids)} 个实例…",
-            lambda: self._operate_instances(instance_ids, self.controller.stop),
+            lambda: self.controller.stop_many(instance_ids),
             self._on_instances_stopped,
         )
 
@@ -791,13 +786,13 @@ class DebugLauncherApp:
         self._cancel_window_layout()
         self._run_async(
             "正在关闭全部…",
-            lambda: self._operate_instances(instance_ids, self.controller.stop),
+            lambda: self.controller.stop_many(instance_ids),
             self._on_instances_stopped,
         )
 
     def _operate_instances(
         self, instance_ids: tuple[int, ...], operation: Callable[[int], ControllerSnapshot],
-    ) -> _InstanceBatchResult:
+    ) -> InstanceBatchResult:
         snapshots: list[ControllerSnapshot] = []
         errors: list[str] = []
         for instance_id in instance_ids:
@@ -807,7 +802,7 @@ class DebugLauncherApp:
                 snapshots.append(operation(instance_id))
             except Exception as exc:  # One failed instance must not prevent the remaining operations.
                 errors.append(f"实例 {instance_id}：{exc}")
-        return _InstanceBatchResult(tuple(snapshots), tuple(errors))
+        return InstanceBatchResult(tuple(snapshots), tuple(errors))
 
     def _run_async(
         self,
@@ -876,14 +871,14 @@ class DebugLauncherApp:
             self._request_window_layout()
 
     def _on_instances_stopped(self, result: object) -> None:
-        if not isinstance(result, _InstanceBatchResult):
+        if not isinstance(result, InstanceBatchResult):
             return
         for snapshot in result.snapshots:
             self._on_instance_stopped(snapshot)
         self._report_batch_errors("关闭", result)
 
     def _on_instances_restarted(self, result: object) -> None:
-        if not isinstance(result, _InstanceBatchResult):
+        if not isinstance(result, InstanceBatchResult):
             return
         for snapshot in result.snapshots:
             self._on_instance_restarted(snapshot, request_layout=False)
@@ -894,7 +889,7 @@ class DebugLauncherApp:
             self._request_window_layout()
         self._report_batch_errors("重启", result)
 
-    def _report_batch_errors(self, action: str, result: _InstanceBatchResult) -> None:
+    def _report_batch_errors(self, action: str, result: InstanceBatchResult) -> None:
         if result.errors and not self.closing:
             self._show_error(f"部分实例{action}失败", LauncherError(
                 f"成功{action} {len(result.snapshots)} / "

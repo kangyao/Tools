@@ -20,7 +20,7 @@ from launch_profiles import LaunchProfile, LauncherConfig, ProfileStore  # noqa:
 from launcher_core import (  # noqa: E402
     DEFAULT_EXECUTABLE, DebugPortAllocator, LauncherController, NetworkRole,
 )
-from test_launcher_core import FakeFactory  # noqa: E402
+from test_launcher_core import FakeFactory, FakeProcess  # noqa: E402
 from window_layout import LayoutResult  # noqa: E402
 
 
@@ -304,6 +304,41 @@ class LauncherUiTests(unittest.TestCase):
         self.assertEqual(self.app.instance_tree.get_children(), ("1",))
         self.assertTrue(all(process.terminated for process in self.factory.created))
         self.assertIn("成功关闭 2 / 3", str(self.show_error.call_args.args[1]))
+
+    def assert_stop_requests_are_concurrent(self, *, all_instances: bool) -> None:
+        self.app.client_count_var.set("3")
+        self.app.role_controls[CLIENT].start_button.invoke()
+        self.wait_until_idle()
+        release = threading.Event()
+        entered = {process.pid: threading.Event() for process in self.factory.created}
+        for process in self.factory.created:
+            def terminate(exit_code=1, process=process):
+                entered[process.pid].set()
+                if not release.wait(5):
+                    raise launcher.LauncherError("测试等待释放退出超时")
+                FakeProcess.terminate(process, exit_code)
+            process.terminate = terminate
+        self.app.instance_tree.selection_set("1" if all_instances else ("1", "3"))
+        self.root.update()
+        button = self.app.stop_all_button if all_instances else self.app.stop_button
+        button.invoke()
+        try:
+            expected_pids = (1000, 1001, 1002) if all_instances else (1000, 1002)
+            for pid in expected_pids:
+                self.assertTrue(entered[pid].wait(1), "关闭按钮仍在逐个等待退出")
+            self.assertFalse(any(process.closed for process in self.factory.created))
+            if not all_instances:
+                self.assertFalse(entered[1001].is_set())
+        finally:
+            release.set()
+            self.wait_until_idle()
+        self.assertEqual(self.app.instance_tree.get_children(), () if all_instances else ("2",))
+
+    def test_stop_all_button_requests_all_exits_concurrently(self) -> None:
+        self.assert_stop_requests_are_concurrent(all_instances=True)
+
+    def test_batch_stop_button_requests_selected_exits_concurrently(self) -> None:
+        self.assert_stop_requests_are_concurrent(all_instances=False)
 
     def test_layout_orders_host_before_older_client(self) -> None:
         self.seed(LaunchProfile(name="Listen Host", role=HOST, server_mode="Host"),
