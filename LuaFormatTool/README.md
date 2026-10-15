@@ -28,7 +28,7 @@ python D:\git\skills\Tools\LuaFormatTool\install_stylua.py
 2. 点击 **开始扫描**。左侧逐个显示问题文件，可以关闭“仅显示问题”查看全部扫描结果。
 3. 点选文件，在右侧查看 **问题原因 / 修改差异 / 原始内容 / 格式化预览**。原因包含行号、规则、原始片段和目标片段。**修改差异** 默认使用左右对比：左侧原始内容、右侧格式化预览，分别显示源文件行号；红色标出修改前 / 删除行，绿色标出修改后 / 新增行，灰色空位保持两边对齐。两侧纵向同步滚动，横向可独立滚动，支持 **上一处 / 下一处** 跳转；也可切换为 **单栏差异**。仅换行符或末尾换行不同时会显示 `[CRLF]`、`[LF]` 或 `[无换行]` 标记（这些标记只用于预览）。
 4. 可多选文件后点击 **格式化选中文件**，也可以点击 **格式化全部问题文件**。成功写入后立即重新检查。
-5. 格式配置面板中的 **导入规则 / 导出规则** 使用 StyLua TOML，导入后点击 **应用** 才生效；主界面的 **导出扫描报告** 输出包含原因和差异的 JSON。
+5. 格式配置面板中的 **导入规则 / 导出规则** 使用 TOML，兼容 StyLua 的原有规则；启用工具扩展的“不处理”规则时，会增加 `[lua_format_tool]` 配置段，需通过本工具使用。导入后点击 **应用** 才生效；主界面的 **导出扫描报告** 输出包含原因和差异的 JSON。
 
 修改扫描路径、格式规则、源文件编码或排除规则后，需要重新扫描才能格式化，确保写入的是所查看的预览。扫描和格式化在后台运行，**停止** 会在当前文件完成后停止处理后续文件。
 
@@ -41,14 +41,19 @@ python D:\git\skills\Tools\LuaFormatTool\install_stylua.py
 | Lua 版本 | Lua54 | Lua51 / Lua52 / Lua53 / Lua54 / LuaJIT / Luau / CfxLua / All |
 | 缩进类型与宽度 | Spaces / 4 | 空格或 Tab；Tab 宽度用于布局估算 |
 | 参考行宽 | 120 | 换行参考宽度，长字符串或注释可能超过此值 |
-| 换行符 | Unix | LF；Windows 使用 CRLF |
+| 换行符 | Unix | LF；Windows 使用 CRLF；不处理时保留源行的 LF / CRLF / CR |
+| 文件末尾换行 | Always | 补齐末尾换行；不处理时保留原文件末尾有无换行的状态 |
 | 字符串引号 | AutoPreferDouble | 优先双引号、优先单引号、强制双引号或强制单引号 |
-| 调用括号 | Always | 单字符串/表参数调用的括号风格 |
-| 合并简单语句 | Never | 简单函数和条件是否合并到一行 |
+| 调用括号 | Always | 单字符串/表参数调用的括号风格；不处理对应 Input，保留原括号 |
+| 合并简单语句 | Never | 简单函数和条件是否合并到一行；不处理对应 Input，保留原合并方式 |
 | 函数名后空格 | Never | 定义、调用或两者添加空格 |
-| 块首尾空行 | Never | 是否保留块首尾额外空行 |
+| 块首尾空行 | Never | 不处理对应 Preserve，保留块首尾原有空行 |
 
-配置格式和参数含义参见 [StyLua 官方文档](https://github.com/JohnnyMorganz/StyLua#configuration)。导入 TOML 时，未指定的字段遵循 StyLua 默认值（包括 Tab 缩进和 All 语法）；新建工具配置采用上表默认值。
+可在 **格式配置** 的下拉框中选择 **不处理（保留……）**。原默认规则保持不变，需要保留哪些样式就单独选择。换行符和文件末尾换行是独立选项：两个都选“不处理”才会同时保留换行符种类和末尾有无换行。混合换行文件按源行对齐保留，自动折行等布局变化产生的新行沿用对应或相邻源行的换行符；无可参考的换行符时使用 LF。简单语句选择 Input 后，过长的单行语句仍可能因参考行宽而折行。
+
+缩进、字符串引号、函数名后空格和参考行宽没有 StyLua 提供的独立停用模式，仍按选定规则格式化。需要完整保留某段代码时，可以在代码中使用官方的 `-- stylua: ignore`，或 `-- stylua: ignore start` / `-- stylua: ignore end`。
+
+配置格式和参数含义参见 [StyLua 2.6.0 官方文档](https://github.com/JohnnyMorganz/StyLua/blob/v2.6.0/README.md#configuration)。导入 TOML 时，未指定的字段遵循 StyLua 默认值（包括 Tab 缩进和 All 语法）；新建工具配置采用上表默认值。工具专有的换行保留选项保存在 `[lua_format_tool]` 中；本工具调用 StyLua 时会移除该扩展段，并在生成预览后恢复对应的换行状态。
 
 扫描只使用界面设置或显式传入的 `--config`，不会自动读取目标目录的 `.stylua.toml`、`.editorconfig`、`.gitignore` 或 `.styluaignore`。项目已有规则时请先导入，目录和文件过滤通过工具的排除规则设置。`require` 排序始终关闭；导入启用排序的配置会明确报错。
 
@@ -68,6 +73,9 @@ python lua_format_tool.py init-config stylua.toml
 
 # 使用配置文件，单次覆盖缩进、行宽和换行符
 python lua_format_tool.py scan D:\Projects\Scripts --config stylua.toml --indent-width 2 --column-width 100 --line-endings Windows
+
+# 不处理换行符、末尾换行、简单语句合并、调用括号和块首尾空行
+python lua_format_tool.py scan D:\Projects\Scripts --line-endings Preserve --final-newline Preserve --collapse-simple-statement Input --call-parentheses Input --block-newline-gaps Preserve
 
 # 格式化预览，不写文件
 python lua_format_tool.py format D:\Projects\Scripts --config stylua.toml --diff
@@ -104,4 +112,4 @@ python install_stylua.py
 python -m unittest discover -s tests -v
 ```
 
-测试涵盖真实 StyLua 格式化、中文编码与 BOM、Lua/Luau 语法、长字符串/注释、规则导入、扫描排除、备份和修改冲突，以及 GUI 后台扫描、详情、格式化和报告。没有安装 StyLua 时，集成测试会明确跳过；没有显示环境时，GUI 测试会明确跳过。
+测试涵盖真实 StyLua 格式化、中文编码与 BOM、Lua/Luau 语法、长字符串/注释、混合换行和末尾换行保留、语句/括号/空行的输入样式保留、规则导入导出、扫描排除、备份和修改冲突，以及 GUI 后台扫描、详情、格式化和报告。没有安装 StyLua 时，集成测试会明确跳过；没有显示环境时，GUI 测试会明确跳过。

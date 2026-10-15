@@ -13,13 +13,13 @@ from tkinter import filedialog, messagebox, ttk
 from tkinter.scrolledtext import ScrolledText
 
 from diff_view import SideBySideDiff
-from formatter import (APP_DIR, CHOICES, DEFAULT_EXCLUDES, STATUS_LABELS, FileResult,
+from formatter import (APP_DIR, CHOICES, DEFAULT_EXCLUDES, OPTION_LABELS, STATUS_LABELS, FileResult,
                        FormatError, FormatSettings, Formatter, apply_result, resolve_stylua)
 
 
 FIELD_LABELS = {
     "syntax": "Lua 版本", "indent_type": "缩进类型", "indent_width": "每级缩进宽度",
-    "column_width": "参考行宽", "line_endings": "换行符", "quote_style": "字符串引号",
+    "column_width": "参考行宽", "line_endings": "换行符", "final_newline": "文件末尾换行", "quote_style": "字符串引号",
     "call_parentheses": "调用括号", "collapse_simple_statement": "合并简单语句",
     "space_after_function_names": "函数名后空格", "block_newline_gaps": "块首尾空行",
 }
@@ -150,6 +150,8 @@ class LuaFormatWindow:
 
     def get_settings(self, variables: dict[str, tk.StringVar] | None = None) -> FormatSettings:
         data = {name: variable.get() for name, variable in (self.variables if variables is None else variables).items()}
+        for name, labels in OPTION_LABELS.items():
+            data[name] = {label: value for value, label in labels.items()}.get(data[name], data[name])
         for name in ("indent_width", "column_width"):
             try:
                 data[name] = int(data[name])
@@ -160,7 +162,7 @@ class LuaFormatWindow:
     def update_rule_summary(self) -> None:
         settings = self.get_settings()
         indent = f"{settings.indent_width} 个空格" if settings.indent_type == "Spaces" else f"Tab（宽度 {settings.indent_width}）"
-        newline = "LF" if settings.line_endings == "Unix" else "CRLF"
+        newline = {"Unix": "LF", "Windows": "CRLF", "Preserve": "换行符不处理"}[settings.line_endings]
         self.rule_summary.set(f"当前格式：{settings.syntax} · {indent} · 行宽 {settings.column_width} · {newline} · {settings.quote_style}")
 
     def open_config_panel(self) -> None:
@@ -175,7 +177,7 @@ class LuaFormatWindow:
         panel.title("格式配置")
         panel.transient(self.root)
         panel.resizable(False, False)
-        self.config_variables = {name: tk.StringVar(master=panel, value=variable.get())
+        self.config_variables = {name: tk.StringVar(master=panel, value=OPTION_LABELS.get(name, {}).get(variable.get(), variable.get()))
                                  for name, variable in self.variables.items()}
         self.config_options = {
             "encoding": tk.StringVar(master=panel, value=self.encoding.get()),
@@ -193,9 +195,13 @@ class LuaFormatWindow:
             frame.grid(row=row, column=column, sticky="ew", padx=8, pady=6)
             ttk.Label(frame, text=FIELD_LABELS[name]).pack(anchor="w")
             if name in CHOICES:
-                ttk.Combobox(frame, textvariable=variable, values=CHOICES[name], state="readonly", width=30).pack(fill="x")
+                values = [OPTION_LABELS.get(name, {}).get(value, value) for value in CHOICES[name]]
+                ttk.Combobox(frame, textvariable=variable, values=values, state="readonly", width=30).pack(fill="x")
             else:
                 ttk.Entry(frame, textvariable=variable, width=30).pack(fill="x")
+        ttk.Label(body, text="“不处理”保留对应输入样式；简单语句过长时仍受参考行宽影响。\n"
+                            "缩进、字符串引号、函数名后空格和参考行宽由 StyLua 统一处理，暂不支持单独关闭。",
+                  wraplength=580).pack(fill="x", pady=(8, 0))
         options = ttk.LabelFrame(body, text="文件处理", padding=10)
         options.pack(fill="x", pady=(10, 0))
         ttk.Label(options, text="源文件编码").pack(side="left")
@@ -471,14 +477,15 @@ class LuaFormatWindow:
 
     def import_rules(self) -> None:
         filename = filedialog.askopenfilename(parent=self.config_panel or self.root,
-                                             filetypes=[("StyLua 配置", "*.toml"), ("所有文件", "*.*")])
+                                             filetypes=[("LuaFormatTool / StyLua 配置", "*.toml"), ("所有文件", "*.*")])
         if not filename:
             return
         try:
             settings = FormatSettings.load(Path(filename))
             variables = self.config_variables if self.config_panel is not None else self.variables
             for name, value in asdict(settings).items():
-                variables[name].set(str(value))
+                variables[name].set(OPTION_LABELS.get(name, {}).get(value, str(value))
+                                    if self.config_panel is not None else str(value))
             if self.config_panel is not None:
                 self.config_notice.set("已导入规则，点击应用保存配置。")
             else:
@@ -493,7 +500,7 @@ class LuaFormatWindow:
             variables = self.config_variables if self.config_panel is not None else self.variables
             content = self.get_settings(variables).to_toml()
             filename = filedialog.asksaveasfilename(parent=self.config_panel or self.root,
-                                                  initialfile="stylua.toml", defaultextension=".toml", filetypes=[("StyLua 配置", "*.toml")])
+                                                  initialfile="stylua.toml", defaultextension=".toml", filetypes=[("LuaFormatTool / StyLua 配置", "*.toml")])
             if filename:
                 if Path(filename).resolve() in {result.path for result in self.results.values()}:
                     raise FormatError("配置文件不能覆盖扫描中的 Lua 源文件")

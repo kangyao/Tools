@@ -10,7 +10,7 @@ from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from formatter import APP_DIR, FormatError, resolve_stylua
+from formatter import APP_DIR, OPTION_LABELS, FormatError, resolve_stylua
 from gui import LuaFormatWindow
 
 
@@ -112,6 +112,29 @@ class GuiTests(unittest.TestCase):
         self.assertIn('quote_style = "ForceSingle"', output.read_text(encoding="utf-8"))
         self.window.close_config_panel()
         self.assertEqual(self.window.get_settings().indent_type, "Spaces")
+
+    def test_preserve_options_have_readable_labels_and_survive_export_import(self):
+        self.window.open_config_panel()
+        for name, value in (("line_endings", "Preserve"), ("final_newline", "Preserve"),
+                            ("collapse_simple_statement", "Input"), ("call_parentheses", "Input"),
+                            ("block_newline_gaps", "Preserve")):
+            self.window.config_variables[name].set(OPTION_LABELS[name][value])
+        expected = self.window.get_settings(self.window.config_variables)
+        self.assertEqual(expected.line_endings, "Preserve")
+        self.assertEqual(expected.collapse_simple_statement, "Input")
+        output = self.directory / "preserve.toml"
+        with patch("gui.filedialog.asksaveasfilename", return_value=str(output)):
+            self.window.export_rules()
+        self.window.apply_config_panel()
+        self.assertEqual(self.window.get_settings(), expected)
+        self.assertIn("换行符不处理", self.window.rule_summary.get())
+        self.window.open_config_panel()
+        self.assertEqual(self.window.config_variables["call_parentheses"].get(), OPTION_LABELS["call_parentheses"]["Input"])
+        self.window.config_variables["line_endings"].set("Unix")
+        with patch("gui.filedialog.askopenfilename", return_value=str(output)):
+            self.window.import_rules()
+        self.assertEqual(self.window.get_settings(self.window.config_variables), expected)
+        self.window.close_config_panel()
 
     def test_write_failure_visible_and_original_protected(self):
         source = self.directory / "test.lua"

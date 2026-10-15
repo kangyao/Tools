@@ -35,9 +35,24 @@ class SettingsTests(unittest.TestCase):
             self.assertEqual(imported.syntax, "All")
             self.assertEqual(imported.column_width, 80)
 
+    def test_preserve_options_round_trip_and_runtime_config(self):
+        settings = replace(FormatSettings(), line_endings="Preserve", final_newline="Preserve",
+                           call_parentheses="Input", collapse_simple_statement="Input", block_newline_gaps="Preserve")
+        with tempfile.TemporaryDirectory() as directory:
+            config = Path(directory) / "preserve.toml"
+            config.write_text(settings.to_toml(), encoding="utf-8")
+            self.assertEqual(FormatSettings.load(config), settings)
+        self.assertIn("[lua_format_tool]", settings.to_toml())
+        runtime = settings.to_toml(for_stylua=True)
+        self.assertNotIn("[lua_format_tool]", runtime)
+        self.assertNotIn("final_newline", runtime)
+        self.assertIn('line_endings = "Unix"', runtime)
+
     def test_reject_invalid_and_unsafe_rules(self):
         for data in ({"indent_width": True}, {"indent_width": 0}, {"column_width": 5},
-                     {"syntax": "lua"}, {"unknown": 1}, {"sort_requires": {"enabled": True}}):
+                     {"syntax": "lua"}, {"unknown": 1}, {"sort_requires": {"enabled": True}},
+                     {"lua_format_tool": []}, {"lua_format_tool": {"unknown": "Preserve"}},
+                     {"lua_format_tool": {"final_newline": "Never"}}):
             with self.subTest(data=data), self.assertRaises(FormatError):
                 FormatSettings.from_mapping(data)
 
@@ -199,6 +214,75 @@ class IntegrationTests(unittest.TestCase):
             self.assertEqual(formatter.check(path).status, "ok")
             path.write_text("local x <const> = 1\n")
             self.assertEqual(formatter.check(path).status, "error")
+
+    def test_preserve_line_endings_and_final_newline(self):
+        settings = replace(FormatSettings(), line_endings="Preserve", final_newline="Preserve")
+        with Formatter(settings, str(STYLUA)) as formatter:
+            for text, expected in (
+                ("local x=1\r\nlocal y=2\r\n", "local x = 1\r\nlocal y = 2\r\n"),
+                ("local x=1\nlocal y=2", "local x = 1\nlocal y = 2"),
+                ("local x=1\rlocal y=2\r", "local x = 1\rlocal y = 2\r"),
+                ("local x=1\r\nlocal y=2\nreturn x+y", "local x = 1\r\nlocal y = 2\nreturn x + y"),
+                ("local x = 1", "local x = 1"),
+                ("", ""), ("\r\n", "\r\n"),
+            ):
+                with self.subTest(text=repr(text)):
+                    path = self.write(text=text)
+                    result = formatter.check(path)
+                    self.assertNotEqual(result.status, "error", result.error)
+                    self.assertEqual(result.preview, expected)
+                    self.assertFalse({issue.rule for issue in result.issues} & {"LINE_ENDINGS", "FINAL_NEWLINE"})
+                    if result.status == "changed":
+                        apply_result(result, backup=False)
+                    self.assertEqual(formatter.check(path).status, "ok")
+
+    def test_preserve_newlines_inside_strings_and_after_reflow(self):
+        settings = replace(FormatSettings(), line_endings="Preserve", final_newline="Preserve", column_width=20)
+        literal = "[=[first\r\nsecond\nlast]=]"
+        escaped = '"a\\\r\nb"'
+        path = self.write(text=f"local s={literal}\r\nlocal text={escaped}\nlocal values={{first=1,second=2,third=3}}")
+        with Formatter(settings, str(STYLUA)) as formatter:
+            result = formatter.check(path)
+            self.assertEqual(result.status, "changed", result.error)
+            self.assertIn(literal, result.preview)
+            self.assertIn(escaped, result.preview)
+            self.assertIn("    first = 1,", result.preview)
+            self.assertFalse(result.preview.endswith(("\r", "\n")))
+            apply_result(result, backup=False)
+            self.assertEqual(formatter.check(path).status, "ok")
+
+    def test_native_input_modes_preserve_statement_shape_parentheses_and_gaps(self):
+        settings = replace(FormatSettings(), call_parentheses="Input", collapse_simple_statement="Input",
+                           block_newline_gaps="Preserve")
+        path = self.write(text="local function one() return 1 end\nlocal function two()\nreturn 2\nend\n"
+                               "print {1}\nprint({2})\nif true then\n\nprint(1)\n\nend\n")
+        with Formatter(settings, str(STYLUA)) as formatter:
+            result = formatter.check(path)
+            self.assertEqual(result.status, "changed", result.error)
+            self.assertIn("local function one() return 1 end", result.preview)
+            self.assertIn("local function two()\n    return 2\nend", result.preview)
+            self.assertIn("print { 1 }", result.preview)
+            self.assertIn("print({ 2 })", result.preview)
+            self.assertIn("if true then\n\n    print(1)\n\nend", result.preview)
+            apply_result(result, backup=False)
+            self.assertEqual(formatter.check(path).status, "ok")
+
+    def test_cli_can_preserve_newlines_with_flags_or_exported_config(self):
+        path = self.write(text="local x = 1\r\nlocal y = 2")
+        config = self.root / "preserve.toml"
+        config.write_text(replace(FormatSettings(), line_endings="Preserve", final_newline="Preserve").to_toml(), encoding="utf-8")
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            self.assertEqual(main(["scan", str(path), "--line-endings", "Preserve", "--final-newline", "Preserve"]), 0)
+            self.assertEqual(main(["scan", str(path), "--config", str(config)]), 0)
+
+    def test_final_newline_and_line_ending_options_are_independent(self):
+        for settings, source, expected in (
+            (replace(FormatSettings(), final_newline="Preserve"), "local x=1\r\nlocal y=2", "local x = 1\nlocal y = 2"),
+            (replace(FormatSettings(), line_endings="Preserve"), "local x=1\r\nlocal y=2", "local x = 1\r\nlocal y = 2\r\n"),
+        ):
+            with self.subTest(settings=settings), Formatter(settings, str(STYLUA)) as formatter:
+                result = formatter.check(self.write(text=source))
+                self.assertEqual(result.preview, expected, result.error)
 
     def test_long_strings_comments_and_ignore_preserve_contents(self):
         path = self.write(text="-- 注释中的 x=1 不应当变成代码\nlocal text=[=[a  b   \n c\t d]=]\n-- stylua: ignore\nlocal   skip=1\nlocal x=2\n")

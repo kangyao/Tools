@@ -25,12 +25,22 @@ STATUS_LABELS = {"ok": "格式正确", "changed": "格式问题", "error": "检�
 CHOICES = {
     "syntax": ("All", "Lua51", "Lua52", "Lua53", "Lua54", "LuaJIT", "Luau", "CfxLua"),
     "indent_type": ("Spaces", "Tabs"),
-    "line_endings": ("Unix", "Windows"),
+    "line_endings": ("Unix", "Windows", "Preserve"),
+    "final_newline": ("Always", "Preserve"),
     "quote_style": ("AutoPreferDouble", "AutoPreferSingle", "ForceDouble", "ForceSingle"),
     "call_parentheses": ("Always", "NoSingleString", "NoSingleTable", "None", "Input"),
     "collapse_simple_statement": ("Never", "Input", "FunctionOnly", "ConditionalOnly", "Always"),
     "space_after_function_names": ("Never", "Definitions", "Calls", "Always"),
     "block_newline_gaps": ("Never", "Preserve"),
+}
+
+# GUI 使用清晰的中文说明，保存配置与命令行仍使用稳定的枚举值。
+OPTION_LABELS = {
+    "line_endings": {"Preserve": "不处理（保留原换行符）"},
+    "final_newline": {"Always": "补齐末尾换行", "Preserve": "不处理（保留末尾换行状态）"},
+    "call_parentheses": {"Input": "不处理（保留原括号）"},
+    "collapse_simple_statement": {"Input": "不处理（保留原合并方式）"},
+    "block_newline_gaps": {"Preserve": "不处理（保留原空行）"},
 }
 
 
@@ -45,6 +55,7 @@ class FormatSettings:
     indent_width: int = 4
     column_width: int = 120
     line_endings: str = "Unix"
+    final_newline: str = "Always"
     quote_style: str = "AutoPreferDouble"
     call_parentheses: str = "Always"
     collapse_simple_statement: str = "Never"
@@ -60,23 +71,39 @@ class FormatSettings:
             if type(value) is not int or not low <= value <= high:
                 raise FormatError(f"{name} 必须是 {low}～{high} 的整数")
 
-    def to_toml(self) -> str:
+    def to_toml(self, *, for_stylua: bool = False) -> str:
         self.validate()
-        lines = ["# LuaFormatTool 格式规则；可直接供 StyLua 使用"]
-        lines.extend(f"{name} = {json.dumps(value)}" for name, value in asdict(self).items())
+        data = asdict(self)
+        data.pop("final_newline")
+        if self.line_endings == "Preserve":
+            data["line_endings"] = "Unix"
+        lines = ["# LuaFormatTool 格式规则"]
+        lines.extend(f"{name} = {json.dumps(value)}" for name, value in data.items())
         lines.extend(("", "[sort_requires]", "enabled = false", ""))
+        if not for_stylua and (self.line_endings == "Preserve" or self.final_newline == "Preserve"):
+            lines.extend(("# 工具扩展配置；请通过 LuaFormatTool 使用本文件。", "[lua_format_tool]"))
+            if self.line_endings == "Preserve":
+                lines.append('line_endings = "Preserve"')
+            if self.final_newline == "Preserve":
+                lines.append('final_newline = "Preserve"')
+            lines.append("")
         return "\n".join(lines)
 
     @classmethod
     def from_mapping(cls, data: dict) -> FormatSettings:
         known = {item.name for item in fields(cls)}
-        unknown = set(data) - known - {"sort_requires"}
+        unknown = set(data) - known - {"sort_requires", "lua_format_tool"}
         if unknown:
             raise FormatError(f"不支持的规则：{', '.join(sorted(unknown))}")
         sort = data.get("sort_requires", {})
         if not isinstance(sort, dict) or set(sort) - {"enabled"} or sort.get("enabled", False) is not False:
             raise FormatError("本工具不执行 require 排序，请设置 sort_requires.enabled = false")
-        result = cls(**{name: value for name, value in data.items() if name in known})
+        extensions = data.get("lua_format_tool", {})
+        if not isinstance(extensions, dict) or set(extensions) - {"line_endings", "final_newline"}:
+            raise FormatError("lua_format_tool 只支持 line_endings 和 final_newline")
+        values = {name: value for name, value in data.items() if name in known}
+        values.update(extensions)
+        result = cls(**values)
         result.validate()
         return result
 
@@ -164,10 +191,10 @@ def explain_changes(source: str, preview: str, settings: FormatSettings) -> list
     wrong_eol = next((match for match in eols if match.group() != expected_eol), None)
     wrong_before = sum(match.group() != expected_eol for match in eols)
     wrong_after = sum(match.group() != expected_eol for match in re.finditer(r"\r\n|\r|\n", preview))
-    if wrong_eol and wrong_before > wrong_after:
+    if settings.line_endings != "Preserve" and wrong_eol and wrong_before > wrong_after:
         line = len(re.findall(r"\r\n|\r|\n", source[:wrong_eol.start()])) + 1
         issues.append(Issue(line, "LINE_ENDINGS", f"换行符与规则不同，目标为 {'CRLF' if expected_eol == chr(13) + chr(10) else 'LF'}"))
-    if source and not source.endswith(("\n", "\r")) and preview.endswith(("\n", "\r")):
+    if settings.final_newline != "Preserve" and source and not source.endswith(("\n", "\r")) and preview.endswith(("\n", "\r")):
         issues.append(Issue(len(source.splitlines()), "FINAL_NEWLINE", "文件末尾缺少换行"))
     before_lines, after_lines = source.splitlines(), preview.splitlines()
     matcher = difflib.SequenceMatcher(a=before_lines, b=after_lines, autojunk=False)
@@ -200,6 +227,40 @@ def explain_changes(source: str, preview: str, settings: FormatSettings) -> list
         for rule, message in dict.fromkeys(messages):
             issues.append(Issue(start + 1, rule, message, left, right))
     return issues
+
+
+def preserve_newlines(source: str, preview: str, settings: FormatSettings) -> str:
+    """保留原行的换行符；重排产生的新行沿用相邻源行的换行符。"""
+    def split(text: str) -> list[tuple[str, str]]:
+        # 只把 CR/LF 当成物理换行，避免拆开字符串中的 Unicode 分隔符。
+        lines = re.findall(r"[^\r\n]*(?:\r\n|\r|\n|$)", text)
+        return [(line.rstrip("\r\n"), line[len(line.rstrip("\r\n")):]) for line in lines if line]
+
+    before, after = split(source), split(preview)
+    if settings.line_endings == "Preserve":
+        endings = [ending for _, ending in before if ending]
+        fallback = max(dict.fromkeys(endings), key=endings.count) if endings else "\n"
+        matcher = difflib.SequenceMatcher(a=[text for text, _ in before],
+                                          b=[text for text, _ in after], autojunk=False)
+        restored = []
+        for tag, start, end, new_start, new_end in matcher.get_opcodes():
+            for offset, index in enumerate(range(new_start, new_end)):
+                if start < end:
+                    original_ending = before[min(start + offset, end - 1)][1]
+                else:
+                    neighbor = start - 1 if start else start
+                    original_ending = before[neighbor][1] if before else ""
+                text, ending = after[index]
+                restored.append(text + ((original_ending or fallback) if ending else ""))
+        preview = "".join(restored)
+    if settings.final_newline == "Preserve":
+        old_ending = before[-1][1] if before else ""
+        new_ending = re.search(r"(\r\n|\r|\n)$", preview)
+        if old_ending and not new_ending:
+            preview += old_ending if settings.line_endings == "Preserve" else ("\r\n" if settings.line_endings == "Windows" else "\n")
+        elif not old_ending and new_ending:
+            preview = preview[:new_ending.start()]
+    return preview
 
 
 def is_excluded(relative: Path, patterns: tuple[str, ...]) -> bool:
@@ -248,7 +309,7 @@ class Formatter:
         self.executable = resolve_stylua(stylua)
         self._temp = tempfile.TemporaryDirectory(prefix="lua-format-")
         self.config = Path(self._temp.name) / "stylua.toml"
-        self.config.write_text(settings.to_toml(), encoding="utf-8", newline="\n")
+        self.config.write_text(settings.to_toml(for_stylua=True), encoding="utf-8", newline="\n")
 
     def __enter__(self) -> Formatter:
         return self
@@ -265,16 +326,21 @@ class Formatter:
             source, codec, preamble = decode_source(original, self.encoding)
             if "\0" in source:
                 raise FormatError("文件包含 NUL 字符，可能是二进制或编码选择错误")
+            # 使用一致的换行进行 AST 校验，再恢复原有换行；否则 StyLua 的
+            # --verify 会把长字符串中的 CRLF/LF 转换判成 AST 差异。
+            stdin_source = source.replace("\r\n", "\n").replace("\r", "\n") if self.settings.line_endings == "Preserve" else source
             process = subprocess.run(
                 [str(self.executable), "--verify", "--num-threads", "1", "--no-editorconfig", "--config-path", str(self.config),
                  "--stdin-filepath", str(path.resolve()), "-"],
-                input=source.encode("utf-8"), stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                input=stdin_source.encode("utf-8"), stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                 timeout=30, creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
             )
             if process.returncode != 0:
                 detail = process.stderr.decode("utf-8", errors="replace").strip()
                 raise FormatError(detail or f"StyLua 返回错误码 {process.returncode}")
             preview = process.stdout.decode("utf-8")
+            if self.settings.line_endings == "Preserve" or self.settings.final_newline == "Preserve":
+                preview = preserve_newlines(source, preview, self.settings)
             formatted = preamble + preview.encode(codec)
             changed = original != formatted
             return FileResult(path.resolve(), "changed" if changed else "ok",
