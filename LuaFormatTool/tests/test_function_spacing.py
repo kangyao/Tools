@@ -6,7 +6,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from function_spacing import separate_functions
+from function_spacing import collapse_guard_returns, separate_functions
 
 
 class FunctionSpacingTests(unittest.TestCase):
@@ -80,6 +80,50 @@ class FunctionSpacingTests(unittest.TestCase):
         output, missing = separate_functions(source, "Luau")
         self.assertEqual(len(missing), 1)
         self.assertIn("end\n\nfunction second", output)
+
+
+class GuardReturnTests(unittest.TestCase):
+    def test_only_short_bare_returns_are_collapsed(self):
+        source = "if not value then\n    return\nend\n"
+        self.assertEqual(collapse_guard_returns(source, 80, 4), "if not value then return end\n")
+        source = 'if name == "then end" then\n    return\nend\n'
+        self.assertEqual(collapse_guard_returns(source, 80, 4), 'if name == "then end" then return end\n')
+        for source in (
+            'if value then\n    return "important"\nend\n',
+            'if value then\n    return [=[important]=]\nend\n',
+            'if value then\n    return `important`\nend\n',
+            'if value then\n    return false\nend\n',
+            'if value then\n    return compute()\nend\n',
+            'if value then\n    print("test")\nend\n',
+            'if value then\n    return\nelse\n    work()\nend\n',
+            'local function f()\n    return\nend\n',
+        ):
+            with self.subTest(source=source):
+                self.assertEqual(collapse_guard_returns(source, 80, 4), source)
+
+    def test_long_conditions_and_indentation_count_towards_width(self):
+        source = "\tif condition then\n\t\treturn\n\tend\n"
+        expected = "\tif condition then return end\n"
+        width = len(expected.rstrip("\n").expandtabs(4))
+        self.assertEqual(collapse_guard_returns(source, width, 4), expected)
+        self.assertEqual(collapse_guard_returns(source, width - 1, 4), source)
+        source = 'if name == "中文中文中文" then\n    return\nend\n'
+        self.assertEqual(collapse_guard_returns(source, 36, 4), source)
+
+    def test_comments_literals_and_ignore_regions_are_untouched(self):
+        sources = (
+            'local text = [=[if value then\n    return\nend]=]\n',
+            '--[=[if value then\n    return\nend]=]\n',
+            'if value then -- explanation\n    return\nend\n',
+            'if value then\n    -- explanation\n    return\nend\n',
+            'if value then\n    return\nend -- explanation\n',
+            '-- stylua: ignore\nif value then\n    return\nend\n',
+            '-- stylua: ignore\nfunction f()\n    if value then\n        return\n    end\nend\n',
+            '-- stylua: ignore start\nif value then\n    return\nend\n-- stylua: ignore end\n',
+        )
+        for source in sources:
+            with self.subTest(source=source):
+                self.assertEqual(collapse_guard_returns(source, 80, 4), source)
 
 
 if __name__ == "__main__":

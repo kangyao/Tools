@@ -243,7 +243,8 @@ class LuaFormatWindow:
                 ttk.Combobox(frame, textvariable=variable, values=values, state="readonly", width=30).pack(fill="x")
             else:
                 ttk.Entry(frame, textvariable=variable, width=30).pack(fill="x")
-        ttk.Label(body, text="“不处理”保留对应输入样式；简单语句过长时仍受参考行宽影响。\n"
+        ttk.Label(body, text="“仅短条件提前返回”只合并 if ... then return end，超过参考行宽时保持多行。\n"
+                            "“不处理”保留对应输入样式；其他合并模式也受参考行宽影响。\n"
                             "缩进、字符串引号、函数名后空格和参考行宽由 StyLua 统一处理，暂不支持单独关闭。",
                   wraplength=580).pack(fill="x", pady=(8, 0))
         options = ttk.LabelFrame(body, text="文件处理", padding=10)

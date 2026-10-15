@@ -1,8 +1,9 @@
-"""在相邻的命名函数之间补空行，跳过 Lua 字面量、注释和忽略区域。"""
+"""Lua 函数间距和短条件提前返回布局，跳过字面量、注释和忽略区域。"""
 
 from __future__ import annotations
 
 import re
+import unicodedata
 from bisect import bisect_right
 
 
@@ -17,8 +18,8 @@ IDENTIFIER = re.compile(r"[A-Za-z_][A-Za-z_0-9]*\Z")
 IGNORE = re.compile(r"--\s*stylua:\s*ignore(?:\s+(start|end))?\s*\Z")
 
 
-def separate_functions(text: str, syntax: str = "Lua54") -> tuple[str, list[int]]:
-    """返回补空行后的文本及原文本中缺少间距的下一函数行号。"""
+def analyze_layout(text: str, syntax: str = "Lua54") -> tuple:
+    """提取可用于空白调整的代码、忽略范围和相邻函数边界。"""
     directives = []
     non_code_spans = []
 
@@ -32,7 +33,7 @@ def separate_functions(text: str, syntax: str = "Lua54") -> tuple[str, list[int]
     code = NON_CODE.sub(mask, text)
     tokens = list(TOKEN.finditer(code))
     if not tokens:
-        return text, []
+        return code, [], non_code_spans, []
     values = [token.group() for token in tokens]
     token_offsets = [token.start() for token in tokens]
     # 以词法块配对 end，避免将 if/循环的 end 当成函数结束。
@@ -106,11 +107,16 @@ def separate_functions(text: str, syntax: str = "Lua54") -> tuple[str, list[int]
             ignored.append((start, tokens[min(last, len(tokens) - 1)].end()))
     if ignore_start is not None:
         ignored.append((ignore_start, len(text)))
+    return code, ignored, non_code_spans, [(tokens[previous].end(), tokens[current].start()) for previous, current in candidates]
+
+
+def separate_functions(text: str, syntax: str = "Lua54") -> tuple[str, list[int]]:
+    """返回补空行后的文本及原文本中缺少间距的下一函数行号。"""
+    _, ignored, non_code_spans, candidates = analyze_layout(text, syntax)
 
     line_starts = [0] + [match.end() for match in re.finditer(r"\r\n|\r|\n", text)]
     insertions = {}
-    for previous, current in candidates:
-        end_offset, start_offset = tokens[previous].end(), tokens[current].start()
+    for end_offset, start_offset in candidates:
         if any(start <= start_offset < end or start <= end_offset - 1 < end for start, end in ignored):
             continue
         old_line = bisect_right(line_starts, end_offset - 1) - 1
@@ -136,3 +142,34 @@ def separate_functions(text: str, syntax: str = "Lua54") -> tuple[str, list[int]
     for position, (ending, _) in sorted(insertions.items(), reverse=True):
         output = output[:position] + ending + output[position:]
     return output, [line for _, line in insertions.values()]
+
+
+def collapse_guard_returns(text: str, column_width: int, indent_width: int, syntax: str = "Lua54") -> str:
+    """只合并无返回值、无注释、无分支且不超过行宽的提前返回条件块。"""
+    code, ignored, non_code_spans, _ = analyze_layout(text, syntax)
+    pattern = re.compile(
+        r"(?m)^(?P<indent>[ \t]*)if (?P<condition>[^\r\n]+) then[ \t]*(?:\r\n|\r|\n)"
+        r"(?P<body>[ \t]+return[ \t]*)(?:\r\n|\r|\n)(?P=indent)end\b"
+    )
+    edits = []
+    for match in pattern.finditer(code):
+        start, end = match.span()
+        if text[match.start("body"):match.end("body")].strip() != "return":
+            continue  # 被遮罩的字符串仍然是返回值，不能误删。
+        if any(left < end and start < right for left, right in ignored):
+            continue
+        # 注释不能随换行一起搬动；字符串内容则保留原始字节对应的文本。
+        if any(left < end and start < right and text.startswith("--", left) for left, right in non_code_spans):
+            continue
+        tail = re.match(r"[^\r\n]*", text[end:]).group()
+        if tail.strip():
+            continue
+        condition = text[match.start("condition"):match.end("condition")].strip()
+        line = f"{match.group('indent')}if {condition} then return end"
+        width = sum(0 if unicodedata.combining(char) else 2 if unicodedata.east_asian_width(char) in ("W", "F") else 1
+                    for char in line.expandtabs(indent_width))
+        if width <= column_width:
+            edits.append((start, end, line))
+    for start, end, line in reversed(edits):
+        text = text[:start] + line + text[end:]
+    return text

@@ -35,6 +35,15 @@ class SettingsTests(unittest.TestCase):
             self.assertEqual(imported.indent_type, "Tabs")
             self.assertEqual(imported.syntax, "All")
             self.assertEqual(imported.column_width, 80)
+            self.assertEqual(imported.collapse_simple_statement, "Never")
+
+    def test_guard_return_mode_round_trips_without_passing_custom_value_to_stylua(self):
+        settings = FormatSettings()
+        self.assertEqual(settings.collapse_simple_statement, "GuardReturn")
+        self.assertEqual(FormatSettings.from_mapping(tomllib.loads(settings.to_toml())), settings)
+        runtime = settings.to_toml(for_stylua=True)
+        self.assertNotIn("GuardReturn", runtime)
+        self.assertIn('collapse_simple_statement = "Never"', runtime)
 
     def test_preserve_options_round_trip_and_runtime_config(self):
         settings = replace(FormatSettings(), line_endings="Preserve", final_newline="Preserve",
@@ -268,6 +277,27 @@ class IntegrationTests(unittest.TestCase):
             self.assertIn("print { 1 }", result.preview)
             self.assertIn("print({ 2 })", result.preview)
             self.assertIn("if true then\n\n    print(1)\n\nend", result.preview)
+            apply_result(result, backup=False)
+            self.assertEqual(formatter.check(path).status, "ok")
+
+    def test_default_only_collapses_short_bare_return_guards(self):
+        source = ('local function f(value)\n'
+                  '    if not value then\n        return\n    end\n'
+                  '    if value == 1 then return "keep this value" end\n'
+                  '    if value == 2 then print("keep this statement") end\n'
+                  '    if value == 3 then return else print("keep branch") end\n'
+                  '    if a_very_long_condition_name and another_very_long_condition_name and third_condition_name then return end\n'
+                  'end\nlocal function g() return "do not collapse function" end\n')
+        path = self.write(text=source)
+        with Formatter(replace(FormatSettings(), column_width=80), str(STYLUA)) as formatter:
+            result = formatter.check(path)
+            self.assertEqual(result.status, "changed", result.error)
+            self.assertIn("    if not value then return end", result.preview)
+            self.assertIn('if value == 1 then\n        return "keep this value"\n    end', result.preview)
+            self.assertIn('if value == 2 then\n        print("keep this statement")\n    end', result.preview)
+            self.assertIn('if value == 3 then\n        return\n    else', result.preview)
+            self.assertNotIn('third_condition_name then return end', result.preview)
+            self.assertIn('local function g()\n    return "do not collapse function"\nend', result.preview)
             apply_result(result, backup=False)
             self.assertEqual(formatter.check(path).status, "ok")
 

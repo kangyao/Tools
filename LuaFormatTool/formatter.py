@@ -18,7 +18,7 @@ from dataclasses import asdict, dataclass, field, fields
 from pathlib import Path
 from typing import Callable, Iterator
 
-from function_spacing import separate_functions
+from function_spacing import collapse_guard_returns, separate_functions
 
 APP_DIR = Path(__file__).resolve().parent
 DEFAULT_EXCLUDES = (".git", ".svn", ".venv", "node_modules", "__pycache__")
@@ -30,7 +30,7 @@ CHOICES = {
     "final_newline": ("Always", "Preserve"),
     "quote_style": ("AutoPreferDouble", "AutoPreferSingle", "ForceDouble", "ForceSingle"),
     "call_parentheses": ("Always", "NoSingleString", "NoSingleTable", "None", "Input"),
-    "collapse_simple_statement": ("Never", "Input", "FunctionOnly", "ConditionalOnly", "Always"),
+    "collapse_simple_statement": ("GuardReturn", "Never", "Input", "FunctionOnly", "ConditionalOnly", "Always"),
     "space_after_function_names": ("Never", "Definitions", "Calls", "Always"),
     "block_newline_gaps": ("Never", "Preserve"),
     "function_spacing": ("Always", "Preserve"),
@@ -41,7 +41,9 @@ OPTION_LABELS = {
     "line_endings": {"Preserve": "不处理（保留原换行符）"},
     "final_newline": {"Always": "补齐末尾换行", "Preserve": "不处理（保留末尾换行状态）"},
     "call_parentheses": {"Input": "不处理（保留原括号）"},
-    "collapse_simple_statement": {"Input": "不处理（保留原合并方式）"},
+    "collapse_simple_statement": {"GuardReturn": "仅短条件提前返回（无返回值）", "Never": "从不合并",
+                                  "Input": "不处理（保留原合并方式）", "FunctionOnly": "合并简单函数",
+                                  "ConditionalOnly": "合并简单条件块（含其他语句）", "Always": "合并所有简单语句"},
     "block_newline_gaps": {"Preserve": "不处理（保留原空行）"},
     "function_spacing": {"Always": "函数之间至少一行空行", "Preserve": "不处理（不强制函数间空行）"},
 }
@@ -61,7 +63,7 @@ class FormatSettings:
     final_newline: str = "Always"
     quote_style: str = "AutoPreferDouble"
     call_parentheses: str = "Always"
-    collapse_simple_statement: str = "Never"
+    collapse_simple_statement: str = "GuardReturn"
     space_after_function_names: str = "Never"
     block_newline_gaps: str = "Never"
     function_spacing: str = "Always"
@@ -82,6 +84,8 @@ class FormatSettings:
         data.pop("function_spacing")
         if self.line_endings == "Preserve":
             data["line_endings"] = "Unix"
+        if self.collapse_simple_statement == "GuardReturn":
+            data["collapse_simple_statement"] = "Never"
         lines = ["# LuaFormatTool 格式规则"]
         lines.extend(f"{name} = {json.dumps(value)}" for name, value in data.items())
         lines.extend(("", "[sort_requires]", "enabled = false", ""))
@@ -92,6 +96,8 @@ class FormatSettings:
             if self.final_newline == "Preserve":
                 lines.append('final_newline = "Preserve"')
             lines.append(f'function_spacing = "{self.function_spacing}"')
+            if self.collapse_simple_statement == "GuardReturn":
+                lines.append('collapse_simple_statement = "GuardReturn"')
             lines.append("")
         return "\n".join(lines)
 
@@ -105,8 +111,8 @@ class FormatSettings:
         if not isinstance(sort, dict) or set(sort) - {"enabled"} or sort.get("enabled", False) is not False:
             raise FormatError("本工具不执行 require 排序，请设置 sort_requires.enabled = false")
         extensions = data.get("lua_format_tool", {})
-        if not isinstance(extensions, dict) or set(extensions) - {"line_endings", "final_newline", "function_spacing"}:
-            raise FormatError("lua_format_tool 只支持 line_endings、final_newline 和 function_spacing")
+        if not isinstance(extensions, dict) or set(extensions) - {"line_endings", "final_newline", "function_spacing", "collapse_simple_statement"}:
+            raise FormatError("lua_format_tool 只支持 line_endings、final_newline、function_spacing 和 collapse_simple_statement")
         values = {name: value for name, value in data.items() if name in known}
         values.update(extensions)
         result = cls(**values)
@@ -117,7 +123,7 @@ class FormatSettings:
     def load(cls, path: Path) -> FormatSettings:
         try:
             # 导入 StyLua 文件时，缺省值遵循 StyLua，而新建工具配置默认使用空格/Lua54。
-            defaults = asdict(cls(syntax="All", indent_type="Tabs"))
+            defaults = asdict(cls(syntax="All", indent_type="Tabs", collapse_simple_statement="Never"))
             defaults.update(tomllib.loads(path.read_text(encoding="utf-8-sig")))
             return cls.from_mapping(defaults)
         except (OSError, ValueError, TypeError) as exc:
@@ -348,6 +354,8 @@ class Formatter:
                 detail = process.stderr.decode("utf-8", errors="replace").strip()
                 raise FormatError(detail or f"StyLua 返回错误码 {process.returncode}")
             preview = process.stdout.decode("utf-8")
+            if self.settings.collapse_simple_statement == "GuardReturn":
+                preview = collapse_guard_returns(preview, self.settings.column_width, self.settings.indent_width, self.settings.syntax)
             if self.settings.function_spacing == "Always":
                 preview, _ = separate_functions(preview, self.settings.syntax)
             if self.settings.line_endings == "Preserve" or self.settings.final_newline == "Preserve":

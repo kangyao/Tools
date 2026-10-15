@@ -175,6 +175,13 @@ class GuiTests(unittest.TestCase):
         self.assertEqual(self.window.config_variables["function_spacing"].get(), OPTION_LABELS["function_spacing"]["Always"])
         self.window.close_config_panel()
 
+    def test_short_guard_return_mode_has_readable_label(self):
+        self.assertEqual(self.window.get_settings().collapse_simple_statement, "GuardReturn")
+        self.window.open_config_panel()
+        self.assertEqual(self.window.config_variables["collapse_simple_statement"].get(), OPTION_LABELS["collapse_simple_statement"]["GuardReturn"])
+        self.window.apply_config_panel()
+        self.assertEqual(self.window.get_settings().collapse_simple_statement, "GuardReturn")
+
     def test_report_contains_only_checked_files_and_no_stale_rules(self):
         source = self.directory / "test.lua"
         source.write_bytes(b"local x=1\n")

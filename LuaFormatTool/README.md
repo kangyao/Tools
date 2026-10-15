@@ -46,18 +46,32 @@ python D:\git\skills\Tools\LuaFormatTool\install_stylua.py
 | 文件末尾换行 | Always | 补齐末尾换行；不处理时保留原文件末尾有无换行的状态 |
 | 字符串引号 | AutoPreferDouble | 优先双引号、优先单引号、强制双引号或强制单引号 |
 | 调用括号 | Always | 单字符串/表参数调用的括号风格；不处理对应 Input，保留原括号 |
-| 合并简单语句 | Never | 简单函数和条件是否合并到一行；不处理对应 Input，保留原合并方式 |
+| 合并简单语句 | GuardReturn | 仅短条件提前返回：只将不带返回值的 `if ... then return end` 合为一行；不处理对应 Input |
 | 函数名后空格 | Never | 定义、调用或两者添加空格 |
 | 块首尾空行 | Never | 不处理对应 Preserve，保留块首尾原有空行 |
 | 函数之间空行 | Always | 相邻函数之间至少一行空行；不处理对应 Preserve，不额外强制补空行 |
 
 **函数之间空行** 默认启用，覆盖普通函数、局部函数、方法及 `local f = function(...)` / `Module.f = function(...)` 形式的定义，也支持嵌套函数。下一函数的说明注释和 `---@param` 等注解保持与函数相连，空行补在注释之前；已有空行不会重复添加。字符串、长注释和 `stylua: ignore` 区域不参与补空行。此规则与“块首尾空行”独立：前者分隔相邻函数，后者控制函数或条件块内部首尾的空行。
 
+**仅短条件提前返回（无返回值）** 默认启用。只有无内部空行、无注释、无 `else` / `elseif` 分支，并且整行（含缩进）不超过参考行宽的 `if ... then return end` 才会合并。`return value`、函数体、普通执行语句和过长条件块保持多行；字符串、注释与 `stylua: ignore` 区域保持原样。其他布局仍由 StyLua 按参考行宽处理。可在下拉框中显式选择原有的“不处理”或其他合并模式。
+
+```lua
+if not target then return end
+
+if not target then
+    return "missing target"
+end
+
+if target then
+    target:Update()
+end
+```
+
 可在 **格式配置** 的下拉框中选择 **不处理**。需要保留哪些样式就单独选择。换行符和文件末尾换行是独立选项：两个都选“不处理”才会同时保留换行符种类和末尾有无换行。混合换行文件按源行对齐保留，自动折行等布局变化产生的新行沿用对应或相邻源行的换行符；无可参考的换行符时使用 LF。简单语句选择 Input 后，过长的单行语句仍可能因参考行宽而折行。
 
 缩进、字符串引号、函数名后空格和参考行宽没有 StyLua 提供的独立停用模式，仍按选定规则格式化。需要完整保留某段代码时，可以在代码中使用官方的 `-- stylua: ignore`，或 `-- stylua: ignore start` / `-- stylua: ignore end`。
 
-配置格式和参数含义参见 [StyLua 2.6.0 官方文档](https://github.com/JohnnyMorganz/StyLua/blob/v2.6.0/README.md#configuration)。导入 TOML 时，未指定的 StyLua 原有字段遵循其默认值（包括 Tab 缩进和 All 语法）；新建工具配置采用上表默认值。工具专有的换行保留和函数间距选项保存在 `[lua_format_tool]` 中；缺少该扩展段的旧配置也默认启用函数间空行。本工具调用 StyLua 时会移除该扩展段，再补齐函数间空行、恢复对应的换行状态。
+配置格式和参数含义参见 [StyLua 2.6.0 官方文档](https://github.com/JohnnyMorganz/StyLua/blob/v2.6.0/README.md#configuration)。导入 TOML 时，未指定的 StyLua 原有字段遵循其默认值（包括 Tab 缩进、All 语法和不合并语句）；新建工具配置采用上表默认值。工具专有的换行保留、函数间距和 GuardReturn 选项保存在 `[lua_format_tool]` 中；缺少该扩展段的旧配置也默认启用函数间空行。GuardReturn 模式先让 StyLua 按 Never 展开语句，再仅合并符合条件的短提前返回，之后补齐函数间空行、恢复对应的换行状态。
 
 扫描只使用界面设置或显式传入的 `--config`，不会自动读取目标目录的 `.stylua.toml`、`.editorconfig`、`.gitignore` 或 `.styluaignore`。项目已有规则时请先导入，目录和文件过滤通过工具的排除规则设置。`require` 排序始终关闭；导入启用排序的配置会明确报错。
 
@@ -83,6 +97,9 @@ python lua_format_tool.py scan D:\Projects\Scripts --line-endings Preserve --fin
 
 # 不额外强制函数之间留空行（默认 Always，可省略）
 python lua_format_tool.py scan D:\Projects\Scripts --function-spacing Preserve
+
+# 只合并短的 if ... then return end（工具默认模式）
+python lua_format_tool.py scan D:\Projects\Scripts --collapse-simple-statement GuardReturn
 
 # 格式化预览，不写文件
 python lua_format_tool.py format D:\Projects\Scripts --config stylua.toml --diff
