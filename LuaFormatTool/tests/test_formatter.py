@@ -9,6 +9,7 @@ import stat
 import sys
 import tempfile
 import threading
+import tomllib
 import unittest
 from dataclasses import replace
 from pathlib import Path
@@ -46,7 +47,10 @@ class SettingsTests(unittest.TestCase):
         runtime = settings.to_toml(for_stylua=True)
         self.assertNotIn("[lua_format_tool]", runtime)
         self.assertNotIn("final_newline", runtime)
+        self.assertNotIn("function_spacing", runtime)
         self.assertIn('line_endings = "Unix"', runtime)
+        disabled = replace(settings, function_spacing="Preserve")
+        self.assertEqual(FormatSettings.from_mapping(tomllib.loads(disabled.to_toml())), disabled)
 
     def test_reject_invalid_and_unsafe_rules(self):
         for data in ({"indent_width": True}, {"indent_width": 0}, {"column_width": 5},
@@ -266,6 +270,30 @@ class IntegrationTests(unittest.TestCase):
             self.assertIn("if true then\n\n    print(1)\n\nend", result.preview)
             apply_result(result, backup=False)
             self.assertEqual(formatter.check(path).status, "ok")
+
+    def test_function_spacing_preview_write_and_opt_out(self):
+        source = "local function first()\n    return 1\nend\n---@param value integer\nfunction Panel:second(value)\n    return value\nend"
+        path = self.write(text=source.replace("\n", "\r\n"))
+        settings = replace(FormatSettings(), line_endings="Preserve", final_newline="Preserve")
+        with Formatter(settings, str(STYLUA)) as formatter:
+            result = formatter.check(path)
+            self.assertEqual(result.status, "changed", result.error)
+            self.assertIn("end\r\n\r\n---@param value integer\r\nfunction", result.preview)
+            self.assertFalse(result.preview.endswith(("\r", "\n")))
+            self.assertIn("FUNCTION_SPACING", {issue.rule for issue in result.issues})
+            self.assertEqual(path.read_bytes(), source.replace("\n", "\r\n").encode())
+            apply_result(result, backup=False)
+            self.assertEqual(formatter.check(path).status, "ok")
+        path.write_bytes(source.replace("\n", "\r\n").encode())
+        with Formatter(replace(settings, function_spacing="Preserve"), str(STYLUA)) as formatter:
+            result = formatter.check(path)
+            self.assertEqual(result.status, "ok", result.error)
+
+    def test_cli_can_disable_function_spacing(self):
+        path = self.write(text="function first()\n    return 1\nend\nfunction second()\n    return 2\nend\n")
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            self.assertEqual(main(["scan", str(path)]), 1)
+            self.assertEqual(main(["scan", str(path), "--function-spacing", "Preserve"]), 0)
 
     def test_cli_can_preserve_newlines_with_flags_or_exported_config(self):
         path = self.write(text="local x = 1\r\nlocal y = 2")

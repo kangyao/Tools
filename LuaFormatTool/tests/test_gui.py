@@ -117,7 +117,7 @@ class GuiTests(unittest.TestCase):
         self.window.open_config_panel()
         for name, value in (("line_endings", "Preserve"), ("final_newline", "Preserve"),
                             ("collapse_simple_statement", "Input"), ("call_parentheses", "Input"),
-                            ("block_newline_gaps", "Preserve")):
+                            ("block_newline_gaps", "Preserve"), ("function_spacing", "Preserve")):
             self.window.config_variables[name].set(OPTION_LABELS[name][value])
         expected = self.window.get_settings(self.window.config_variables)
         self.assertEqual(expected.line_endings, "Preserve")
@@ -146,6 +146,12 @@ class GuiTests(unittest.TestCase):
         self.wait_idle()
         self.assertIn("已被修改", self.window.results[str(source)].error)
         self.assertEqual(source.read_bytes(), b"local newer = true\n")
+
+    def test_function_spacing_is_enabled_for_existing_configs(self):
+        self.assertEqual(self.window.get_settings().function_spacing, "Always")
+        self.window.open_config_panel()
+        self.assertEqual(self.window.config_variables["function_spacing"].get(), OPTION_LABELS["function_spacing"]["Always"])
+        self.window.close_config_panel()
 
     def test_report_uses_scanned_rules_after_controls_change(self):
         source = self.directory / "test.lua"

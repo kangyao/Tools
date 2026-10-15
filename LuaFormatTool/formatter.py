@@ -18,6 +18,7 @@ from dataclasses import asdict, dataclass, field, fields
 from pathlib import Path
 from typing import Callable, Iterator
 
+from function_spacing import separate_functions
 
 APP_DIR = Path(__file__).resolve().parent
 DEFAULT_EXCLUDES = (".git", ".svn", ".venv", "node_modules", "__pycache__")
@@ -32,6 +33,7 @@ CHOICES = {
     "collapse_simple_statement": ("Never", "Input", "FunctionOnly", "ConditionalOnly", "Always"),
     "space_after_function_names": ("Never", "Definitions", "Calls", "Always"),
     "block_newline_gaps": ("Never", "Preserve"),
+    "function_spacing": ("Always", "Preserve"),
 }
 
 # GUI 使用清晰的中文说明，保存配置与命令行仍使用稳定的枚举值。
@@ -41,6 +43,7 @@ OPTION_LABELS = {
     "call_parentheses": {"Input": "不处理（保留原括号）"},
     "collapse_simple_statement": {"Input": "不处理（保留原合并方式）"},
     "block_newline_gaps": {"Preserve": "不处理（保留原空行）"},
+    "function_spacing": {"Always": "函数之间至少一行空行", "Preserve": "不处理（不强制函数间空行）"},
 }
 
 
@@ -61,6 +64,7 @@ class FormatSettings:
     collapse_simple_statement: str = "Never"
     space_after_function_names: str = "Never"
     block_newline_gaps: str = "Never"
+    function_spacing: str = "Always"
 
     def validate(self) -> None:
         for name, choices in CHOICES.items():
@@ -75,17 +79,19 @@ class FormatSettings:
         self.validate()
         data = asdict(self)
         data.pop("final_newline")
+        data.pop("function_spacing")
         if self.line_endings == "Preserve":
             data["line_endings"] = "Unix"
         lines = ["# LuaFormatTool 格式规则"]
         lines.extend(f"{name} = {json.dumps(value)}" for name, value in data.items())
         lines.extend(("", "[sort_requires]", "enabled = false", ""))
-        if not for_stylua and (self.line_endings == "Preserve" or self.final_newline == "Preserve"):
+        if not for_stylua:
             lines.extend(("# 工具扩展配置；请通过 LuaFormatTool 使用本文件。", "[lua_format_tool]"))
             if self.line_endings == "Preserve":
                 lines.append('line_endings = "Preserve"')
             if self.final_newline == "Preserve":
                 lines.append('final_newline = "Preserve"')
+            lines.append(f'function_spacing = "{self.function_spacing}"')
             lines.append("")
         return "\n".join(lines)
 
@@ -99,8 +105,8 @@ class FormatSettings:
         if not isinstance(sort, dict) or set(sort) - {"enabled"} or sort.get("enabled", False) is not False:
             raise FormatError("本工具不执行 require 排序，请设置 sort_requires.enabled = false")
         extensions = data.get("lua_format_tool", {})
-        if not isinstance(extensions, dict) or set(extensions) - {"line_endings", "final_newline"}:
-            raise FormatError("lua_format_tool 只支持 line_endings 和 final_newline")
+        if not isinstance(extensions, dict) or set(extensions) - {"line_endings", "final_newline", "function_spacing"}:
+            raise FormatError("lua_format_tool 只支持 line_endings、final_newline 和 function_spacing")
         values = {name: value for name, value in data.items() if name in known}
         values.update(extensions)
         result = cls(**values)
@@ -186,6 +192,9 @@ def decode_source(raw: bytes, encoding: str = "auto") -> tuple[str, str, bytes]:
 def explain_changes(source: str, preview: str, settings: FormatSettings) -> list[Issue]:
     """只解释实际变化的区域；布局/引号分类是差异推断，不执行 Lua 语义检查。"""
     issues: list[Issue] = []
+    if settings.function_spacing == "Always":
+        _, missing = separate_functions(source, settings.syntax)
+        issues.extend(Issue(line, "FUNCTION_SPACING", "相邻函数之间需要至少一行空行（放在下一函数的注释之前）") for line in missing)
     expected_eol = "\r\n" if settings.line_endings == "Windows" else "\n"
     eols = list(re.finditer(r"\r\n|\r|\n", source))
     wrong_eol = next((match for match in eols if match.group() != expected_eol), None)
@@ -339,6 +348,8 @@ class Formatter:
                 detail = process.stderr.decode("utf-8", errors="replace").strip()
                 raise FormatError(detail or f"StyLua 返回错误码 {process.returncode}")
             preview = process.stdout.decode("utf-8")
+            if self.settings.function_spacing == "Always":
+                preview, _ = separate_functions(preview, self.settings.syntax)
             if self.settings.line_endings == "Preserve" or self.settings.final_newline == "Preserve":
                 preview = preserve_newlines(source, preview, self.settings)
             formatted = preamble + preview.encode(codec)

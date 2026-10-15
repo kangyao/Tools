@@ -22,6 +22,7 @@ FIELD_LABELS = {
     "column_width": "参考行宽", "line_endings": "换行符", "final_newline": "文件末尾换行", "quote_style": "字符串引号",
     "call_parentheses": "调用括号", "collapse_simple_statement": "合并简单语句",
     "space_after_function_names": "函数名后空格", "block_newline_gaps": "块首尾空行",
+    "function_spacing": "函数之间空行",
 }
 
 
@@ -163,7 +164,8 @@ class LuaFormatWindow:
         settings = self.get_settings()
         indent = f"{settings.indent_width} 个空格" if settings.indent_type == "Spaces" else f"Tab（宽度 {settings.indent_width}）"
         newline = {"Unix": "LF", "Windows": "CRLF", "Preserve": "换行符不处理"}[settings.line_endings]
-        self.rule_summary.set(f"当前格式：{settings.syntax} · {indent} · 行宽 {settings.column_width} · {newline} · {settings.quote_style}")
+        spacing = "函数间留空行" if settings.function_spacing == "Always" else "函数间距不处理"
+        self.rule_summary.set(f"当前格式：{settings.syntax} · {indent} · 行宽 {settings.column_width} · {newline} · {settings.quote_style} · {spacing}")
 
     def open_config_panel(self) -> None:
         if self.busy:
