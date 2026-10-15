@@ -39,7 +39,9 @@ from launch_profiles import (
 )
 from persistent_debug_server import PersistentDebugOptions, run_embedded_debug_server
 from profile_manager import ProfileManagerWindow
-from window_layout import LayoutResult, LayoutTarget, WindowLayoutService
+from window_layout import (
+    LaunchLayoutEntry, LayoutResult, LayoutTarget, Rect, WindowLayoutService, initial_window_size,
+)
 
 
 TOOL_DIR = Path(__file__).resolve().parent
@@ -90,6 +92,7 @@ class DebugLauncherApp:
         self.layout_cancel = threading.Event()
         self.layout_generation = 0
         self.layout_thread: threading.Thread | None = None
+        self.pair_launch_prepositioned = False
         self.profile_manager: ProfileManagerWindow | None = None
         self.role_controls: dict[NetworkRole, _RoleControls] = {}
         self.client_delay_var = tk.StringVar(value="2")
@@ -168,7 +171,7 @@ class DebugLauncherApp:
         ttk.Label(pair_bar, text="秒启动 Client").pack(side=tk.LEFT, padx=(5, 0))
         self.auto_tile_windows_button = ttk.Checkbutton(
             pair_bar,
-            text="启动或重启后自动平铺 App 窗口",
+            text="自动平铺 App 窗口",
             variable=self.auto_tile_windows_var,
             command=self._on_auto_tile_windows_changed,
         )
@@ -567,6 +570,57 @@ class DebugLauncherApp:
         self.layout_thread = None
         self._append_log(f"自动平铺 App 窗口失败：{error}", error=True)
 
+    def _prepare_pair_layout(
+        self, host: LauncherSettings, client: LauncherSettings, count: int,
+    ) -> tuple[LauncherSettings, tuple[Rect, ...] | None]:
+        self.pair_launch_prepositioned = False
+        if not self.auto_tile_windows_var.get():
+            return host, None
+        entries: list[LaunchLayoutEntry] = []
+        reuse_host = any(
+            snapshot.settings is not None
+            and snapshot.settings.network.role is NetworkRole.HOST
+            and snapshot.settings.network.port == host.network.port
+            for snapshot in self.snapshots_by_id.values()
+        )
+        new_host = not host.network.is_dedicated and not reuse_host
+        if new_host:
+            entries.append(LaunchLayoutEntry(initial_window_size(host.executable)))
+        for target in self._layout_targets():
+            settings = self.snapshots_by_id[target.instance_id].settings
+            assert settings is not None
+            entries.append(LaunchLayoutEntry(initial_window_size(settings.executable), target))
+        client_offset = len(entries)
+        entries.extend(LaunchLayoutEntry(initial_window_size(client.executable)) for _ in range(count))
+        try:
+            layout = self.window_layout_service.plan_launch(entries)
+        except Exception as exc:
+            self._append_log(f"预设启动窗口位置失败，启动后重试平铺：{exc}", error=True)
+            return host, None
+        self.pair_launch_prepositioned = True
+        self.layout_cancel = threading.Event()
+        if new_host:
+            host = replace(host, initial_window_rect=layout[0])
+        return host, layout[client_offset:]
+
+    def _start_initial_window_layout(self, snapshot: ControllerSnapshot) -> None:
+        settings = snapshot.settings
+        if (settings is None or settings.initial_window_rect is None or snapshot.pid is None
+                or self.closing or not self.auto_tile_windows_var.get()):
+            return
+        generation, cancel = self.layout_generation, self.layout_cancel
+        target = LayoutTarget(snapshot.instance_id, snapshot.pid)
+
+        def worker() -> None:
+            try:
+                result = self.window_layout_service.place_on_start(target, settings.initial_window_rect, cancel)
+            except Exception as exc:
+                self.events.put(("window_layout_failed", (generation, exc)))
+            else:
+                self.events.put(("window_layout_finished", (generation, result)))
+
+        threading.Thread(target=worker, name=f"initial-window-{snapshot.instance_id}", daemon=True).start()
+
     # ----- launching ----------------------------------------------------------------------------
 
     def _start_role(self, role: NetworkRole) -> None:
@@ -628,6 +682,7 @@ class DebugLauncherApp:
             return
         self._cancel_window_layout()
         self.launch_cancel.clear()
+        host_settings, client_rects = self._prepare_pair_layout(host_settings, client_settings, count)
         self._run_async(
             f"正在启动 Host + {count} 个 Client…",
             lambda: self.controller.start_pair(
@@ -636,6 +691,8 @@ class DebugLauncherApp:
                 cancel=self.launch_cancel,
                 on_host_started=lambda snapshot, reused: self.events.put(("pair_host", (snapshot, reused))),
                 host_label=host.name, client_label=client.name,
+                client_window_rects=client_rects,
+                on_client_started=lambda snapshot: self.events.put(("pair_client", snapshot)),
             ),
             self._on_pair_started,
         )
@@ -658,7 +715,8 @@ class DebugLauncherApp:
     def _on_client_started(self, result: object) -> None:
         if not isinstance(result, ControllerSnapshot):
             return
-        self._on_instance_started(result)
+        if result.instance_id not in self.snapshots_by_id:
+            self._on_instance_started(result)
         self._render_instances()
         self.instance_tree.selection_set(str(result.instance_id))
 
@@ -682,7 +740,8 @@ class DebugLauncherApp:
         self.instance_tree.selection_set([
             str(snapshot.instance_id) for snapshot in (result.host, *result.clients)
         ])
-        self._request_window_layout()
+        if not self.pair_launch_prepositioned:
+            self._request_window_layout()
         if result.error and not self.closing:
             self._show_error("Client 未全部启动", LauncherError(
                 f"已启动 {len(result.clients)} / {result.requested_clients} 个 Client。\n{result.error}"
@@ -832,6 +891,7 @@ class DebugLauncherApp:
         if not isinstance(snapshot, ControllerSnapshot):
             return
         self.snapshots_by_id[snapshot.instance_id] = snapshot
+        self._start_initial_window_layout(snapshot)
         if snapshot.debug_ports is not None:
             self._start_debug_service(snapshot.debug_ports)
         self._append_log(
@@ -1007,6 +1067,9 @@ class DebugLauncherApp:
                 snapshot, reused = payload
                 self._on_host_started(snapshot, reused, request_layout=False)
                 self.status_var.set("Host 已启动，正在准备 Client…")
+                continue
+            if kind == "pair_client":
+                self._on_client_started(payload)
                 continue
             if kind == "window_layout_finished":
                 generation, result = payload  # type: ignore[misc]

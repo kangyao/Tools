@@ -6,9 +6,11 @@ from dataclasses import dataclass
 from fractions import Fraction
 import math
 import os
+from pathlib import Path
 import threading
 import time
 from typing import Callable, Collection, Protocol, Sequence
+import xml.etree.ElementTree as ET
 
 
 WS_CHILD = 0x40000000
@@ -43,6 +45,25 @@ class Rect:
 class LayoutTarget:
     instance_id: int
     pid: int
+
+
+@dataclass(frozen=True)
+class LaunchLayoutEntry:
+    size: tuple[int, int]
+    target: LayoutTarget | None = None
+
+
+def initial_window_size(executable: str) -> tuple[int, int]:
+    """Read the native window defaults without changing the shared device config."""
+    try:
+        window = ET.parse(Path(os.path.expandvars(executable)).expanduser().parent / "devices" / "win.xml").find("./GfxDevice/MainWindow")
+        if window is not None:
+            size = int(window.get("width", "0")), int(window.get("height", "0"))
+            if min(size) > 0:
+                return size
+    except (OSError, ValueError, ET.ParseError):
+        pass
+    return 1280, 720
 
 
 @dataclass(frozen=True)
@@ -155,10 +176,12 @@ def calculate_packed_layout(
     return tuple(layout)
 
 
-def is_main_window_candidate(window: WindowInfo, pids: Collection[int]) -> bool:
+def is_main_window_candidate(
+    window: WindowInfo, pids: Collection[int], *, include_hidden: bool = False,
+) -> bool:
     return (
         window.pid in pids
-        and window.visible
+        and (window.visible or include_hidden)
         and window.owner == 0
         and not window.style & WS_CHILD
         and not window.ex_style & WS_EX_TOOLWINDOW
@@ -170,12 +193,13 @@ def is_main_window_candidate(window: WindowInfo, pids: Collection[int]) -> bool:
 
 def select_main_windows(
     windows: Sequence[WindowInfo], pids: Collection[int],
+    *, include_hidden: bool = False,
 ) -> dict[int, WindowInfo]:
     """Pick one stable main-window candidate for each managed process."""
 
     selected: dict[int, WindowInfo] = {}
     for window in windows:
-        if not is_main_window_candidate(window, pids):
+        if not is_main_window_candidate(window, pids, include_hidden=include_hidden):
             continue
         current = selected.get(window.pid)
         score = (window.rect.area, bool(window.title), -window.hwnd)
@@ -199,6 +223,63 @@ class WindowLayoutService:
         self.backend = backend or Win32WindowBackend()
         self._clock = clock
         self._waiter = waiter or (lambda event, seconds: event.wait(seconds))
+
+    def plan_launch(self, entries: Sequence[LaunchLayoutEntry]) -> tuple[Rect, ...]:
+        """Reserve the whole batch before launch and reposition existing game windows now."""
+        pids = {entry.target.pid for entry in entries if entry.target is not None}
+        windows = select_main_windows(self.backend.enumerate_windows(pids), pids) if pids else {}
+        sizes = tuple(
+            (windows[entry.target.pid].rect.width, windows[entry.target.pid].rect.height)
+            if entry.target is not None and entry.target.pid in windows else entry.size
+            for entry in entries
+        )
+        layout = calculate_packed_layout(self.backend.primary_work_area(), sizes)
+        for entry, rect in zip(entries, layout):
+            if entry.target is not None and entry.target.pid in windows:
+                self.backend.place_window(windows[entry.target.pid].hwnd, rect)
+        return layout
+
+    def place_on_start(
+        self, target: LayoutTarget, rect: Rect, cancel: threading.Event,
+        *, timeout_seconds: float = 12.0, poll_interval_seconds: float = 0.02,
+        stable_seconds: float = 0.4,
+    ) -> LayoutResult:
+        """Place a newly created window immediately, including while it is still hidden."""
+        if timeout_seconds < 0 or poll_interval_seconds <= 0 or stable_seconds < 0:
+            raise ValueError("窗口等待时间配置无效。")
+        deadline = self._clock() + timeout_seconds
+        visible_since: float | None = None
+        moved = False
+        while not cancel.is_set():
+            windows = select_main_windows(
+                self.backend.enumerate_windows({target.pid}), {target.pid}, include_hidden=True,
+            )
+            window = windows.get(target.pid)
+            now = self._clock()
+            if window is not None:
+                if cancel.is_set():
+                    break
+                if not moved or window.rect != rect:
+                    try:
+                        self.backend.place_window(window.hwnd, rect)
+                    except Exception as exc:
+                        return LayoutResult(failures=(LayoutFailure(target.instance_id, str(exc)),))
+                    moved = True
+                    visible_since = None
+                if window.visible:
+                    if visible_since is None:
+                        visible_since = now
+                    if now - visible_since >= stable_seconds:
+                        return LayoutResult(moved=(target.instance_id,))
+                else:
+                    visible_since = None
+            else:
+                visible_since = None
+            if now >= deadline:
+                return LayoutResult(moved=(target.instance_id,)) if moved else LayoutResult(missing=(target.instance_id,))
+            if self._waiter(cancel, min(poll_interval_seconds, max(0, deadline - now))):
+                break
+        return LayoutResult(cancelled=True)
 
     def arrange(
         self,

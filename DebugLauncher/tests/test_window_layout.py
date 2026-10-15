@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+import tempfile
 import sys
 import threading
 import unittest
@@ -10,6 +11,7 @@ if str(TOOL_DIR) not in sys.path:
     sys.path.insert(0, str(TOOL_DIR))
 
 from window_layout import (  # noqa: E402
+    LaunchLayoutEntry,
     LayoutTarget,
     Rect,
     WS_CHILD,
@@ -19,6 +21,7 @@ from window_layout import (  # noqa: E402
     calculate_grid,
     calculate_packed_layout,
     select_main_windows,
+    initial_window_size,
 )
 
 
@@ -185,6 +188,68 @@ class WindowSelectionTests(unittest.TestCase):
 
 
 class WindowLayoutServiceTests(unittest.TestCase):
+    def test_launch_plan_reserves_missing_windows_and_repositions_existing_ones(self) -> None:
+        class PrimaryBackend(FakeBackend):
+            def primary_work_area(self):
+                return Rect(0, 0, 1600, 900)
+
+        backend = PrimaryBackend((window(10, 100, 800, 600),))
+        layout = self.service(backend, FakeTime()).plan_launch((
+            LaunchLayoutEntry((1280, 720)),
+            LaunchLayoutEntry((1280, 720), LayoutTarget(1, 100)),
+            LaunchLayoutEntry((1280, 720)),
+        ))
+        self.assertEqual(len(layout), 3)
+        self.assertEqual(backend.placements, [(10, layout[1])])
+        self.assertEqual(layout, calculate_packed_layout(Rect(0, 0, 1600, 900), ((1280, 720), (800, 600), (1280, 720))))
+
+    def test_startup_places_hidden_window_before_waiting_for_visibility(self) -> None:
+        rect = Rect(0, 0, 800, 600)
+        backend = FakeBackend(
+            (window(10, 100, 1000, 700, visible=False),),
+            (WindowInfo(10, 100, rect),),
+        )
+        fake_time = FakeTime()
+        result = self.service(backend, fake_time).place_on_start(
+            LayoutTarget(1, 100), rect, threading.Event(), stable_seconds=0,
+        )
+        self.assertEqual(result.moved, (1,))
+        self.assertEqual(backend.placements, [(10, rect)])
+        self.assertEqual(fake_time.wait_count, 1)
+
+    def test_startup_corrects_engine_recentering_without_waiting_for_other_windows(self) -> None:
+        rect = Rect(0, 0, 800, 600)
+        backend = FakeBackend(
+            (), (window(10, 100, 1000, 700),),
+            (window(10, 100, 1200, 800),),
+            (WindowInfo(10, 100, rect),),
+        )
+        result = self.service(backend, FakeTime()).place_on_start(
+            LayoutTarget(1, 100), rect, threading.Event(), stable_seconds=0.04,
+        )
+        self.assertEqual(result.moved, (1,))
+        self.assertEqual(backend.placements, [(10, rect), (10, rect)])
+
+    def test_cancelled_initial_placement_leaves_windows_untouched(self) -> None:
+        backend = FakeBackend((window(10, 100),))
+        cancel = threading.Event()
+        cancel.set()
+        result = self.service(backend, FakeTime()).place_on_start(LayoutTarget(1, 100), Rect(0, 0, 800, 600), cancel)
+        self.assertTrue(result.cancelled)
+        self.assertEqual(backend.placements, [])
+        self.assertEqual(backend.enumerated_pids, [])
+
+    def test_initial_size_reads_device_defaults_and_falls_back_for_invalid_data(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            executable = Path(directory) / "App.exe"
+            devices = executable.parent / "devices"
+            devices.mkdir()
+            config = devices / "win.xml"
+            config.write_text('<Config><GfxDevice><MainWindow width="900" height="600"/></GfxDevice></Config>')
+            self.assertEqual(initial_window_size(str(executable)), (900, 600))
+            config.write_text('<Config>broken')
+            self.assertEqual(initial_window_size(str(executable)), (1280, 720))
+
     def service(self, backend: FakeBackend, fake_time: FakeTime) -> WindowLayoutService:
         return WindowLayoutService(
             backend, clock=fake_time.clock, waiter=fake_time.wait,

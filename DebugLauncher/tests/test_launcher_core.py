@@ -5,6 +5,7 @@ from pathlib import Path
 import sys
 import tempfile
 import threading
+import time
 import unittest
 from unittest.mock import patch
 
@@ -13,6 +14,7 @@ TOOL_DIR = Path(__file__).resolve().parents[1]
 if str(TOOL_DIR) not in sys.path:
     sys.path.insert(0, str(TOOL_DIR))
 
+from window_layout import Rect  # noqa: E402
 from launcher_core import (  # noqa: E402
     AttachConfiguration,
     ConfigStore,
@@ -342,6 +344,7 @@ class FakeFactory:
     def __init__(self) -> None:
         self.created: list[FakeProcess] = []
         self.calls: list[tuple[str, tuple[str, ...], bool, dict[str, str]]] = []
+        self.window_rects: list[Rect | None] = []
 
     def __call__(
         self,
@@ -349,7 +352,9 @@ class FakeFactory:
         arguments: tuple[str, ...],
         show_console: bool,
         environment_overrides: dict[str, str],
+        initial_window_rect: Rect | None = None,
     ) -> FakeProcess:
+        self.window_rects.append(initial_window_rect)
         self.calls.append(
             (executable, tuple(arguments), show_console, environment_overrides)
         )
@@ -620,6 +625,22 @@ class LauncherControllerTests(unittest.TestCase):
         self.assertEqual(second.client.settings.network.dev_account, 3)
         self.assertEqual(len(self.factory.created), 3)
 
+    def test_pair_passes_each_initial_rectangle_before_reporting_its_client(self) -> None:
+        host_rect = Rect(0, 0, 640, 360)
+        client_rects = (Rect(640, 0, 1280, 360), Rect(0, 360, 640, 720))
+        host = LauncherSettings(arguments=NetworkOptions(role=NetworkRole.HOST).arguments(),
+                                initial_window_rect=host_rect)
+        client = LauncherSettings(arguments=NetworkOptions(role=NetworkRole.CLIENT).arguments())
+        observed = []
+        result = self.controller.start_pair(
+            host, client, delay_seconds=0, client_count=2, client_window_rects=client_rects,
+            on_client_started=lambda snapshot: observed.append((snapshot.settings.initial_window_rect, len(self.factory.created))),
+        )
+        self.assertEqual(self.factory.window_rects, [host_rect, *client_rects])
+        self.assertEqual(observed, [(client_rects[0], 2), (client_rects[1], 3)])
+        self.controller.restart(result.clients[1].instance_id)
+        self.assertEqual(self.factory.window_rects[-1], client_rects[1])
+
     def test_changed_host_configuration_is_not_silently_reused(self) -> None:
         original = LauncherSettings(arguments=NetworkOptions(role=NetworkRole.HOST).arguments())
         changed = LauncherSettings(arguments=NetworkOptions(role=NetworkRole.HOST, room_id=2).arguments())
@@ -630,10 +651,10 @@ class LauncherControllerTests(unittest.TestCase):
 
     def test_client_failure_keeps_host_owned_and_reports_partial_result(self) -> None:
         normal_factory = self.controller._process_factory
-        def fail_client(executable, arguments, show_console, environment):
+        def fail_client(executable, arguments, show_console, environment, initial_window_rect=None):
             if "Client" in arguments:
                 raise LauncherError("Client executable missing")
-            return normal_factory(executable, arguments, show_console, environment)
+            return normal_factory(executable, arguments, show_console, environment, initial_window_rect)
         self.controller._process_factory = fail_client
         result = self.controller.start_pair(
             LauncherSettings(arguments=NetworkOptions(role=NetworkRole.HOST).arguments()),
@@ -720,10 +741,10 @@ class LauncherControllerTests(unittest.TestCase):
     def test_client_batch_failure_keeps_started_clients(self) -> None:
         normal_factory = self.controller._process_factory
 
-        def fail_third(executable, arguments, show_console, environment):
+        def fail_third(executable, arguments, show_console, environment, initial_window_rect=None):
             if len(self.factory.created) == 2:
                 raise LauncherError("third client failed")
-            return normal_factory(executable, arguments, show_console, environment)
+            return normal_factory(executable, arguments, show_console, environment, initial_window_rect)
 
         self.controller._process_factory = fail_third
         client = LauncherSettings(arguments=NetworkOptions(role=NetworkRole.CLIENT).arguments())
@@ -829,6 +850,79 @@ class LauncherControllerTests(unittest.TestCase):
 
 @unittest.skipUnless(sys.platform == "win32", "Windows Job Object integration test")
 class WindowsJobProcessTests(unittest.TestCase):
+    def test_initial_placement_moves_a_real_hidden_window_and_corrects_its_show_position(self) -> None:
+        from window_layout import LayoutTarget, Win32WindowBackend, WindowLayoutService
+
+        with tempfile.TemporaryDirectory() as directory:
+            ready = Path(directory) / "ready"
+            show = Path(directory) / "show"
+            code = """
+import pathlib, sys, tkinter as tk
+ready, show = map(pathlib.Path, sys.argv[1:])
+root = tk.Tk()
+root.withdraw()
+root.title("DebugLauncher initial placement test")
+root.geometry("800x600+200+200")
+root.update_idletasks()
+ready.touch()
+def check():
+    if show.exists():
+        root.deiconify()
+    else:
+        root.after(20, check)
+root.after(20, check)
+root.after(8000, root.destroy)
+root.mainloop()
+"""
+            process = WindowsJobProcess.launch(sys.executable, ("-I", "-c", code, str(ready), str(show)), show_console=False)
+            try:
+                deadline = time.monotonic() + 5
+                while not ready.exists() and time.monotonic() < deadline:
+                    time.sleep(0.02)
+                self.assertTrue(ready.exists())
+
+                class RecordingBackend(Win32WindowBackend):
+                    visible_on_place = []
+
+                    def place_window(self, hwnd, rect):
+                        self.visible_on_place.append(bool(self.user32.IsWindowVisible(hwnd)))
+                        super().place_window(hwnd, rect)
+                        show.touch()
+
+                backend = RecordingBackend()
+                area = backend.primary_work_area()
+                rect = Rect(area.left, area.top, area.left + 640, area.top + 400)
+                result = WindowLayoutService(backend).place_on_start(
+                    LayoutTarget(1, process.pid), rect, threading.Event(), timeout_seconds=4,
+                )
+                self.assertEqual(result.moved, (1,))
+                self.assertFalse(backend.visible_on_place[0], "首次定位应在窗口显示前")
+                windows = backend.enumerate_windows({process.pid})
+                self.assertTrue(any(window.visible and window.rect == rect for window in windows))
+            finally:
+                process.close()
+
+    def test_initial_rectangle_reaches_native_startup_info(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "startup.json"
+            process = WindowsJobProcess.launch(
+                sys.executable,
+                ("-I", "-c",
+                 "import ctypes,json,pathlib,sys; sys.path.insert(0,sys.argv[1]); "
+                 "from launcher_core import _STARTUPINFOW; s=_STARTUPINFOW(); "
+                 "ctypes.windll.kernel32.GetStartupInfoW(ctypes.byref(s)); "
+                 "pathlib.Path(sys.argv[2]).write_text(json.dumps([s.dwFlags & 6, ctypes.c_int(s.dwX).value, "
+                 "ctypes.c_int(s.dwY).value, s.dwXSize, s.dwYSize]))",
+                 str(TOOL_DIR), str(output)),
+                show_console=False, initial_window_rect=Rect(-900, 20, -100, 620),
+            )
+            try:
+                self.assertTrue(process.wait(10000))
+                self.assertEqual(process.poll(), 0)
+                self.assertEqual(json.loads(output.read_text()), [6, -900, 20, 800, 600])
+            finally:
+                process.close()
+
     def test_app_arguments_reach_windows_process_without_shell_expansion(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             output = Path(directory) / "received arguments.json"

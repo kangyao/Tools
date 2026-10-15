@@ -21,7 +21,7 @@ from launcher_core import (  # noqa: E402
     DEFAULT_EXECUTABLE, DebugPortAllocator, LauncherController, NetworkRole,
 )
 from test_launcher_core import FakeFactory, FakeProcess  # noqa: E402
-from window_layout import LayoutResult  # noqa: E402
+from window_layout import LayoutResult, Rect, calculate_packed_layout  # noqa: E402
 
 
 HOST = NetworkRole.HOST
@@ -32,6 +32,16 @@ class FakeWindowLayoutService:
     def __init__(self) -> None:
         self.calls: list[tuple[tuple[object, ...], int, threading.Event]] = []
         self.block = False
+        self.plans = []
+        self.initial_calls = []
+
+    def plan_launch(self, entries):
+        self.plans.append(tuple(entries))
+        return calculate_packed_layout(Rect(0, 0, 2560, 1400), [entry.size for entry in entries])
+
+    def place_on_start(self, target, rect, cancel):
+        self.initial_calls.append((target, rect, cancel))
+        return LayoutResult(moved=(target.instance_id,), cancelled=cancel.is_set())
 
     def arrange(self, targets, anchor_hwnd, cancel):
         targets = tuple(targets)
@@ -200,14 +210,69 @@ class LauncherUiTests(unittest.TestCase):
         self.assertEqual([target.instance_id for target in targets], [1, 2, 3])
         self.assertEqual(self.app.instance_tree.selection(), ("1", "2", "3"))
 
-    def test_pair_requests_one_layout_after_clients_finish(self) -> None:
+    def test_pair_sets_each_initial_position_without_a_final_group_move(self) -> None:
         self.app.client_count_var.set("3")
         self.app.start_pair_button.invoke()
         self.wait_until_idle()
-        self.wait_for_layout(1)
-        targets = self.layout_service.calls[0][0]
-        self.assertEqual([target.instance_id for target in targets], [2, 3, 4])
+        self.assertEqual(self.layout_service.calls, [])
+        self.assertEqual(len(self.layout_service.plans[0]), 3)
+        self.assertEqual([target.instance_id for target, _rect, _cancel in self.layout_service.initial_calls], [2, 3, 4])
+        self.assertIsNone(self.factory.window_rects[0], "DS has no game window")
+        self.assertEqual(self.factory.window_rects[1:], [call[1] for call in self.layout_service.initial_calls])
         self.assertEqual(self.app.instance_tree.selection(), ("1", "2", "3", "4"))
+
+    def test_pair_places_first_client_while_later_clients_are_still_starting(self) -> None:
+        self.app.client_count_var.set("2")
+        release = threading.Event()
+        second_pending = threading.Event()
+        original_factory = self.factory
+
+        def delay_second(executable, arguments, show_console, environment, initial_window_rect=None):
+            self.assertTrue(self.layout_service.plans, "布局必须在创建进程前规划")
+            if len(original_factory.created) == 2:
+                second_pending.set()
+                if not release.wait(5):
+                    raise launcher.LauncherError("测试等待启动超时")
+            return original_factory(executable, arguments, show_console, environment, initial_window_rect)
+
+        self.app.controller._process_factory = delay_second
+        self.app.start_pair_button.invoke()
+        try:
+            self.assertTrue(second_pending.wait(1))
+            deadline = time.monotonic() + 2
+            while not self.layout_service.initial_calls and time.monotonic() < deadline:
+                self.root.update()
+                time.sleep(0.01)
+            self.assertEqual(self.layout_service.initial_calls[0][0].instance_id, 2)
+            self.assertTrue(self.app.busy, "首个窗口定位无需等待整批启动结束")
+            self.assertEqual(len(original_factory.created), 2)
+        finally:
+            release.set()
+            self.wait_until_idle()
+
+    def test_listen_host_reserves_a_window_slot_before_clients(self) -> None:
+        self.seed(LaunchProfile(name="Host", role=HOST, server_mode="Host"),
+                  LaunchProfile(name="Client", role=CLIENT, server_mode="Host"))
+        self.app.start_pair_button.invoke()
+        self.wait_until_idle()
+        self.assertEqual(len(self.layout_service.plans[0]), 2)
+        self.assertIsNotNone(self.factory.window_rects[0])
+        self.assertLess(self.factory.window_rects[0].left, self.factory.window_rects[1].left)
+        self.assertEqual(self.layout_service.calls, [])
+
+    def test_pair_without_auto_tile_does_not_plan_initial_positions(self) -> None:
+        self.app.auto_tile_windows_button.invoke()
+        self.app.start_pair_button.invoke()
+        self.wait_until_idle()
+        self.assertEqual(self.layout_service.plans, [])
+        self.assertEqual(self.factory.window_rects, [None, None])
+
+    def test_pair_plan_failure_falls_back_to_post_launch_layout(self) -> None:
+        with patch.object(self.layout_service, "plan_launch", side_effect=OSError("no monitor")):
+            self.app.start_pair_button.invoke()
+            self.wait_until_idle()
+        self.wait_for_layout(1)
+        self.assertEqual(self.factory.window_rects, [None, None])
 
     def test_batch_selection_survives_refresh_and_disables_single_instance_actions(self) -> None:
         self.app.client_count_var.set("3")
@@ -278,10 +343,10 @@ class LauncherUiTests(unittest.TestCase):
         self.wait_for_layout(1)
         original_factory = self.factory
 
-        def fail_second(executable, arguments, show_console, environment):
+        def fail_second(executable, arguments, show_console, environment, initial_window_rect=None):
             if "3" == arguments[arguments.index("-MGFDevAccount") + 1]:
                 raise launcher.LauncherError("无法启动第二个 Client")
-            return original_factory(executable, arguments, show_console, environment)
+            return original_factory(executable, arguments, show_console, environment, initial_window_rect)
 
         self.app.controller._process_factory = fail_second
         self.app.restart_button.invoke()
@@ -443,10 +508,10 @@ class LauncherUiTests(unittest.TestCase):
         )
         normal = self.factory
 
-        def fail_client(executable, arguments, show_console, environment):
+        def fail_client(executable, arguments, show_console, environment, initial_window_rect=None):
             if "Client" in arguments:
                 raise launcher.LauncherError("启动程序不存在")
-            return normal(executable, arguments, show_console, environment)
+            return normal(executable, arguments, show_console, environment, initial_window_rect)
 
         self.app.controller._process_factory = fail_client
         self.app.start_pair_button.invoke()

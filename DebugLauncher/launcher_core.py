@@ -18,6 +18,7 @@ import xml.etree.ElementTree as ET
 
 
 from aicore_control import available_dev_account, owned_ports, request_stop
+from window_layout import Rect
 
 
 DEFAULT_PROJECT_ROOT = r"C:\MiniGame\Source\AIGamePlay"
@@ -244,9 +245,12 @@ class LauncherSettings:
     show_console: bool = True
     window_geometry: str = ""
     argument_enabled: tuple[bool, ...] | None = None
+    initial_window_rect: Rect | None = None
     network: NetworkOptions = field(init=False, repr=False, compare=False)
 
     def __post_init__(self) -> None:
+        if self.initial_window_rect is not None and min(self.initial_window_rect.width, self.initial_window_rect.height) <= 0:
+            raise ConfigurationError("App 初始窗口尺寸必须为正数。")
         states = self.argument_enabled
         if states is None:
             object.__setattr__(
@@ -765,6 +769,7 @@ class WindowsJobProcess:
         arguments: Sequence[str],
         show_console: bool = True,
         environment_overrides: Mapping[str, str] | None = None,
+        initial_window_rect: Rect | None = None,
     ) -> WindowsJobProcess:
         if os.name != "nt":
             raise LauncherError("该启动器仅支持 Windows。")
@@ -798,6 +803,10 @@ class WindowsJobProcess:
 
             startup = _STARTUPINFOW()
             startup.cb = ctypes.sizeof(startup)
+            if initial_window_rect is not None:
+                startup.dwFlags |= 0x0004 | 0x0002  # STARTF_USEPOSITION | STARTF_USESIZE
+                startup.dwX, startup.dwY = initial_window_rect.left, initial_window_rect.top
+                startup.dwXSize, startup.dwYSize = initial_window_rect.width, initial_window_rect.height
             dedicated_aicore = (executable_path.stem.casefold() in ("aicore", "aicore_profile", "aicore_d")
                                 and parse_network_arguments(arguments).is_dedicated)
             if dedicated_aicore and not show_console:
@@ -1064,7 +1073,7 @@ class PairLaunchResult:
 
 
 ProcessFactory = Callable[
-    [str, Sequence[str], bool, Mapping[str, str]],
+    [str, Sequence[str], bool, Mapping[str, str], Rect | None],
     ManagedProcess,
 ]
 
@@ -1177,6 +1186,7 @@ class LauncherController:
                     arguments,
                     settings.show_console,
                     build_process_environment_overrides(settings, debug_ports),
+                    settings.initial_window_rect,
                 )
             except Exception:
                 self._release_debug_slot(debug_ports)
@@ -1265,15 +1275,23 @@ class LauncherController:
         auto_dev_account: bool = True,
         label: str = "",
         cancel: threading.Event | None = None,
+        window_rects: Sequence[Rect] | None = None,
+        on_client_started: Callable[[ControllerSnapshot], None] | None = None,
     ) -> ClientLaunchResult:
         """Start several Clients from one configuration, each with its own dev account."""
         validate_client_count(count, auto_dev_account)
+        if window_rects is not None and len(window_rects) != count:
+            raise ConfigurationError("初始窗口位置数量必须与 Client 数量一致。")
         clients: list[ControllerSnapshot] = []
         try:
             for _index in range(count):
                 if cancel is not None and cancel.is_set():
                     raise LauncherError("已取消后续 Client 启动。")
-                clients.append(self.start_client(settings, auto_dev_account=auto_dev_account, label=label))
+                launch_settings = replace(settings, initial_window_rect=window_rects[_index]) if window_rects is not None else settings
+                snapshot = self.start_client(launch_settings, auto_dev_account=auto_dev_account, label=label)
+                clients.append(snapshot)
+                if on_client_started is not None:
+                    on_client_started(snapshot)
         except Exception as exc:
             if not clients:
                 raise
@@ -1292,6 +1310,8 @@ class LauncherController:
         on_host_started: Callable[[ControllerSnapshot, bool], None] | None = None,
         host_label: str = "",
         client_label: str = "",
+        client_window_rects: Sequence[Rect] | None = None,
+        on_client_started: Callable[[ControllerSnapshot], None] | None = None,
     ) -> PairLaunchResult:
         """Start Host first, then the Clients; keep the Host managed if a Client fails."""
         if client.network.role is not NetworkRole.CLIENT:
@@ -1299,6 +1319,8 @@ class LauncherController:
         if not 0 <= delay_seconds <= 60:
             raise ConfigurationError("Client 启动间隔必须在 0 到 60 秒之间。")
         validate_client_count(client_count, auto_dev_account)
+        if client_window_rects is not None and len(client_window_rects) != client_count:
+            raise ConfigurationError("初始窗口位置数量必须与 Client 数量一致。")
         cancel = cancel or threading.Event()
         if cancel.is_set():
             raise LauncherError("已取消启动。")
@@ -1317,6 +1339,7 @@ class LauncherController:
             launched = self.start_clients(
                 client, client_count, auto_dev_account=auto_dev_account,
                 label=client_label, cancel=cancel,
+                window_rects=client_window_rects, on_client_started=on_client_started,
             )
         except Exception as exc:
             return PairLaunchResult(
@@ -1407,6 +1430,7 @@ class LauncherController:
                         instance.settings,
                         instance.debug_ports,
                     ),
+                    instance.settings.initial_window_rect,
                 )
             except Exception:
                 del self._instances[instance_id]
