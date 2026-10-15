@@ -92,13 +92,16 @@ class LauncherUiTests(unittest.TestCase):
         self.app._load_settings()
         return config
 
-    def wait_until_idle(self) -> None:
+    def wait_until_idle(self, *, expect_error: bool = False) -> None:
         deadline = time.monotonic() + 5
         while self.app.busy and time.monotonic() < deadline:
             self.root.update()
             time.sleep(0.01)
         self.assertFalse(self.app.busy, "Launch operation did not complete")
-        self.show_error.assert_not_called()
+        if expect_error:
+            self.show_error.assert_called_once()
+        else:
+            self.show_error.assert_not_called()
 
     def wait_for_layout(self, call_count: int) -> None:
         deadline = time.monotonic() + 3
@@ -195,6 +198,7 @@ class LauncherUiTests(unittest.TestCase):
         self.wait_for_layout(1)
         targets = self.layout_service.calls[0][0]
         self.assertEqual([target.instance_id for target in targets], [1, 2, 3])
+        self.assertEqual(self.app.instance_tree.selection(), ("1", "2", "3"))
 
     def test_pair_requests_one_layout_after_clients_finish(self) -> None:
         self.app.client_count_var.set("3")
@@ -203,6 +207,103 @@ class LauncherUiTests(unittest.TestCase):
         self.wait_for_layout(1)
         targets = self.layout_service.calls[0][0]
         self.assertEqual([target.instance_id for target in targets], [2, 3, 4])
+        self.assertEqual(self.app.instance_tree.selection(), ("1", "2", "3", "4"))
+
+    def test_batch_selection_survives_refresh_and_disables_single_instance_actions(self) -> None:
+        self.app.client_count_var.set("3")
+        self.app.role_controls[CLIENT].start_button.invoke()
+        self.wait_until_idle()
+        tree = self.app.instance_tree
+        self.assertEqual(str(tree.cget("selectmode")), "extended")
+        tree.selection_set(("1", "3"))
+        tree.focus("3")
+        self.app._refresh_status(force=True)
+        self.assertEqual(tree.selection(), ("1", "3"))
+        self.assertEqual(tree.focus(), "3")
+        self.assertEqual(str(self.app.stop_button.cget("text")), "批量关闭（2）")
+        self.assertEqual(str(self.app.restart_button.cget("text")), "批量重启（2）")
+        for button in (self.app.command_button, self.app.log_button):
+            self.assertEqual(str(button.cget("state")), tk.DISABLED)
+        self.app.select_all_button.invoke()
+        self.assertEqual(tree.selection(), ("1", "2", "3"))
+        tree.selection_set("2")
+        self.app._update_buttons()
+        for button in (self.app.command_button, self.app.log_button):
+            self.assertEqual(str(button.cget("state")), tk.NORMAL)
+
+    def test_batch_stop_only_closes_selected_instances(self) -> None:
+        self.app.client_count_var.set("3")
+        self.app.role_controls[CLIENT].start_button.invoke()
+        self.wait_until_idle()
+        self.app.instance_tree.selection_set(("1", "3"))
+        self.root.update()
+        self.app.stop_button.invoke()
+        self.wait_until_idle()
+        self.assertEqual(self.app.instance_tree.get_children(), ("2",))
+        self.assertEqual([process.terminated for process in self.factory.created], [True, False, True])
+        self.assertEqual(str(self.app.stop_button.cget("state")), tk.DISABLED)
+
+    def test_batch_stop_continues_after_one_instance_times_out(self) -> None:
+        self.app.client_count_var.set("3")
+        self.app.role_controls[CLIENT].start_button.invoke()
+        self.wait_until_idle()
+        self.factory.created[1].wait_result = False
+        self.app.stop_button.invoke()
+        self.wait_until_idle(expect_error=True)
+        self.assertEqual(self.app.instance_tree.get_children(), ("2",))
+        self.assertEqual([process.closed for process in self.factory.created], [True, False, True])
+        self.assertIn("成功关闭 2 / 3", str(self.show_error.call_args.args[1]))
+        self.assertIn("实例 2", str(self.show_error.call_args.args[1]))
+
+    def test_batch_restart_keeps_each_snapshot_and_requests_one_layout(self) -> None:
+        self.app.client_count_var.set("3")
+        self.app.role_controls[CLIENT].start_button.invoke()
+        self.wait_until_idle()
+        self.wait_for_layout(1)
+        original_calls = self.factory.calls[:]
+        self.app.instance_tree.selection_set(("1", "3"))
+        self.root.update()
+        self.app.restart_button.invoke()
+        self.wait_until_idle()
+        self.wait_for_layout(2)
+        self.assertEqual(self.factory.calls[3:], [original_calls[0], original_calls[2]])
+        self.assertEqual([snapshot.pid for snapshot in self.app.controller.snapshots()], [1003, 1001, 1004])
+        self.assertEqual(self.app.instance_tree.selection(), ("1", "3"))
+        self.assertFalse(self.factory.created[1].terminated)
+
+    def test_batch_restart_continues_after_one_launch_fails(self) -> None:
+        self.app.client_count_var.set("3")
+        self.app.role_controls[CLIENT].start_button.invoke()
+        self.wait_until_idle()
+        self.wait_for_layout(1)
+        original_factory = self.factory
+
+        def fail_second(executable, arguments, show_console, environment):
+            if "3" == arguments[arguments.index("-MGFDevAccount") + 1]:
+                raise launcher.LauncherError("无法启动第二个 Client")
+            return original_factory(executable, arguments, show_console, environment)
+
+        self.app.controller._process_factory = fail_second
+        self.app.restart_button.invoke()
+        self.wait_until_idle(expect_error=True)
+        self.wait_for_layout(2)
+        self.assertEqual(self.app.instance_tree.get_children(), ("1", "3"))
+        self.assertEqual([snapshot.pid for snapshot in self.app.controller.snapshots()], [1003, 1004])
+        self.assertEqual(self.app.instance_tree.selection(), ("1", "3"))
+        self.assertIn("成功重启 2 / 3", str(self.show_error.call_args.args[1]))
+        self.assertIn("无法启动第二个 Client", str(self.show_error.call_args.args[1]))
+
+    def test_stop_all_ignores_selection_and_keeps_failed_instances_managed(self) -> None:
+        self.app.client_count_var.set("3")
+        self.app.role_controls[CLIENT].start_button.invoke()
+        self.wait_until_idle()
+        self.factory.created[0].wait_result = False
+        self.app.instance_tree.selection_set("3")
+        self.app.stop_all_button.invoke()
+        self.wait_until_idle(expect_error=True)
+        self.assertEqual(self.app.instance_tree.get_children(), ("1",))
+        self.assertTrue(all(process.terminated for process in self.factory.created))
+        self.assertIn("成功关闭 2 / 3", str(self.show_error.call_args.args[1]))
 
     def test_layout_orders_host_before_older_client(self) -> None:
         self.seed(LaunchProfile(name="Listen Host", role=HOST, server_mode="Host"),

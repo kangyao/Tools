@@ -60,6 +60,12 @@ class _RoleControls:
     start_button: ttk.Button
 
 
+@dataclass(frozen=True)
+class _InstanceBatchResult:
+    snapshots: tuple[ControllerSnapshot, ...]
+    errors: tuple[str, ...]
+
+
 class DebugLauncherApp:
     def __init__(
         self, root: tk.Tk, window_layout_service: WindowLayoutService | None = None,
@@ -187,7 +193,7 @@ class DebugLauncherApp:
             "target", "dap", "attach", "runtime", "debug",
         )
         self.instance_tree = ttk.Treeview(
-            instance_frame, columns=columns, show="headings", height=5, selectmode="browse"
+            instance_frame, columns=columns, show="headings", height=5, selectmode="extended"
         )
         headings = {
             "id": ("ID", 45),
@@ -210,6 +216,8 @@ class DebugLauncherApp:
         self.instance_tree.grid(row=0, column=0, sticky=tk.EW)
         self.instance_tree.bind("<<TreeviewSelect>>", lambda _event: self._update_buttons())
         self.instance_tree.bind("<Double-1>", self._on_instance_double_click)
+        self.instance_tree.bind("<Control-a>", self._select_all_instances)
+        self.instance_tree.bind("<Control-A>", self._select_all_instances)
         instance_y_scrollbar = ttk.Scrollbar(
             instance_frame, orient=tk.VERTICAL, command=self.instance_tree.yview,
         )
@@ -222,6 +230,16 @@ class DebugLauncherApp:
             xscrollcommand=instance_x_scrollbar.set,
             yscrollcommand=instance_y_scrollbar.set,
         )
+        selection_bar = ttk.Frame(instance_frame)
+        selection_bar.grid(row=2, column=0, sticky=tk.EW, pady=(6, 0))
+        ttk.Label(
+            selection_bar, text="Ctrl / Shift 多选，Ctrl+A 全选；可批量关闭或重启。",
+            style="Summary.TLabel",
+        ).pack(side=tk.LEFT)
+        self.select_all_button = ttk.Button(
+            selection_bar, text="全选", command=self._select_all_instances, width=8,
+        )
+        self.select_all_button.pack(side=tk.RIGHT)
 
         action_frame = ttk.Frame(outer, padding=(0, 12, 0, 12))
         action_frame.grid(row=2, column=0, sticky=tk.EW)
@@ -654,6 +672,7 @@ class DebugLauncherApp:
             return
         for client in result.clients:
             self._on_client_started(client)
+        self.instance_tree.selection_set([str(client.instance_id) for client in result.clients])
         self._request_window_layout()
         if result.error and not self.closing:
             self._show_error("部分 Client 未启动", LauncherError(
@@ -665,6 +684,9 @@ class DebugLauncherApp:
             return
         for client in result.clients:
             self._on_client_started(client)
+        self.instance_tree.selection_set([
+            str(snapshot.instance_id) for snapshot in (result.host, *result.clients)
+        ])
         self._request_window_layout()
         if result.error and not self.closing:
             self._show_error("Client 未全部启动", LauncherError(
@@ -741,42 +763,51 @@ class DebugLauncherApp:
         )
 
     def _stop(self) -> None:
-        instance_id = self._selected_instance_id()
-        if instance_id is None:
+        instance_ids = self._selected_instance_ids()
+        if not instance_ids or self.busy or self.closing:
             return
         self._cancel_window_layout()
         self._run_async(
-            "正在关闭…",
-            lambda: self._stop_instance(instance_id),
-            self._on_instance_stopped,
+            f"正在批量关闭 {len(instance_ids)} 个实例…",
+            lambda: self._operate_instances(instance_ids, self.controller.stop),
+            self._on_instances_stopped,
         )
 
     def _restart(self) -> None:
-        instance_id = self._selected_instance_id()
-        if instance_id is None:
+        instance_ids = self._selected_instance_ids()
+        if not instance_ids or self.busy or self.closing:
             return
         self._cancel_window_layout()
         self._run_async(
-            "正在重新启动…",
-            lambda: self.controller.restart(instance_id),
-            self._on_instance_restarted,
+            f"正在批量重启 {len(instance_ids)} 个实例…",
+            lambda: self._operate_instances(instance_ids, self.controller.restart),
+            self._on_instances_restarted,
         )
 
     def _stop_all(self) -> None:
-        if not self.snapshots_by_id:
+        instance_ids = tuple(self.snapshots_by_id)
+        if not instance_ids or self.busy or self.closing:
             return
         self._cancel_window_layout()
         self._run_async(
             "正在关闭全部…",
-            self._stop_all_instances,
-            self._on_all_stopped,
+            lambda: self._operate_instances(instance_ids, self.controller.stop),
+            self._on_instances_stopped,
         )
 
-    def _stop_instance(self, instance_id: int) -> ControllerSnapshot:
-        return self.controller.stop(instance_id)
-
-    def _stop_all_instances(self) -> tuple[ControllerSnapshot, ...]:
-        return self.controller.stop_all()
+    def _operate_instances(
+        self, instance_ids: tuple[int, ...], operation: Callable[[int], ControllerSnapshot],
+    ) -> _InstanceBatchResult:
+        snapshots: list[ControllerSnapshot] = []
+        errors: list[str] = []
+        for instance_id in instance_ids:
+            if self.closing:
+                break
+            try:
+                snapshots.append(operation(instance_id))
+            except Exception as exc:  # One failed instance must not prevent the remaining operations.
+                errors.append(f"实例 {instance_id}：{exc}")
+        return _InstanceBatchResult(tuple(snapshots), tuple(errors))
 
     def _run_async(
         self,
@@ -831,7 +862,7 @@ class DebugLauncherApp:
             )
         )
 
-    def _on_instance_restarted(self, result: object) -> None:
+    def _on_instance_restarted(self, result: object, *, request_layout: bool = True) -> None:
         snapshot = result
         if not isinstance(snapshot, ControllerSnapshot):
             return
@@ -841,14 +872,35 @@ class DebugLauncherApp:
         self._append_log(
             f"[实例 {snapshot.instance_id}] 已按原始配置重新启动，PID {snapshot.pid}。"
         )
-        self._request_window_layout()
+        if request_layout:
+            self._request_window_layout()
 
-    def _on_all_stopped(self, result: object) -> None:
-        snapshots = result if isinstance(result, tuple) else ()
-        for snapshot in snapshots:
-            if isinstance(snapshot, ControllerSnapshot):
-                self._append_log(f"[实例 {snapshot.instance_id}] App 已关闭。")
-        self.snapshots_by_id.clear()
+    def _on_instances_stopped(self, result: object) -> None:
+        if not isinstance(result, _InstanceBatchResult):
+            return
+        for snapshot in result.snapshots:
+            self._on_instance_stopped(snapshot)
+        self._report_batch_errors("关闭", result)
+
+    def _on_instances_restarted(self, result: object) -> None:
+        if not isinstance(result, _InstanceBatchResult):
+            return
+        for snapshot in result.snapshots:
+            self._on_instance_restarted(snapshot, request_layout=False)
+        if result.errors:
+            # A failed relaunch may remove an old instance; reconcile it before scheduling layout.
+            self._refresh_status(force=True)
+        if result.snapshots:
+            self._request_window_layout()
+        self._report_batch_errors("重启", result)
+
+    def _report_batch_errors(self, action: str, result: _InstanceBatchResult) -> None:
+        if result.errors and not self.closing:
+            self._show_error(f"部分实例{action}失败", LauncherError(
+                f"成功{action} {len(result.snapshots)} / "
+                f"{len(result.snapshots) + len(result.errors)} 个实例。\n"
+                + "\n".join(result.errors)
+            ))
 
     def _initialize_default_debug_service(self) -> None:
         if self.closing:
@@ -1127,30 +1179,49 @@ class DebugLauncherApp:
         self.status_after_id = self.root.after(500, self._refresh_status)
 
     def _update_buttons(self) -> None:
-        selected = self._selected_instance_id() is not None
+        selected_count = len(self._selected_instance_ids())
         idle = not self.busy and not self.closing
         for role, controls in self.role_controls.items():
             has_profile = self.config.selected(role) is not None
             controls.start_button.configure(state=tk.NORMAL if idle and has_profile else tk.DISABLED)
         both_selected = all(self.config.selected(role) is not None for role in LAUNCH_ROLES)
         self.start_pair_button.configure(state=tk.NORMAL if idle and both_selected else tk.DISABLED)
-        instance_state = tk.NORMAL if idle and selected else tk.DISABLED
-        self.stop_button.configure(state=instance_state)
-        self.restart_button.configure(state=instance_state)
-        self.command_button.configure(state=tk.NORMAL if selected else tk.DISABLED)
-        self.log_button.configure(state=tk.NORMAL if selected else tk.DISABLED)
+        instance_state = tk.NORMAL if idle and selected_count else tk.DISABLED
+        self.stop_button.configure(
+            state=instance_state,
+            text=f"批量关闭（{selected_count}）" if selected_count > 1 else "关闭选中实例",
+        )
+        self.restart_button.configure(
+            state=instance_state,
+            text=f"批量重启（{selected_count}）" if selected_count > 1 else "重启选中实例",
+        )
+        single_state = tk.NORMAL if selected_count == 1 else tk.DISABLED
+        self.command_button.configure(state=single_state)
+        self.log_button.configure(state=single_state)
+        self.select_all_button.configure(state=tk.NORMAL if self.snapshots_by_id else tk.DISABLED)
         self.stop_all_button.configure(
             state=tk.NORMAL if idle and self.snapshots_by_id else tk.DISABLED
         )
 
     def _selected_instance_id(self) -> int | None:
-        selection = self.instance_tree.selection()
-        return int(selection[0]) if selection else None
+        selection = self._selected_instance_ids()
+        return selection[0] if len(selection) == 1 else None
+
+    def _selected_instance_ids(self) -> tuple[int, ...]:
+        return tuple(
+            int(item) for item in self.instance_tree.selection()
+            if int(item) in self.snapshots_by_id
+        )
+
+    def _select_all_instances(self, _event: tk.Event[tk.Misc] | None = None) -> str:
+        self.instance_tree.selection_set(self.instance_tree.get_children())
+        self._update_buttons()
+        return "break"
 
     def _render_instances(self) -> None:
-        selected = self._selected_instance_id()
         for item in self.instance_tree.get_children():
-            self.instance_tree.delete(item)
+            if int(item) not in self.snapshots_by_id:
+                self.instance_tree.delete(item)
         role_labels = {
             NetworkRole.STANDALONE: "单机",
             NetworkRole.HOST: "Host",
@@ -1176,28 +1247,25 @@ class DebugLauncherApp:
             runtime_state = (
                 f"已连接 {runtime_client}" if runtime_client != "未连接" else "未连接"
             )
-            self.instance_tree.insert(
-                "",
-                tk.END,
-                iid=str(instance_id),
-                values=(
-                    instance_id,
-                    snapshot.label or "—",
-                    "DS" if network.is_dedicated else role_labels[role],
-                    snapshot.pid or "—",
-                    endpoint,
-                    room,
-                    account,
-                    "运行中",
-                    ports.target_port if ports else "—",
-                    ports.dap_port if ports else "—",
-                    attach_state if ports else "—",
-                    runtime_state if ports else "—",
-                    self.debug_states.get(debug_port, "—") if ports else "—",
-                ),
+            values = (
+                instance_id,
+                snapshot.label or "—",
+                "DS" if network.is_dedicated else role_labels[role],
+                snapshot.pid or "—",
+                endpoint,
+                room,
+                account,
+                "运行中",
+                ports.target_port if ports else "—",
+                ports.dap_port if ports else "—",
+                attach_state if ports else "—",
+                runtime_state if ports else "—",
+                self.debug_states.get(debug_port, "—") if ports else "—",
             )
-        if selected is not None and selected in self.snapshots_by_id:
-            self.instance_tree.selection_set(str(selected))
+            if self.instance_tree.exists(str(instance_id)):
+                self.instance_tree.item(str(instance_id), values=values)
+            else:
+                self.instance_tree.insert("", tk.END, iid=str(instance_id), values=values)
 
     def _remember_window_geometry(self, event: tk.Event[tk.Misc]) -> None:
         if event.widget is not self.root or self.root.state() != "normal":
