@@ -363,6 +363,71 @@ class FakeFactory:
         return process
 
 
+
+class SdkLaunchArgumentsTests(unittest.TestCase):
+    def configure(self, root: Path, sdk_root: str = "SDK") -> LauncherSettings:
+        (root / ".project").mkdir(exist_ok=True)
+        (root / ".project/dev-runtime.json").write_text(
+            json.dumps({"schemaVersion": 2, "sdkRoot": sdk_root}), encoding="utf-8",
+        )
+        framework = root / sdk_root / "AICoreScripts"
+        framework.mkdir(parents=True, exist_ok=True)
+        (framework / "main.lua").write_text("return {}", encoding="utf-8")
+        return LauncherSettings(executable=str(root / "bin/AICore_profile.exe"),
+                                arguments=("-AICoreRoot", str(root)))
+
+    def test_selected_sdk_is_resolved_for_preview_and_launch(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for sdk_root in ("SDK", str(root / "other SDK")):
+                with self.subTest(sdk_root=sdk_root):
+                    settings = self.configure(root, sdk_root)
+                    arguments = build_launch_arguments(settings)
+                    expected = str((root / sdk_root / "AICoreScripts").resolve())
+                    self.assertEqual(arguments[-2:], ("-AICoreFrameworkRoot", expected))
+                    self.assertEqual(parse_argument_text(format_command_preview(settings))[1:], arguments)
+
+    def test_explicit_framework_and_other_apps_are_preserved(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            settings = self.configure(Path(directory))
+            explicit = LauncherSettings(executable=settings.executable,
+                arguments=settings.arguments + ("-AICoreFrameworkRoot", "custom/framework"))
+            self.assertEqual(build_launch_arguments(explicit), explicit.arguments)
+            other_app = LauncherSettings(executable="CustomApp.exe", arguments=settings.arguments)
+            self.assertEqual(build_launch_arguments(other_app), other_app.arguments)
+
+    def test_missing_entry_and_old_directory_fail_before_launch(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            settings = self.configure(root)
+            (root / "AICoreScripts").mkdir()
+            with self.assertRaisesRegex(ConfigurationError, "旧目录"):
+                build_launch_arguments(settings)
+            (root / "AICoreScripts").rmdir()
+            (root / "SDK/AICoreScripts/main.lua").unlink()
+            with self.assertRaisesRegex(ConfigurationError, "缺少框架入口"):
+                build_launch_arguments(settings)
+
+    def test_legacy_config_is_unchanged_and_invalid_json_is_reported(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            settings = self.configure(root)
+            config = root / ".project/dev-runtime.json"
+            config.write_text('{"schemaVersion":1,"frameworkRoot":"framework"}', encoding="utf-8")
+            self.assertEqual(build_launch_arguments(settings), settings.arguments)
+            config.write_text("invalid JSON", encoding="utf-8")
+            with self.assertRaisesRegex(ConfigurationError, "无法读取工程运行配置"):
+                build_launch_arguments(settings)
+
+    def test_busy_udp_port_does_not_create_an_app(self) -> None:
+        import socket
+        from launcher_core import _check_server_udp_port
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as owner:
+            owner.bind(("0.0.0.0", 0))
+            with self.assertRaisesRegex(LauncherError, "无法监听 UDP"):
+                _check_server_udp_port(owner.getsockname()[1])
+
+
 class DebugPortAllocatorTests(unittest.TestCase):
     def test_allocates_incrementing_bundles_and_reuses_released_bundle(self) -> None:
         allocator = DebugPortAllocator(lambda _port: True)

@@ -20,6 +20,8 @@ python .\launcher.py
 
 默认 AICore 程序会自动补 `-AICoreRoot C:\MiniGame\Source\AIGamePlay`；显式填写的工程路径和自选 EXE 保留。
 
+工程使用 `dev-runtime.json` 格式 2 时，启动器按 `sdkRoot` 补充 `-AICoreFrameworkRoot <SDK>/AICoreScripts`，预览与实际命令一致。显式框架参数保留；SDK 缺少入口或工程残留旧 `AICoreScripts/` 目录时，启动前报告错误。Host 端口被其他进程占用时也在启动前提示，不关闭外部进程。
+
 默认网络参数：
 
 ```text

@@ -17,7 +17,7 @@ from typing import Callable, Mapping, Protocol, Sequence
 import xml.etree.ElementTree as ET
 
 
-from aicore_control import available_dev_account, owned_ports, request_stop
+from aicore_control import argument_value, available_dev_account, owned_ports, request_stop
 from window_layout import Rect
 
 
@@ -551,9 +551,46 @@ def build_launch_arguments(
     """Build the single argv source used by previews and process launches."""
 
     arguments = list(settings.enabled_arguments)
+    if Path(settings.executable).stem.casefold() in ("aicore", "aicore_profile", "aicore_d"):
+        _append_sdk_framework_root(arguments, settings.executable)
     if debug_ports is not None:
         arguments.extend((LUA_DEBUG_PORT_ARGUMENT, str(debug_ports.target_port)))
     return tuple(arguments)
+
+
+
+def _append_sdk_framework_root(arguments: list[str], executable: str) -> None:
+    """Resolve schema-2 SDKs for hosts that still read frameworkRoot only."""
+    if argument_value(arguments, "-AICoreFrameworkRoot") is not None:
+        return
+    project_argument = argument_value(arguments, "-AICoreRoot")
+    if project_argument is None:
+        return
+    project = Path(os.path.expandvars(project_argument)).expanduser()
+    if not project.is_absolute():
+        project = Path(executable).resolve().parent / project
+    project = project.resolve()
+    config_file = project / ".project/dev-runtime.json"
+    try:
+        config = json.loads(config_file.read_text(encoding="utf-8-sig"))
+    except FileNotFoundError:
+        return
+    except (OSError, UnicodeError, ValueError) as exc:
+        raise ConfigurationError(f"无法读取工程运行配置 {config_file}：{exc}") from exc
+    if not isinstance(config, dict) or config.get("schemaVersion") != 2:
+        return
+    sdk_root = config.get("sdkRoot")
+    if not isinstance(sdk_root, str) or not sdk_root.strip():
+        raise ConfigurationError(f"工程运行配置缺少 sdkRoot：{config_file}")
+    framework = (project / sdk_root / "AICoreScripts").resolve()
+    if not (framework / "main.lua").is_file():
+        raise ConfigurationError(f"所选 SDK 缺少框架入口：{framework / 'main.lua'}")
+    if (project / "AICoreScripts").is_dir():
+        raise ConfigurationError(
+            f"工程仍有旧目录 {project / 'AICoreScripts'}，宿主会优先加载它；"
+            "请清理迁移残留后使用所选 SDK。"
+        )
+    arguments.extend(("-AICoreFrameworkRoot", str(framework)))
 
 
 def format_command_preview(
@@ -574,6 +611,20 @@ def _is_tcp_port_available(host: str, port: int) -> bool:
     except OSError:
         return False
     return True
+
+
+
+def _check_server_udp_port(port: int) -> None:
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as candidate:
+            if os.name == "nt":
+                candidate.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+            candidate.bind(("0.0.0.0", port))
+    except OSError as exc:
+        raise LauncherError(
+            f"无法监听 UDP {port}（{exc}）；请关闭占用端口的服务端，"
+            "或在 Host、Client 配置中选择相同的空闲端口。"
+        ) from exc
 
 
 class DebugPortAllocator:
@@ -782,6 +833,9 @@ class WindowsJobProcess:
         if not executable_path.is_file():
             raise LauncherError(f"启动程序不是文件：{executable_path}")
 
+        network = parse_network_arguments(arguments)
+        if network.role is NetworkRole.HOST:
+            _check_server_udp_port(network.port)
         kernel32 = _load_kernel32()
         job_handle = kernel32.CreateJobObjectW(None, None)
         if not job_handle:

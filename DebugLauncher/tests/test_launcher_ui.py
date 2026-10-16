@@ -680,6 +680,7 @@ class LauncherUiTests(unittest.TestCase):
         self.dialog_mocks["showerror"].assert_called_once()
         self.assertEqual(self.app.store.load().selected(CLIENT).name, "默认 Client")
 
+    @patch("launcher_core._append_sdk_framework_root", new=lambda *_args: None)
     def test_editing_command_updates_form_and_is_saved(self) -> None:
         manager = self.manager()
         manager.select_profile(self.app.config.selected_host_id)
