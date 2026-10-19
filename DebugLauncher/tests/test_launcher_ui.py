@@ -600,15 +600,67 @@ class LauncherUiTests(unittest.TestCase):
         self.assertEqual(self.app.store.load().selected(HOST).port, 7020)
         self.assertEqual(self.tree_values()[0][4], "监听 :7000")  # 运行实例保留启动快照。
 
-    def test_cancel_restores_saved_profile(self) -> None:
+    def test_save_button_saves_closes_and_allows_reopening(self) -> None:
+        for edited in (False, True):
+            with self.subTest(edited=edited):
+                manager = self.manager()
+                if edited:
+                    manager.form.port.set("7020")
+                manager.save_button.invoke()
+                self.assertFalse(manager.window.winfo_exists())
+                self.assertIsNone(self.app.profile_manager)
+                self.assertTrue(self.root.winfo_exists())
+                self.dialog_mocks["askyesnocancel"].assert_not_called()
+                expected_port = 7020 if edited else 7000
+                self.assertEqual(self.app.store.load().selected(HOST).port, expected_port)
+                reopened = self.manager()
+                self.assertIsNot(reopened, manager)
+                self.assertEqual(reopened.form.port.get(), str(expected_port))
+
+    def test_save_button_keeps_window_open_on_validation_or_write_failure(self) -> None:
         manager = self.manager()
-        manager.select_profile(self.app.config.selected_client_id)
-        manager.form.dev_account.set("9")
-        self.assertTrue(manager.is_dirty)
-        manager.cancel()
-        self.assertEqual(manager.form.dev_account.get(), "2")
-        self.assertFalse(manager.is_dirty)
-        self.assertEqual(self.app.store.load().selected(CLIENT).dev_account, 2)
+        manager.form.port.set("invalid")
+        manager.save_button.invoke()
+        self.assertTrue(manager.window.winfo_exists())
+        self.assertIs(self.app.profile_manager, manager)
+        self.assertEqual(manager.form.port.get(), "invalid")
+        self.dialog_mocks["showerror"].assert_called_once()
+        self.assertEqual(self.app.store.load().selected(HOST).port, 7000)
+
+        manager.form.port.set("7020")
+        with patch.object(self.app.store, "save", side_effect=launcher.LauncherError("无法写入配置")):
+            manager.save_button.invoke()
+        self.assertTrue(manager.window.winfo_exists())
+        self.assertIs(self.app.profile_manager, manager)
+        self.assertEqual(manager.form.port.get(), "7020")
+        self.assertEqual(self.dialog_mocks["showerror"].call_count, 2)
+        self.assertEqual(self.app.config.selected(HOST).port, 7000)
+        self.assertEqual(self.app.store.load().selected(HOST).port, 7000)
+
+    def test_cancel_button_discards_edits_and_closes(self) -> None:
+        for state in ("unchanged", "edited", "new"):
+            with self.subTest(state=state):
+                manager = self.manager()
+                if state == "new":
+                    manager.new_profile()
+                if state != "unchanged":
+                    manager.form.name.set("未保存的配置")
+                    manager.form.port.set("invalid")
+                cancel_button = next(
+                    button for button in manager.save_button.master.winfo_children()
+                    if str(button.cget("text")) == "取消"
+                )
+                cancel_button.invoke()
+                self.assertFalse(manager.window.winfo_exists())
+                self.assertIsNone(self.app.profile_manager)
+                self.assertTrue(self.root.winfo_exists())
+                self.dialog_mocks["askyesnocancel"].assert_not_called()
+                self.dialog_mocks["showerror"].assert_not_called()
+                self.assertEqual(len(self.app.config.profiles), 2)
+                self.assertEqual(self.app.store.load().selected(HOST).port, 7000)
+                reopened = self.manager()
+                self.assertEqual(reopened.form.port.get(), "7000")
+                self.assertFalse(reopened.is_dirty)
 
     def test_switching_with_unsaved_edits_asks_before_discarding(self) -> None:
         manager = self.manager()

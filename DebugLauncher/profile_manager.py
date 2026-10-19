@@ -209,7 +209,7 @@ class ProfileManagerWindow:
 
         actions = ttk.Frame(outer)
         actions.grid(row=1, column=0, columnspan=2, sticky=tk.E, pady=(12, 0))
-        self.save_button = ttk.Button(actions, text="保存", width=8, command=self.save)
+        self.save_button = ttk.Button(actions, text="保存", width=8, command=self.save_and_close)
         self.save_button.pack(side=tk.LEFT)
         ttk.Button(actions, text="另存为", width=8, command=self.save_as).pack(side=tk.LEFT, padx=6)
         ttk.Button(actions, text="取消", width=8, command=self.cancel).pack(side=tk.LEFT)
@@ -488,7 +488,12 @@ class ProfileManagerWindow:
         else:
             self._load_draft(LaunchProfile(name="新 Host 配置", role=NetworkRole.HOST))
 
+    def save_and_close(self) -> None:
+        if self.save():
+            self.cancel()
+
     def save(self) -> bool:
+        """Save without closing so profile switching can continue in this window."""
         is_new, active = self.current_id is None, bool(self.active_var.get())
         try:
             profile = self.collect()
@@ -528,18 +533,14 @@ class ProfileManagerWindow:
             self._load_profile(profile)
 
     def cancel(self) -> None:
-        if self.current_id is None:
-            self._discard_draft()
-            return
-        profile = self.get_config().profile(self.current_id)
-        if profile is not None:
-            self._load_profile(profile)
+        """Discard unsaved edits and close the configuration manager."""
+        self.window.destroy()
+        self.on_closed()
 
     def close(self) -> bool:
         if not self.resolve_unsaved():
             return False
-        self.window.destroy()
-        self.on_closed()
+        self.cancel()
         return True
 
     def _discard_draft(self) -> None:
