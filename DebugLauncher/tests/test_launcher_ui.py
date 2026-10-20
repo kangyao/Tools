@@ -344,7 +344,7 @@ class LauncherUiTests(unittest.TestCase):
         original_factory = self.factory
 
         def fail_second(executable, arguments, show_console, environment, initial_window_rect=None):
-            if "3" == arguments[arguments.index("-MGFDevAccount") + 1]:
+            if "3" == arguments[arguments.index("-MGFTestAccount") + 1]:
                 raise launcher.LauncherError("无法启动第二个 Client")
             return original_factory(executable, arguments, show_console, environment, initial_window_rect)
 
@@ -527,8 +527,6 @@ class LauncherUiTests(unittest.TestCase):
     def test_open_log_opens_the_instance_log_file(self) -> None:
         bin_dir = Path(self.directory.name) / "Bin64"
         bin_dir.mkdir()
-        log = bin_dir / "AICoreApp_dev2.log"
-        log.write_text("log", encoding="utf-8")
         self.seed(
             LaunchProfile(name="本机 Host", role=HOST, executable=str(bin_dir / "AICore.exe")),
             LaunchProfile(name="本机 Client", role=CLIENT, executable=str(bin_dir / "AICore.exe")),
@@ -539,6 +537,8 @@ class LauncherUiTests(unittest.TestCase):
         self.app.role_controls[CLIENT].start_button.invoke()
         self.wait_until_idle()
         first, second = self.app.instance_tree.get_children()
+        log = self.app._instance_log_path(int(first))
+        log.write_text("log", encoding="utf-8")
         self.app.instance_tree.selection_set(first)
         self.root.update()
         with patch.object(launcher.os, "startfile", create=True) as startfile:
@@ -549,7 +549,7 @@ class LauncherUiTests(unittest.TestCase):
             self.root.update()
             with patch.object(launcher.messagebox, "askyesno", return_value=True) as ask:
                 self.app.log_button.invoke()
-            self.assertIn("AICoreApp_dev3.log", ask.call_args.args[1])
+            self.assertIn(self.app._instance_log_path(int(second)).name, ask.call_args.args[1])
             startfile.assert_called_once_with(bin_dir)
 
     def test_double_click_on_instance_opens_its_log(self) -> None:
@@ -560,7 +560,7 @@ class LauncherUiTests(unittest.TestCase):
             self.app._on_instance_double_click(type("Event", (), {"y": 5})())
         open_log.assert_called_once_with()
         self.assertEqual(
-            self.app._instance_log_path(1).name, "AICoreApp.log",
+            self.app._instance_log_path(1).name, "AICoreApp-server.log",
         )
 
     def test_view_command_shows_actual_dev_account_and_debug_port(self) -> None:
@@ -570,7 +570,7 @@ class LauncherUiTests(unittest.TestCase):
         self.wait_until_idle()
         second = self.app.instance_tree.get_children()[-1]
         command = self.app._instance_command(int(second))
-        self.assertIn("-MGFDevAccount 3", command)
+        self.assertIn("-MGFTestAccount 3", command)
         self.assertNotIn("-MGFNetUin", command)
         self.assertIn("-lua-debug-port", command)
 
@@ -757,10 +757,10 @@ class LauncherUiTests(unittest.TestCase):
         self.assertEqual(manager.form.extra_arguments.get(), '-extra "a b"')
         self.assertIn("-MGFNetPort 7200", manager.preview_var.get())  # 编辑中不改写用户文字。
         manager._finish_command_edit()
-        self.assertEqual(
-            manager.preview_var.get(),
-            f"{DEFAULT_EXECUTABLE} -MGFDevAccount 1 -MGFNetRole Host -MGFNetPort 7200 -MGFNetRoomId 1 -extra \"a b\"",
-        )
+        self.assertTrue(manager.preview_var.get().startswith(
+            f"{DEFAULT_EXECUTABLE} -MGFTestAccount 1 -MGFNetRole Host -MGFNetPort 7200 -MGFNetRoomId 1 -extra \"a b\""
+        ))
+        self.assertIn("-MGFTestAccountFile", manager.preview_var.get())
         self.assertEqual(manager.form.project_root.get(), "")
         self.assertFalse(manager.form.skip_character_selection.get())
         self.assertTrue(manager.is_dirty)
@@ -880,7 +880,7 @@ class LauncherUiTests(unittest.TestCase):
         manager = self.manager()
         manager.select_profile(self.app.config.selected_host_id)
         self.assertIn("-MGFNetRole CloudServer", manager.preview_var.get())
-        self.assertNotIn("-MGFDevAccount", manager.preview_var.get())
+        self.assertNotIn("-MGFTestAccount", manager.preview_var.get())
         self.assertEqual(str(manager.account_entry.cget("state")), "disabled")
         manager.form.server_mode.set("Host")
         self.assertIn("-MGFNetRole Host", manager.preview_var.get())

@@ -29,14 +29,14 @@ python .\launcher.py
 
 ```text
 -MGFNetRole CloudServer -MGFNetPort 7000 -MGFNetRoomId 1 -AICoreTestMode -AICoreTestServiceIdentity debug-launcher
--MGFDevAccount 2 -MGFNetRole Client -MGFNetHost 127.0.0.1 -MGFNetPort 7000 -MGFNetRoomId 1 -MGFNetServer CloudServer -AICoreTestMode
+-MGFTestAccount 2 -MGFTestAccountFile <工程>/.project/account.json -MGFNetRole Client -MGFNetHost 127.0.0.1 -MGFNetPort 7000 -MGFNetRoomId 1 -MGFNetServer CloudServer -AICoreTestMode
 ```
 
 本地联调默认开启测试模式；票据留空由宿主提供默认测试票据。自定义票据最多 32 字节，两端须一致；CloudServer 的测试服务身份最多 128 字节。单机不携带这些参数，也不等待服务端。
 
-`-MGFDevAccount N` 选 `AIGamePlay/.project/account.json` 的第 N 个开发账号登录（Listen Host 默认 1、Client 默认 2；DS 为 mock，不占开发账号）。除云服外所有角色都要真实登录，联机身份取登录账号的 uin；旧的 `-MGFNetUin` 已被 AICore 移除，传入会判 `NetLaunchInvalid: uin`，启动器读取旧配置时自动丢弃，额外参数中填写会提示删除。
+账号序号通过 `-MGFTestAccount N -MGFTestAccountFile <工程>/.project/account.json` 传给当前 AICore，使用真实账号登录；Listen Host 默认 1、Client 默认 2，DS 使用服务身份。旧 `-MGFDevAccount` 配置读取时兼容，启动时转成新参数；原生程序不再用旧参数选择账号。
 
-**额外参数** 用于填写其他 App 参数，含空格的值用双引号；按 Windows 命令行规则解析，不通过 shell 执行。额外参数中不能重复填写 `-MGFNet*` 网络参数与 `-MGFDevAccount`、`-script-debug-wait-client` 或 `-lua-debug-port`，应改用对应的表单字段或选项。命令预览与实际启动使用同一份参数列表。
+**额外参数** 用于填写其他 App 参数，含空格的值用双引号；按 Windows 命令行规则解析，不通过 shell 执行。额外参数中不能重复填写 `-MGFNet*` 网络参数与 `-MGFTestAccount`、`-script-debug-wait-client` 或 `-lua-debug-port`，应改用对应的表单字段或选项。命令预览与实际启动使用同一份参数列表。
 
 配置管理中的 **启动命令** 可以直接编辑：能解析的修改会立即同步到表单字段（程序路径、类型、地址、端口、房间、开发账号、等待调试器、额外参数），解析失败时表单保持不变并提示原因，按 Esc 放弃无效的命令文字；配置名称、显示控制台、自动分配账号等命令中没有的设置保持不变。编辑结果同样需要点 **保存** 才生效。
 
@@ -51,7 +51,7 @@ python .\launcher.py
 
 联机启动前检查地址为本机，端口、房间、服务端模式、测试模式和票据两端一致。Host 失败时不启动 Client；Client 失败时 Host 保留，可单独重试或关闭。
 
-AICore 按开发账号加锁，同一台机器上每个进程必须用不同账号。启用自动分配时，Client 从配置的账号序号开始，跳过本启动器管理的所有实例（含 Host，不论房间）已占用的序号，并用与 StartGame 相同的全局 dev<N>.lock 检查避开其他启动器占用的账号；实际序号只属于本次实例，保存的配置不会被递增。关闭自动分配时使用固定序号，与已运行实例冲突时给出错误，且 Client 数量只能为 1。多个 Client 中某个启动失败时停止后续启动，已启动的保留，并提示已启动的数量。
+自动分配从配置序号起，跳过受管实例及两类原生账号锁：临时目录的 `miniw_devaccount/dev<N>.lock`，EXE 目录的 `WritePath/test_account_locks/<uin>.lock`。固定账号占用时在创建进程前提示；账号序号只作用于本次实例，不递增保存配置。批量启动等前一个 Client 的 PID、工程、实例 ID 与 HTTP 宿主就绪状态核对成功，再启动下一个；超时或失败保留已启动实例并停止后续启动。显式等待调试器时由 IDE 控制继续。
 
 其他功能：
 
@@ -63,7 +63,7 @@ AICore 按开发账号加锁，同一台机器上每个进程必须用不同账�
 - **关闭选中实例 / 批量关闭 / 关闭全部**：多选时按钮显示选中数量，只关闭本次选中的实例；“关闭全部”处理所有受管实例。各实例的关闭请求并发发起，不再等前一个退出后才关闭下一个；每个实例仍优先通过已验证 PID / instance_id / 工程的 AICore HTTP 正常停止，不支持或超时才结束受管 Job 进程树。等待全部请求完成后汇总成功数量和失败原因，未关闭的实例继续受管。各进程实际退出时间可能不同。
 - **重启选中实例 / 批量重启**：支持多选，分别使用每个实例的启动快照（参数、实际开发账号、调试端口），不受之后的配置编辑影响；某个实例失败后继续处理其余实例并汇总结果，完成后统一平铺一次。要使用修改后的配置，关闭旧实例后重新启动。查看命令、打开日志需单选实例。
 - **查看启动命令**：显示所选实例实际传递的完整命令，包括自动分配的 `-lua-debug-port`，可复制。
-- **打开日志**（或双击实例行）：用系统关联程序打开该实例的日志文件。路径按 AICore `WinGameStart.cpp` 的规则推算，位于 EXE 所在目录：`-AICoreLogFile` 指定的文件名优先；其次 `-AICoreNetRole Dedicated` 为 `AICoreApp-server.log`、`Client` 为 `AICoreApp-client-<PID>.log`；再次 `-MGFDevAccount N` 为 `AICoreApp_devN.log`；否则 `AICoreApp.log`。文件尚不存在时提示路径，并可打开所在目录。注意同一开发账号的实例共用一个日志文件。
+- **打开日志**（或双击实例行）：优先使用 `-AICoreLogFile`；否则 DS 为 `AICoreApp-server.log`，Client 为 `AICoreApp-client-<PID>.log`，单机为 `AICoreApp.log`。账号参数不改变日志名；文件未生成时可打开所在目录。
 - **等待 Lua 调试器**：追加 `-script-debug-wait-client`，新建配置默认关闭。勾选后 App 会停在启动阶段，直到 IDE 通过 Attach Lua 连接后才继续运行。
 - **Attach 状态**：从 `.run/Lua.run.xml` 读取配置名和端口；两个状态图片分别显示 IDE 到 DAP/桥接、桥接到 App ScriptDebugger 的连接情况。缺失调试组件时只提示一次，App 仍可正常启动。
 - **窗口启动位置**：保存启动器窗口尺寸；每次打开时忽略上次所在显示器，并在主显示器中央启动。
@@ -125,6 +125,8 @@ GUI 运行日志出现 `AIFramework offline; waiting for restart` 表示正在�
 启动器使用 Windows Job Object 管理进程树，只能关闭当前 GUI 实例亲自启动的进程，不会按名称查找或终止其他 App 实例。关闭启动器窗口时，它管理的 App、常驻调试桥和 Node DAP 也会被关闭。
 
 ## 验证记录
+
+2026-10-20（账号多开修复）：真实启动 1 DS + 3 Client，3 个不同账号均登录、通过 Hello 验票，服务端记录 3 名玩家加入；验证进程正常关闭。修复旧账号参数失效、两类账号锁检查、批量初始化等待及日志命名。
 
 2026-10-20：205 项回归中 204 项 `pass`，1 项仍因缺少 `.run/Lua.run.xml` 报错。通过主界面按钮启动真实 AICore：单机登录成功；1 DS + 1 Client 的会话和房间均 Ready，Hello 验票通过，服务端记录玩家加入。测试进程已正常关闭。
 

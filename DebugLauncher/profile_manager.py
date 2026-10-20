@@ -177,7 +177,7 @@ class ProfileManagerWindow:
         ttk.Entry(form, textvariable=f.port, width=10).grid(row=6, column=1, sticky=tk.W, pady=3)
         ttk.Label(form, text="房间").grid(row=6, column=2, sticky=tk.W, padx=(16, 6))
         ttk.Entry(form, textvariable=f.room_id, width=10).grid(row=6, column=3, sticky=tk.W, pady=3)
-        # 开发账号序号：AIGamePlay/.dev/account.json 的第 N 项，生成 -MGFDevAccount N；Host 与 Client 都需要登录。
+        # 账号序号：.project/account.json 第 N 项，通过原生测试账号入口登录。
         self.account_label = self._label(form, "开发账号序号", 7)
         self.account_entry = ttk.Entry(form, textvariable=f.dev_account, width=10)
         self.account_entry.grid(row=7, column=1, sticky=tk.W, pady=3)

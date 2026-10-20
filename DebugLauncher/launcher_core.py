@@ -17,7 +17,7 @@ from typing import Callable, Mapping, Protocol, Sequence
 import xml.etree.ElementTree as ET
 
 
-from aicore_control import argument_value, available_dev_account, owned_ports, request_stop
+from aicore_control import argument_value, available_dev_account, owned_ports, request_stop, resolve_account_file, runtime_ready
 from window_layout import Rect
 
 
@@ -35,12 +35,13 @@ MCP_CLIENT_NAME_ENVIRONMENT_VARIABLE = "MINIGAME_MCP_CLIENT_NAME"
 DEFAULT_NETWORK_HOST = "127.0.0.1"
 DEFAULT_NETWORK_PORT = 7000
 DEFAULT_NETWORK_ROOM_ID = 1
-DEV_ACCOUNT_ARGUMENT = "-MGFDevAccount"
+DEV_ACCOUNT_ARGUMENT = "-MGFTestAccount"
+LEGACY_DEV_ACCOUNT_ARGUMENT = "-MGFDevAccount"
 # 开发账号序号（AIGamePlay/.project/account.json 的数组位置，1 起）：Host 默认 1，Client 默认 2。
 # AICore 按账号加锁，同一台机器上每个进程必须用不同的账号。
 DEFAULT_DEV_ACCOUNTS = {"host": 1, "client": 2}
 NETWORK_ARGUMENTS = (
-    DEV_ACCOUNT_ARGUMENT, "-MGFNetRole", "-MGFNetHost", "-MGFNetPort", "-MGFNetRoomId", "-MGFNetServer",
+    DEV_ACCOUNT_ARGUMENT, LEGACY_DEV_ACCOUNT_ARGUMENT, "-MGFNetRole", "-MGFNetHost", "-MGFNetPort", "-MGFNetRoomId", "-MGFNetServer",
 )
 # 已移除的旧参数：客机身份改取登录账号，AICore 收到会判 NetLaunchInvalid: uin；读取旧参数时丢弃。
 LEGACY_NETWORK_ARGUMENTS = ("-MGFNetUin",)
@@ -123,7 +124,7 @@ class NetworkRole(str, Enum):
 
 
 def default_dev_account(role: NetworkRole) -> int:
-    """Default dev account index for a role; 0 means the role passes no -MGFDevAccount."""
+    """Default account index for a role; 0 means no explicit account selector."""
     return DEFAULT_DEV_ACCOUNTS.get(role.value, 0)
 
 
@@ -184,6 +185,8 @@ def parse_network_arguments(arguments: Sequence[str]) -> NetworkOptions:
             continue
         if argument not in NETWORK_ARGUMENTS:
             continue
+        if argument == LEGACY_DEV_ACCOUNT_ARGUMENT:
+            argument = DEV_ACCOUNT_ARGUMENT
         if argument in values:
             raise ConfigurationError(f"网络参数 {argument} 不能重复。")
         if index == len(arguments) or arguments[index].startswith("-"):
@@ -501,16 +504,12 @@ class DebugPortBundle:
     dap_port: int
 
 
-_MAX_DEV_ACCOUNT_DIGITS = 9
-
-
 def resolve_app_log_path(
     executable: str, arguments: Sequence[str], pid: int | None,
 ) -> Path:
     """Return the log file an AICore App writes next to its executable.
 
-    Mirrors GetLogFileName / ResolveDevAccountLogTag in AiFrameworkApp/WinApp/WinGameStart.cpp:
-    -AICoreLogFile wins, then -AICoreNetRole Dedicated / Client, then -MGFDevAccount, else AICoreApp.log.
+    Mirrors AICoreStartupArguments::GetLogFileName: explicit file, network role, default file.
     """
 
     directory = Path(os.path.expandvars(executable)).expanduser().parent
@@ -527,20 +526,11 @@ def resolve_app_log_path(
     explicit = value("-AICoreLogFile")
     if explicit and not any(separator in explicit for separator in "\\/:"):
         return directory / explicit
-    role = value("-AICoreNetRole")
-    if role == "Dedicated":
+    role = value("-AICoreRunMode") or value("-MGFNetRole") or value("-AICoreNetRole")
+    if role in ("Dedicated", "CloudServer"):
         return directory / "AICoreApp-server.log"
     if role == "Client":
         return directory / f"AICoreApp-client-{process}.log"
-    for index, argument in enumerate(arguments):
-        if argument.casefold() != DEV_ACCOUNT_ARGUMENT.casefold():
-            continue
-        account = arguments[index + 1] if index + 1 < len(arguments) else ""
-        if account.isdigit() and account.isascii() and not account.startswith("0") and (
-            len(account) <= _MAX_DEV_ACCOUNT_DIGITS
-        ):
-            return directory / f"AICoreApp_dev{account}.log"
-        return directory / f"AICoreApp_dev-{process}.log"
     return directory / "AICoreApp.log"
 
 
@@ -552,6 +542,11 @@ def build_launch_arguments(
 
     arguments = list(settings.enabled_arguments)
     if Path(settings.executable).stem.casefold() in ("aicore", "aicore_profile", "aicore_d"):
+        arguments = [DEV_ACCOUNT_ARGUMENT if argument == LEGACY_DEV_ACCOUNT_ARGUMENT else argument for argument in arguments]
+        if settings.network.dev_account and argument_value(arguments, DEV_ACCOUNT_ARGUMENT) is None:
+            arguments.extend((DEV_ACCOUNT_ARGUMENT, str(settings.network.dev_account)))
+        if argument_value(arguments, DEV_ACCOUNT_ARGUMENT) is not None and argument_value(arguments, "-MGFTestAccountFile") is None:
+            arguments.extend(("-MGFTestAccountFile", str(resolve_account_file(arguments, settings.executable))))
         _append_sdk_framework_root(arguments, settings.executable)
     if debug_ports is not None:
         arguments.extend((LUA_DEBUG_PORT_ARGUMENT, str(debug_ports.target_port)))
@@ -1008,6 +1003,20 @@ class WindowsJobProcess:
             cancel.wait(0.2)
         raise LauncherError(f"服务端（PID {self.pid}）未在 {timeout:g} 秒内监听 UDP {port}。")
 
+    def wait_runtime_ready(self, cancel: threading.Event, timeout: float = 60) -> None:
+        if Path(self._executable).stem.casefold() not in ("aicore", "aicore_profile", "aicore_d"):
+            return
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if self.poll() is not None:
+                raise LauncherError(f"Client（PID {self.pid}）在初始化时退出，查看实例日志。")
+            if cancel.is_set():
+                raise LauncherError("已取消后续 Client 启动。")
+            if runtime_ready(self.pid, self._arguments, self._executable):
+                return
+            cancel.wait(0.2)
+        raise LauncherError(f"Client（PID {self.pid}）未在 {timeout:g} 秒内完成宿主初始化，后续实例未启动。")
+
     def close(self) -> None:
         with self._lock:
             if self._job_handle:
@@ -1232,6 +1241,11 @@ class LauncherController:
                 raise LauncherError("启动器正在关闭，不能再启动 App。")
             self._reap_finished_processes()
             self._validate_network_identity(settings)
+            if self._native_process_factory and settings.network.dev_account and Path(settings.executable).stem.casefold() in ("aicore", "aicore_profile", "aicore_d"):
+                try:
+                    available_dev_account(settings.network.dev_account, set(), settings.enabled_arguments, settings.executable, exact=True)
+                except (OSError, ValueError) as exc:
+                    raise LauncherError(str(exc)) from None
             debug_ports = self._acquire_debug_slot()
             arguments = build_launch_arguments(settings, debug_ports)
             try:
@@ -1346,6 +1360,12 @@ class LauncherController:
                 clients.append(snapshot)
                 if on_client_started is not None:
                     on_client_started(snapshot)
+                if _index + 1 < count and DEBUG_WAIT_ARGUMENT not in launch_settings.enabled_arguments:
+                    with self._lock:
+                        process = self._instances[snapshot.instance_id].process
+                    wait_ready = getattr(process, "wait_runtime_ready", None)
+                    if wait_ready is not None:
+                        wait_ready(cancel or threading.Event())
         except Exception as exc:
             if not clients:
                 raise

@@ -17,28 +17,56 @@ from urllib.request import HTTPRedirectHandler, ProxyHandler, Request, build_ope
 
 def argument_value(arguments: Sequence[str], name: str) -> str | None:
     for index, argument in enumerate(arguments):
-        if argument.casefold() == name.casefold() and index + 1 < len(arguments):
-            return arguments[index + 1]
+        key, separator, value = argument.partition("=")
+        if key.casefold() == name.casefold():
+            if separator:
+                return value
+            if index + 1 < len(arguments):
+                return arguments[index + 1]
     return None
 
 
-def available_dev_account(start: int, used: set[int], arguments: Sequence[str], executable: str) -> int:
-    """Use the same exclusive dev<N>.lock probe as Start-NetDebug.ps1."""
+def resolve_account_file(arguments: Sequence[str], executable: str) -> Path:
+    """Resolve the same explicit account file used by the generated native command."""
+    directory = Path(os.path.expandvars(executable)).expanduser().resolve().parent
+    explicit = argument_value(arguments, "-MGFTestAccountFile")
+    if explicit is not None:
+        if not explicit.strip():
+            raise ValueError("-MGFTestAccountFile 缺少账号文件路径。")
+        file = Path(os.path.expandvars(explicit)).expanduser()
+        return (file if file.is_absolute() else directory / file).resolve()
     project = argument_value(arguments, "-AICoreRoot")
-    limit = start + 63
     if project:
-        if not ntpath.isabs(project):
-            project = ntpath.normpath(ntpath.join(str(Path(executable).resolve().parent), project))
-        try:
-            payload = json.loads((Path(project) / ".project/account.json").read_text(encoding="utf-8-sig"))
-            accounts = payload.get("accounts") if isinstance(payload, dict) else None
-            if not isinstance(accounts, list) or not accounts:
-                raise ValueError("开发账号文件必须包含非空 accounts 数组。")
-            limit = len(accounts)
-        except FileNotFoundError:
-            pass  # Let the App report its own missing-account configuration.
-        except json.JSONDecodeError:
-            raise ValueError("开发账号文件 JSON 无效。") from None
+        root = Path(os.path.expandvars(project)).expanduser()
+        return ((root if root.is_absolute() else directory / root) / ".project/account.json").resolve()
+    default_project_file = directory.parent / "Source/AIGamePlay/.project/account.json"
+    if default_project_file.is_file():
+        return default_project_file.resolve()
+    environment = os.environ.get("AICORE_TEST_ACCOUNTS")
+    if environment:
+        file = Path(os.path.expandvars(environment)).expanduser()
+        return (file if file.is_absolute() else directory / file).resolve()
+    return directory / "aicore_test_accounts.json"
+
+
+def available_dev_account(start: int, used: set[int], arguments: Sequence[str], executable: str,
+                          *, exact: bool = False) -> int:
+    """Probe both global dev-account locks and native UIN-based test leases."""
+    file = resolve_account_file(arguments, executable)
+    try:
+        payload = json.loads(file.read_text(encoding="utf-8-sig"))
+    except json.JSONDecodeError:
+        raise ValueError("账号文件 JSON 无效。") from None
+    accounts = payload.get("accounts") if isinstance(payload, dict) else None
+    if not isinstance(accounts, list) or not accounts:
+        raise ValueError("账号文件必须包含非空 accounts 数组。")
+    for index, account in enumerate(accounts, 1):
+        uin = account.get("uin") if isinstance(account, dict) else None
+        if not isinstance(uin, int) or isinstance(uin, bool) or not 1 <= uin <= 4294967295:
+            raise ValueError(f"账号 #{index} 的 uin 无效。")
+    limit = len(accounts)
+    if exact and not 1 <= start <= limit:
+        raise ValueError(f"账号序号 {start} 超出账号文件范围（共 {limit} 个）。")
     kernel = ctypes.WinDLL("kernel32", use_last_error=True)
     kernel.CreateFileW.argtypes = (wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD,
                                   ctypes.c_void_p, wintypes.DWORD, wintypes.DWORD, wintypes.HANDLE)
@@ -47,17 +75,23 @@ def available_dev_account(start: int, used: set[int], arguments: Sequence[str], 
     kernel.CloseHandle.restype = wintypes.BOOL
     directory = Path(tempfile.gettempdir()) / "miniw_devaccount"
     directory.mkdir(exist_ok=True)
-    for index in range(start, limit + 1):
+    test_directory = Path(executable).resolve().parent / "WritePath/test_account_locks"
+    test_directory.mkdir(parents=True, exist_ok=True)
+    for index in range(start, (start if exact else limit) + 1):
         if index in used:
             continue
-        handle = kernel.CreateFileW(str(directory / f"dev{index}.lock"), 0xC0000000, 0, None, 4, 0x80, None)
-        if handle == ctypes.c_void_p(-1).value:
-            error = ctypes.get_last_error()
-            if error in (32, 33):
-                continue
-            raise OSError(error, "无法检查开发账号锁")
-        kernel.CloseHandle(handle)
-        return index
+        for path in (directory / f"dev{index}.lock", test_directory / f"{accounts[index - 1]['uin']}.lock"):
+            handle = kernel.CreateFileW(str(path), 0xC0000000, 0, None, 4, 0x80, None)
+            if handle == ctypes.c_void_p(-1).value:
+                error = ctypes.get_last_error()
+                if error in (32, 33):
+                    break
+                raise OSError(error, "无法检查账号锁")
+            kernel.CloseHandle(handle)
+        else:
+            return index
+    if exact:
+        raise ValueError(f"开发账号 {start} 已被占用，请选择其他账号或启用自动分配。")
     raise ValueError(f"没有空闲开发账号（从 {start} 开始，账号总数 {limit}）。")
 
 
@@ -109,6 +143,27 @@ def _http(base: str, route: str, payload: dict | None = None) -> dict:
     if not isinstance(result, dict) or result.get("ok") is not True or not isinstance(result.get("data"), dict):
         raise ValueError("Invalid AICore management response")
     return result["data"]
+
+
+def runtime_ready(pid: int, arguments: Sequence[str], executable: str) -> bool:
+    project = argument_value(arguments, "-AICoreRoot")
+    directory = Path(executable).resolve().parent
+    root = Path(project) if project else directory.parent / "Source/AIGamePlay"
+    if not root.is_absolute():
+        root = directory / root
+    try:
+        receipt = json.loads((root / ".project/AICore/instance.json").read_text(encoding="utf-8-sig"))
+        url = urlsplit(receipt["base_url"])
+        if (receipt.get("pid") != pid or url.scheme != "http" or url.hostname != "127.0.0.1"
+                or not url.port or url.path not in ("", "/") or url.username or url.query or url.fragment):
+            return False
+        info = _http(f"http://127.0.0.1:{url.port}", "/api/aicore/v1/info")
+        return (info.get("pid") == pid and info.get("instance_id") == receipt.get("instance_id")
+                and bool(info.get("instance_id")) and info.get("host_ready") is True
+                and ntpath.normcase(ntpath.normpath(str(info.get("project_path", ""))))
+                    == ntpath.normcase(ntpath.normpath(str(root))))
+    except (OSError, ValueError, KeyError, TypeError, HTTPException):
+        return False
 
 
 def request_stop(pid: int, arguments: Sequence[str], alive: Callable[[], bool], *, working_directory: str | None = None) -> bool:

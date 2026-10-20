@@ -37,6 +37,7 @@ from launcher_core import (  # noqa: E402
     format_command_preview,
     load_attach_configuration,
     parse_argument_text,
+    parse_network_arguments,
 )
 
 
@@ -102,7 +103,7 @@ class ConfigStoreTests(unittest.TestCase):
 
     def test_settings_round_trip(self) -> None:
         arguments = (
-            "-MGFDevAccount", "5", "-MGFNetRole", "Client", "-MGFNetHost", "192.168.1.25",
+            "-MGFTestAccount", "5", "-MGFNetRole", "Client", "-MGFNetHost", "192.168.1.25",
             "-MGFNetPort", "7001", "-MGFNetRoomId", "3",
             "-Custom", "value with spaces", "", 'a"b', "-script-debug-wait-client",
         )
@@ -233,22 +234,22 @@ class ConfigStoreTests(unittest.TestCase):
 
 class ArgumentTests(unittest.TestCase):
     def test_host_preset_matches_start_aicore_host_bat(self) -> None:
-        expected = ("-MGFDevAccount", "1", "-MGFNetRole", "Host", "-MGFNetPort", "7000", "-MGFNetRoomId", "1")
+        expected = ("-MGFTestAccount", "1", "-MGFNetRole", "Host", "-MGFNetPort", "7000", "-MGFNetRoomId", "1")
         arguments = apply_network_preset((), NetworkRole.HOST)
         self.assertEqual(arguments, expected)
         settings = LauncherSettings(arguments=arguments)
-        self.assertEqual(build_launch_arguments(settings), expected)
+        self.assertEqual(build_launch_arguments(settings)[:len(expected)], expected)
         self.assertEqual(settings.network.role, NetworkRole.HOST)
 
     def test_client_preset_matches_start_aicore_client_bat(self) -> None:
         expected = (
-            "-MGFDevAccount", "2", "-MGFNetRole", "Client", "-MGFNetHost", "127.0.0.1",
+            "-MGFTestAccount", "2", "-MGFNetRole", "Client", "-MGFNetHost", "127.0.0.1",
             "-MGFNetPort", "7000", "-MGFNetRoomId", "1",
         )
         arguments = apply_network_preset((), NetworkRole.CLIENT)
         self.assertEqual(arguments, expected)
         settings = LauncherSettings(arguments=arguments)
-        self.assertEqual(build_launch_arguments(settings), expected)
+        self.assertEqual(build_launch_arguments(settings)[:len(expected)], expected)
         self.assertEqual(settings.network, NetworkOptions(role=NetworkRole.CLIENT))
 
     def test_switching_presets_preserves_custom_options_without_stale_network_flags(self) -> None:
@@ -256,7 +257,7 @@ class ArgumentTests(unittest.TestCase):
         client = NetworkOptions(NetworkRole.CLIENT, "10.0.0.8", 7002, 5, 8).arguments()
         host = apply_network_preset(custom + client + ("-MGFNetUin", "10008"), NetworkRole.HOST)
         self.assertEqual(host, (
-            "-MGFDevAccount", "1", "-MGFNetRole", "Host", "-MGFNetPort", "7000", "-MGFNetRoomId", "1", *custom,
+            "-MGFTestAccount", "1", "-MGFNetRole", "Host", "-MGFNetPort", "7000", "-MGFNetRoomId", "1", *custom,
         ), "切换预设同时清掉已移除的 -MGFNetUin")
         self.assertEqual(apply_network_preset(host, NetworkRole.STANDALONE), custom)
 
@@ -269,12 +270,12 @@ class ArgumentTests(unittest.TestCase):
 
     def test_edited_network_values_drive_metadata_and_launch(self) -> None:
         arguments = parse_argument_text(
-            '-MGFDevAccount 7 -MGFNetRole Client -MGFNetHost 10.0.0.8 -MGFNetPort 7002 '
+            '-MGFTestAccount 7 -MGFNetRole Client -MGFNetHost 10.0.0.8 -MGFNetPort 7002 '
             '-MGFNetRoomId 12 -App "Custom App"'
         )
         settings = LauncherSettings(arguments=arguments)
         self.assertEqual(settings.network, NetworkOptions(NetworkRole.CLIENT, "10.0.0.8", 7002, 12, 7))
-        self.assertEqual(build_launch_arguments(settings), arguments)
+        self.assertEqual(build_launch_arguments(settings)[:len(arguments)], arguments)
 
     def test_invalid_network_values_are_rejected(self) -> None:
         invalid = (
@@ -282,7 +283,7 @@ class ArgumentTests(unittest.TestCase):
             ("-MGFNetPort", "0"), ("-MGFNetPort", "65536"),
             ("-MGFNetPort", "abc"), ("-MGFNetPort", "-MGFNetRoomId", "1"),
             ("-MGFNetHost", ""), ("-MGFNetRoomId", "0"),
-            ("-MGFDevAccount", "0"), ("-MGFDevAccount", "abc"), ("-MGFDevAccount",),
+            ("-MGFTestAccount", "0"), ("-MGFTestAccount", "abc"), ("-MGFTestAccount",),
             ("-MGFNetPort", "7000", "-MGFNetPort", "7001"),
             ("-lua-debug-port", "3382"),
         )
@@ -362,6 +363,94 @@ class FakeFactory:
         self.created.append(process)
         return process
 
+
+
+class NativeAccountArgumentsTests(unittest.TestCase):
+    def test_old_selector_is_translated_and_project_file_is_explicit(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            project = Path(directory) / "My Project"
+            settings = LauncherSettings(executable=str(Path(directory) / "bin/AICore_profile.exe"),
+                                        arguments=("-AICoreRoot", str(project), "-MGFDevAccount", "3",
+                                                   "-MGFNetRole", "Client"))
+            arguments = build_launch_arguments(settings)
+            self.assertNotIn("-MGFDevAccount", arguments)
+            self.assertEqual(arguments[arguments.index("-MGFTestAccount") + 1], "3")
+            self.assertEqual(arguments[arguments.index("-MGFTestAccountFile") + 1],
+                             str(project / ".project/account.json"))
+            self.assertEqual(parse_network_arguments(arguments).dev_account, 3)
+
+    def test_custom_account_file_survives_automatic_reassignment(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            file = str(Path(directory) / "custom accounts.json")
+            settings = LauncherSettings(arguments=NetworkOptions(role=NetworkRole.CLIENT).arguments()
+                                       + ("-MGFTestAccountFile", file))
+            controller = LauncherController(FakeFactory(), DebugPortAllocator(lambda _: True))
+            try:
+                result = controller.start_clients(settings, 3)
+                self.assertEqual([s.settings.network.dev_account for s in result.clients], [2, 3, 4])
+                for index, snapshot in enumerate(result.clients, 2):
+                    self.assertNotIn("-MGFDevAccount", snapshot.arguments)
+                    self.assertEqual(snapshot.arguments[snapshot.arguments.index("-MGFTestAccount") + 1], str(index))
+                    self.assertEqual(snapshot.arguments.count("-MGFTestAccountFile"), 1)
+                    self.assertEqual(snapshot.arguments[snapshot.arguments.index("-MGFTestAccountFile") + 1], file)
+            finally:
+                controller.shutdown()
+
+    def test_busy_fixed_account_fails_before_creating_an_app(self) -> None:
+        with patch.object(WindowsJobProcess, "launch") as launch, patch(
+            "launcher_core.available_dev_account", side_effect=ValueError("开发账号 3 已被占用")
+        ) as available:
+            controller = LauncherController(port_allocator=DebugPortAllocator(lambda _: True))
+            try:
+                settings = LauncherSettings(arguments=NetworkOptions(role=NetworkRole.CLIENT, dev_account=3).arguments())
+                with self.assertRaisesRegex(LauncherError, "账号 3 已被占用"):
+                    controller.start_client(settings, auto_dev_account=False)
+                self.assertTrue(available.call_args.kwargs["exact"])
+                launch.assert_not_called()
+                self.assertEqual(controller.snapshots(), ())
+            finally:
+                controller.shutdown()
+
+    def test_conflicting_old_and_new_selectors_are_rejected(self) -> None:
+        with self.assertRaisesRegex(ConfigurationError, "不能重复"):
+            LauncherSettings(arguments=("-MGFDevAccount", "2", "-MGFTestAccount", "3"))
+
+
+class BatchInitializationTests(unittest.TestCase):
+    def test_each_client_finishes_initialization_before_the_next_is_created(self) -> None:
+        events = []
+        base_factory = FakeFactory()
+        def factory(executable, arguments, show_console, environment, initial_window_rect=None):
+            process = base_factory(executable, arguments, show_console, environment, initial_window_rect)
+            events.append(("created", process.pid))
+            process.wait_runtime_ready = lambda cancel: events.append(("ready", process.pid))
+            return process
+        controller = LauncherController(factory, DebugPortAllocator(lambda _: True))
+        try:
+            result = controller.start_clients(LauncherSettings(arguments=NetworkOptions(role=NetworkRole.CLIENT).arguments()), 3)
+            pids = [s.pid for s in result.clients]
+            self.assertEqual(events, [("created", pids[0]), ("ready", pids[0]),
+                                      ("created", pids[1]), ("ready", pids[1]), ("created", pids[2])])
+        finally:
+            controller.shutdown()
+
+    def test_failed_initialization_keeps_started_client_and_stops_the_batch(self) -> None:
+        factory = FakeFactory()
+        def start(executable, arguments, show_console, environment, initial_window_rect=None):
+            process = factory(executable, arguments, show_console, environment, initial_window_rect)
+            def wait(cancel):
+                raise LauncherError("宿主初始化失败")
+            process.wait_runtime_ready = wait
+            return process
+        controller = LauncherController(start, DebugPortAllocator(lambda _: True))
+        try:
+            result = controller.start_clients(LauncherSettings(arguments=NetworkOptions(role=NetworkRole.CLIENT).arguments()), 3)
+            self.assertEqual(len(factory.created), 1)
+            self.assertEqual(len(result.clients), 1)
+            self.assertIn("初始化失败", result.error)
+            self.assertEqual(len(controller.snapshots()), 1)
+        finally:
+            controller.shutdown()
 
 
 class SdkLaunchArgumentsTests(unittest.TestCase):
@@ -490,26 +579,27 @@ class AppLogPathTests(unittest.TestCase):
         return path.name
 
     def test_names_follow_aicore_win_game_start_rules(self) -> None:
-        cases = {
-            "AICoreApp.log": (),
-            "AICoreApp_dev2.log": ("-MGFDevAccount", "2", "-MGFNetRole", "Client"),
-            "AICoreApp_dev1.log": ("-mgfdevaccount", "1"),
-            "AICoreApp_dev-42.log": ("-MGFDevAccount", "01"),
-            "AICoreApp-server.log": ("-AICoreNetRole", "Dedicated", "-MGFDevAccount", "3"),
-            "AICoreApp-client-42.log": ("-AICoreNetRole", "Client", "-MGFDevAccount", "3"),
-            "mine.log": ("-AICoreLogFile", "mine.log", "-AICoreNetRole", "Dedicated"),
-            "AICoreAvatarTerrainDemo.log": ("-MGFAvatarTerrainDemo", "-AICoreLogFile", "x.log"),
-        }
-        for expected, arguments in cases.items():
+        cases = (
+            ("AICoreApp.log", ()),
+            ("AICoreApp-client-42.log", ("-MGFTestAccount", "2", "-MGFNetRole", "Client")),
+            ("AICoreApp.log", ("-MGFTestAccount", "1")),
+            ("AICoreApp.log", ("-MGFDevAccount", "1")),
+            ("AICoreApp-server.log", ("-AICoreNetRole", "Dedicated", "-MGFTestAccount", "3")),
+            ("AICoreApp-server.log", ("-MGFNetRole", "CloudServer")),
+            ("AICoreApp-client-42.log", ("-AICoreRunMode", "Client")),
+            ("mine.log", ("-AICoreLogFile", "mine.log", "-AICoreNetRole", "Dedicated")),
+            ("AICoreAvatarTerrainDemo.log", ("-MGFAvatarTerrainDemo", "-AICoreLogFile", "x.log")),
+        )
+        for expected, arguments in cases:
             with self.subTest(arguments=arguments):
                 self.assertEqual(self.name(*arguments), expected)
 
     def test_log_file_with_a_path_is_ignored_like_the_app(self) -> None:
-        self.assertEqual(self.name("-AICoreLogFile", r"D:\x.log", "-MGFDevAccount", "4"), "AICoreApp_dev4.log")
+        self.assertEqual(self.name("-AICoreLogFile", r"D:\x.log", "-MGFTestAccount", "4"), "AICoreApp.log")
 
-    def test_dev_account_without_value_uses_pid(self) -> None:
-        self.assertEqual(self.name("-MGFDevAccount"), "AICoreApp_dev-42.log")
-        self.assertEqual(self.name("-MGFDevAccount", "x", pid=None), "AICoreApp_dev-<pid>.log")
+    def test_account_flags_do_not_change_default_log_name(self) -> None:
+        self.assertEqual(self.name("-MGFTestAccount"), "AICoreApp.log")
+        self.assertEqual(self.name("-MGFTestAccount", "x", pid=None), "AICoreApp.log")
 
 
 class LauncherControllerTests(unittest.TestCase):
@@ -677,8 +767,8 @@ class LauncherControllerTests(unittest.TestCase):
         self.assertEqual(observed, [(1, False, 1)])
         self.assertEqual(result.client.instance_id, 2)
         self.assertNotEqual(result.host.debug_ports, result.client.debug_ports)
-        self.assertEqual(self.factory.calls[0][1][:4], ("-MGFDevAccount", "1", "-MGFNetRole", "Host"))
-        self.assertEqual(self.factory.calls[1][1][:4], ("-MGFDevAccount", "2", "-MGFNetRole", "Client"))
+        self.assertEqual(self.factory.calls[0][1][:4], ("-MGFTestAccount", "1", "-MGFNetRole", "Host"))
+        self.assertEqual(self.factory.calls[1][1][:4], ("-MGFTestAccount", "2", "-MGFNetRole", "Client"))
 
     def test_pair_reuses_managed_host_and_allocates_another_client_dev_account(self) -> None:
         host = LauncherSettings(arguments=NetworkOptions(role=NetworkRole.HOST).arguments())
@@ -1097,7 +1187,7 @@ class GlobalDevAccountTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             project = Path(directory) / "project"
             (project / ".project").mkdir(parents=True)
-            (project / ".project/account.json").write_text(json.dumps({"accounts": [{}, {}, {}]}), encoding="utf-8")
+            (project / ".project/account.json").write_text(json.dumps({"accounts": [{"uin": 101}, {"uin": 102}, {"uin": 103}, {"uin": 104}]}), encoding="utf-8")
             lock_directory = Path(directory) / "miniw_devaccount"
             lock_directory.mkdir()
             kernel = ctypes.WinDLL("kernel32", use_last_error=True)
@@ -1107,13 +1197,22 @@ class GlobalDevAccountTests(unittest.TestCase):
             kernel.CloseHandle.argtypes = (wintypes.HANDLE,)
             handle = kernel.CreateFileW(str(lock_directory / "dev2.lock"), 0xC0000000, 0, None, 4, 0x80, None)
             self.assertNotEqual(handle, ctypes.c_void_p(-1).value)
+            lease_directory = Path(directory) / "bin/WritePath/test_account_locks"
+            lease_directory.mkdir(parents=True)
+            lease = kernel.CreateFileW(str(lease_directory / "103.lock"), 0xC0000000, 0, None, 4, 0x80, None)
+            self.assertNotEqual(lease, ctypes.c_void_p(-1).value)
             try:
                 with patch("aicore_control.tempfile.gettempdir", return_value=directory):
                     args = ("-AICoreRoot", str(project))
-                    self.assertEqual(available_dev_account(2, set(), args, DEFAULT_EXECUTABLE), 3)
+                    executable = str(Path(directory) / "bin/AICore_profile.exe")
+                    self.assertEqual(available_dev_account(2, set(), args, executable), 4)
+                    for occupied in (2, 3):
+                        with self.assertRaisesRegex(ValueError, "已被占用"):
+                            available_dev_account(occupied, set(), args, executable, exact=True)
                     with self.assertRaisesRegex(ValueError, "没有空闲开发账号"):
-                        available_dev_account(2, {3}, args, DEFAULT_EXECUTABLE)
+                        available_dev_account(2, {4}, args, executable)
             finally:
+                kernel.CloseHandle(lease)
                 kernel.CloseHandle(handle)
 
 

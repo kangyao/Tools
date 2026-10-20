@@ -6,6 +6,8 @@ from pathlib import Path
 from typing import Mapping
 import uuid
 
+from aicore_control import argument_value, resolve_account_file
+
 from launcher_core import (
     ConfigStore,
     ConfigurationError,
@@ -15,6 +17,7 @@ from launcher_core import (
     DEFAULT_NETWORK_HOST,
     DEFAULT_NETWORK_PORT,
     DEFAULT_NETWORK_ROOM_ID,
+    DEV_ACCOUNT_ARGUMENT,
     LEGACY_NETWORK_ARGUMENTS,
     LUA_DEBUG_PORT_ARGUMENT,
     LauncherSettings,
@@ -97,7 +100,7 @@ class LaunchProfile:
     host: str = DEFAULT_NETWORK_HOST
     port: int = DEFAULT_NETWORK_PORT
     room_id: int = DEFAULT_NETWORK_ROOM_ID
-    # 开发账号序号（-MGFDevAccount）；0 表示取角色默认值（Host 1、Client 2）。
+    # 账号序号（-MGFTestAccount）；0 表示取角色默认值（Host 1、Client 2）。
     dev_account: int = 0
     auto_dev_account: bool = True
     extra_arguments: tuple[str, ...] = ()
@@ -203,7 +206,7 @@ class LaunchProfile:
         arguments = self.network.arguments()
         if self.role is NetworkRole.STANDALONE:
             if self.dev_account:
-                arguments += ("-MGFDevAccount", str(self.dev_account))
+                arguments += (DEV_ACCOUNT_ARGUMENT, str(self.dev_account))
         else:
             if self.test_mode:
                 arguments += ("-AICoreTestMode",)
@@ -255,15 +258,20 @@ def profile_from_command(command: str, base: LaunchProfile) -> LaunchProfile:
     for argument in arguments:
         if argument in LEGACY_NETWORK_ARGUMENTS:
             raise ConfigurationError(
-                f"{argument} 已移除（客机身份改取登录账号），请删除；用 -MGFDevAccount 选择账号。"
+                f"{argument} 已移除（客机身份改取登录账号），请删除；用 -MGFTestAccount 选择账号。"
             )
     network = parse_network_arguments(arguments)
     if network.role is NetworkRole.STANDALONE and any(
-        argument in NETWORK_ARGUMENTS and argument not in ("-MGFNetRole", "-MGFDevAccount") for argument in arguments
+        argument in NETWORK_ARGUMENTS and argument not in ("-MGFNetRole", "-MGFDevAccount", DEV_ACCOUNT_ARGUMENT) for argument in arguments
     ):
         raise ConfigurationError("单机命令不能包含联机地址、端口或房间参数。")
     extras = apply_network_preset(arguments, NetworkRole.STANDALONE)
     project, extras = _split_project_arguments(extras)
+    if "-MGFTestAccountFile" in extras and argument_value(base.extra_arguments, "-MGFTestAccountFile") is None:
+        index = extras.index("-MGFTestAccountFile")
+        default_file = resolve_account_file(("-AICoreRoot", project) if project else (), executable)
+        if extras[index + 1:index + 2] == (str(default_file),):
+            extras = extras[:index] + extras[index + 2:]
     skip_selection = base.skip_character_selection if has_initial_character(extras) else False
     # Keep explicit custom characters in extras; the checkbox supplies only the default Avatar.
     if not has_initial_character(base.extra_arguments):

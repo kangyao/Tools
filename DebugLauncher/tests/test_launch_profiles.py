@@ -31,7 +31,7 @@ class LaunchProfileTests(unittest.TestCase):
     def test_arguments_match_scripts_then_extras_then_debug_wait(self) -> None:
         profile = client(extra_arguments=("-client-only", "a b"), debug_wait=True)
         self.assertEqual(profile.settings().arguments, (
-            "-MGFDevAccount", "2", "-MGFNetRole", "Client", "-MGFNetHost", "127.0.0.1", "-MGFNetPort", "7000",
+            "-MGFTestAccount", "2", "-MGFNetRole", "Client", "-MGFNetHost", "127.0.0.1", "-MGFNetPort", "7000",
             "-MGFNetRoomId", "1", "-MGFNetServer", "CloudServer",
             "-AICoreTestMode",
             "-client-only", "a b", "-AICoreRoot", r"C:\MiniGame\Source\AIGamePlay",
@@ -73,7 +73,7 @@ class LaunchProfileTests(unittest.TestCase):
             "-lua-debug-port": lambda: host(extra_arguments=("-lua-debug-port", "1")),
             "开发账号序号": lambda: client(dev_account=-1),
             "-MGFNetUin 已移除": lambda: client(extra_arguments=("-MGFNetUin", "10001")),
-            "网络参数 -MGFDevAccount": lambda: host(extra_arguments=("-MGFDevAccount", "3")),
+            "网络参数 -MGFTestAccount": lambda: host(extra_arguments=("-MGFTestAccount", "3")),
             "配置名称": lambda: host(name="  "),
             "端口": lambda: host(port=70000),
             "房间号": lambda: host(room_id=0),
@@ -108,7 +108,7 @@ class LaunchProfileTests(unittest.TestCase):
             (edited.role, edited.executable, edited.host, edited.port, edited.room_id),
             (NetworkRole.CLIENT, r"D:\Bin\App.exe", "10.0.0.9", 7100, 4),
         )
-        self.assertEqual(edited.dev_account, 2)  # 未写 -MGFDevAccount 时取 Client 默认值。
+        self.assertEqual(edited.dev_account, 2)  # 未写 -MGFTestAccount 时取 Client 默认值。
         self.assertEqual(edited.extra_arguments, ("-custom", "x y"))
         self.assertTrue(edited.debug_wait)
         self.assertEqual((edited.id, edited.name, edited.show_console), (base.id, base.name, False))
@@ -358,7 +358,7 @@ class DedicatedProfilesTests(unittest.TestCase):
         target = client().settings()
         self.assertTrue(server.network.is_dedicated)
         self.assertEqual(server.network.dev_account, 0)
-        self.assertNotIn("-MGFDevAccount", server.arguments)
+        self.assertNotIn("-MGFTestAccount", server.arguments)
         self.assertIn("CloudServer", target.arguments)
         self.assertEqual(pair_mismatches(host(), client(server_mode="Host"))[0],
                          "服务端模式 Host 与 Host 的 CloudServer 不一致")
