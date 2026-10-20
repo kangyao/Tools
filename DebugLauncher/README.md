@@ -12,22 +12,27 @@ python .\launcher.py
 
 主界面只负责启动，配置的编辑和激活都在 **配置管理** 窗口中完成。详细设计见 [CONFIGURATION_PLAN.md](CONFIGURATION_PLAN.md)。
 
-1. 点击 **配置管理**，新建或编辑 Host、Client 配置：填写配置名称、类型、服务端模式、程序路径、端口和房间；Client 与 Listen Host 使用开发账号序号，Client 另有主机地址和“多开时自动分配不同账号”。点击 **保存** 后才会生效。
-2. 在配置管理中为 Host、Client 各勾选一份 **激活**（列表中以 ✓ 标记）。每种类型只能激活一份，勾选后立即在主界面显示，无需点保存。
-3. 主界面显示激活的 Host、Client 配置及参数摘要。设置 Client **数量** 后，点击 **启动 Host**、**启动 N 个 Client** 单独启动，或点击 **一键启动 Host + N 个 Client**：先启动 Host（已有相同配置的受管 Host 时直接复用），等待设定的间隔（默认 2 秒）后依次启动 N 个 Client。启用自动平铺时，一键启动会在创建进程前预留整批窗口的位置与尺寸，并随每个窗口创建立即定位，不再等待整批启动完毕后统一搬动。启动器还会确认该受管服务端 PID 已监听配置的 UDP 端口（最多 30 秒），未就绪时不启动 Client。激活状态、数量和间隔都会被记住。
+1. 主界面点击 **启动单机** 即可独立运行；点击 **启动联机** 自动启动服务端与设定数量的 Client。仍可分别启动 Host / Client。
+2. 在 **配置管理** 中分别设置单机、Host、Client 的参数，每种类型各激活一份配置（✓）。修改后点击 **保存** 生效。
+3. 通用字段包括程序路径、目标工程、角色选择、账号、控制台、调试等待和额外参数。单机账号 0 表示沿用程序默认账号。联机另有服务端模式、地址、端口、房间、测试模式、票据与服务身份；单机隐藏联机字段。
+4. 联机先启动或复用相同配置的 Host，确认其 PID 监听 UDP 端口后，再按间隔启动 Client。默认间隔 2 秒，状态与数量会保存；自动平铺在进程创建前规划窗口位置。
 
 默认服务端模式为 `CloudServer`，与 AIGamePlay `StartGame.bat` 一致；配置类型 Host 表示服务端配置，运行实例中 DS 显示为 **DS / mock**。需要本地主机玩家时，把两端服务端模式都改为 `Host`。
 
-默认 AICore 程序会自动补 `-AICoreRoot C:\MiniGame\Source\AIGamePlay`；显式填写的工程路径和自选 EXE 保留。
+**目标工程** 默认 `C:\MiniGame\Source\AIGamePlay`，可输入路径或浏览选择目录；启动时生成 `-AICoreRoot <目录>`，留空使用程序默认工程。旧配置额外参数中的 `-AICoreRoot` 自动迁入此字段；编辑启动命令也会同步此字段。
+
+配置管理中的 **跳过角色选择（默认 Avatar）** 默认开启，与 AIGamePlay `GameLauncher.bat` 一致，自动追加 `-MGFInitialCharacter avatar_default`。取消勾选后不再自动追加，可手动选择角色；开关随每份配置保存，旧配置缺少该字段时默认开启。额外参数中显式指定的 `-MGFInitialCharacter`（含 `=值` 写法）优先保留，不重复追加；要恢复手动选择，也需删除显式参数。
 
 工程使用 `dev-runtime.json` 格式 2 时，启动器按 `sdkRoot` 补充 `-AICoreFrameworkRoot <SDK>/AICoreScripts`，预览与实际命令一致。显式框架参数保留；SDK 缺少入口或工程残留旧 `AICoreScripts/` 目录时，启动前报告错误。Host 端口被其他进程占用时也在启动前提示，不关闭外部进程。
 
 默认网络参数：
 
 ```text
--MGFNetRole CloudServer -MGFNetPort 7000 -MGFNetRoomId 1
--MGFDevAccount 2 -MGFNetRole Client -MGFNetHost 127.0.0.1 -MGFNetPort 7000 -MGFNetRoomId 1 -MGFNetServer CloudServer
+-MGFNetRole CloudServer -MGFNetPort 7000 -MGFNetRoomId 1 -AICoreTestMode -AICoreTestServiceIdentity debug-launcher
+-MGFDevAccount 2 -MGFNetRole Client -MGFNetHost 127.0.0.1 -MGFNetPort 7000 -MGFNetRoomId 1 -MGFNetServer CloudServer -AICoreTestMode
 ```
+
+本地联调默认开启测试模式；票据留空由宿主提供默认测试票据。自定义票据最多 32 字节，两端须一致；CloudServer 的测试服务身份最多 128 字节。单机不携带这些参数，也不等待服务端。
 
 `-MGFDevAccount N` 选 `AIGamePlay/.project/account.json` 的第 N 个开发账号登录（Listen Host 默认 1、Client 默认 2；DS 为 mock，不占开发账号）。除云服外所有角色都要真实登录，联机身份取登录账号的 uin；旧的 `-MGFNetUin` 已被 AICore 移除，传入会判 `NetLaunchInvalid: uin`，启动器读取旧配置时自动丢弃，额外参数中填写会提示删除。
 
@@ -44,7 +49,7 @@ python .\launcher.py
 - 修改已激活配置的类型后，它不再是原类型的激活配置。
 - 当前有未保存修改时勾选“激活”，会先提示保存、放弃或继续编辑；新建的配置在保存时按勾选状态激活。
 
-一键启动前会检查激活的 Client 是否能连接激活的 Host：地址须为本机（`127.0.0.1`、`localhost`、`::1`），端口、房间和服务端模式须与 Host 一致，否则列出不匹配的字段。Host 启动失败时不会启动 Client；Client 启动失败时 Host 继续由启动器管理，可单独重试 Client 或关闭 Host。
+联机启动前检查地址为本机，端口、房间、服务端模式、测试模式和票据两端一致。Host 失败时不启动 Client；Client 失败时 Host 保留，可单独重试或关闭。
 
 AICore 按开发账号加锁，同一台机器上每个进程必须用不同账号。启用自动分配时，Client 从配置的账号序号开始，跳过本启动器管理的所有实例（含 Host，不论房间）已占用的序号，并用与 StartGame 相同的全局 dev<N>.lock 检查避开其他启动器占用的账号；实际序号只属于本次实例，保存的配置不会被递增。关闭自动分配时使用固定序号，与已运行实例冲突时给出错误，且 Client 数量只能为 1。多个 Client 中某个启动失败时停止后续启动，已启动的保留，并提示已启动的数量。
 
@@ -66,7 +71,9 @@ AICore 按开发账号加锁，同一台机器上每个进程必须用不同账�
 
 ## 配置存储与迁移
 
-配置保存在本目录的 `settings.local.json`（版本 5，已被 Git 忽略），包含具名配置集合（旧存档里的 `uin` 字段读取时忽略、`auto_uin` 沿用为 `auto_dev_account`）、激活的 Host / Client 配置（`selected_host` / `selected_client`）、Client 数量（`client_count`）、双端启动间隔、启动器窗口尺寸（保存的旧位置在启动时忽略）和自动平铺开关（`auto_tile_windows`）。配置新增 `server_mode`；旧版本 4 读取时默认 CloudServer，保留名称、标识、路径和激活状态。配置用稳定标识关联，改名后激活状态保持不变。
+配置保存在本目录的 `settings.local.json`（版本 7，Git 忽略）。每份配置独立保存参数，三种模式独立保存激活状态；保留 Client 数量、启动间隔、窗口尺寸和自动平铺设置。
+
+版本 1～6 自动补充“默认单机”，优先继承已激活 Client 的程序与工程路径，不复制联机参数或改变原有激活状态。联机旧配置缺少的新字段默认使用本地测试模式和测试服务身份。版本 7 删除单机配置后不会再次自动补回。
 
 首次读取旧版本配置时自动迁移为“默认 Host”和“默认 Client”：
 
@@ -118,6 +125,8 @@ GUI 运行日志出现 `AIFramework offline; waiting for restart` 表示正在�
 启动器使用 Windows Job Object 管理进程树，只能关闭当前 GUI 实例亲自启动的进程，不会按名称查找或终止其他 App 实例。关闭启动器窗口时，它管理的 App、常驻调试桥和 Node DAP 也会被关闭。
 
 ## 验证记录
+
+2026-10-20：205 项回归中 204 项 `pass`，1 项仍因缺少 `.run/Lua.run.xml` 报错。通过主界面按钮启动真实 AICore：单机登录成功；1 DS + 1 Client 的会话和房间均 Ready，Hello 验票通过，服务端记录玩家加入。测试进程已正常关闭。
 
 2026-10-15（一键启动预设位置）：完整 Python 回归共 183 项，182 项通过，另 1 项仍因缺少下述 IDE 配置文件报错。覆盖整批位置预规划、Listen Host / DS 区别、禁用开关、规划失败回退、启动中逐个定位及部分启动失败；原生子进程验证了 Windows 启动坐标和尺寸，真实 Win32 测试窗口验证了隐藏阶段定位及显示后的坐标校正。未启动真实 AICore 游戏实例。
 

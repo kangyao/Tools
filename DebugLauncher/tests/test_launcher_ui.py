@@ -159,7 +159,7 @@ class LauncherUiTests(unittest.TestCase):
         self.assertEqual(self.app.role_controls[HOST].name.get(), "Debug Host")
         self.assertEqual(self.app.role_controls[CLIENT].name.get(), "本机 Client")
         self.assertEqual(self.app.client_count_var.get(), "3")
-        self.assertEqual(str(self.app.start_pair_button.cget("text")), "一键启动 DS + 3 个 Client")
+        self.assertEqual(str(self.app.start_pair_button.cget("text")), "启动联机：DS + 3 个 Client")
 
     def test_deactivating_disables_that_role_only(self) -> None:
         self.activate("默认 Client", False)
@@ -587,6 +587,21 @@ class LauncherUiTests(unittest.TestCase):
 
     # ----- configuration manager ----------------------------------------------------------------
 
+    def test_project_field_browses_updates_command_and_persists(self) -> None:
+        manager = self.manager()
+        project = r"D:\Projects\Game With Spaces"
+        with patch.object(profile_manager.filedialog, "askdirectory", return_value=project):
+            manager._browse_project()
+        self.assertEqual(manager.form.project_root.get(), project)
+        self.assertEqual(manager.collect().project_root, project)
+        self.assertIn(f'-AICoreRoot "{project}"', manager.preview_var.get())
+        self.assertTrue(manager.save())
+        self.assertEqual(self.app.store.load().profile(manager.current_id).project_root, project)
+        manager.preview_var.set(
+            r'App.exe -MGFNetRole Client -AICoreRoot="D:\Other Project"'
+        )
+        self.assertEqual(manager.form.project_root.get(), r"D:\Other Project")
+
     def test_unsaved_edits_are_not_used_until_saved(self) -> None:
         manager = self.manager()
         manager.select_profile(self.app.config.selected_host_id)
@@ -656,7 +671,7 @@ class LauncherUiTests(unittest.TestCase):
                 self.assertTrue(self.root.winfo_exists())
                 self.dialog_mocks["askyesnocancel"].assert_not_called()
                 self.dialog_mocks["showerror"].assert_not_called()
-                self.assertEqual(len(self.app.config.profiles), 2)
+                self.assertEqual(len(self.app.config.profiles), 3)
                 self.assertEqual(self.app.store.load().selected(HOST).port, 7000)
                 reopened = self.manager()
                 self.assertEqual(reopened.form.port.get(), "7000")
@@ -744,12 +759,31 @@ class LauncherUiTests(unittest.TestCase):
         manager._finish_command_edit()
         self.assertEqual(
             manager.preview_var.get(),
-            f"{DEFAULT_EXECUTABLE} -MGFDevAccount 1 -MGFNetRole Host -MGFNetPort 7200 -MGFNetRoomId 1 -extra \"a b\" -AICoreRoot C:\\MiniGame\\Source\\AIGamePlay",
+            f"{DEFAULT_EXECUTABLE} -MGFDevAccount 1 -MGFNetRole Host -MGFNetPort 7200 -MGFNetRoomId 1 -extra \"a b\"",
         )
+        self.assertEqual(manager.form.project_root.get(), "")
+        self.assertFalse(manager.form.skip_character_selection.get())
         self.assertTrue(manager.is_dirty)
         self.assertTrue(manager.save())
         saved = self.app.store.load().selected(HOST)
         self.assertEqual((saved.port, saved.extra_arguments), (7200, ("-extra", "a b")))
+
+    def test_skip_character_selection_preview_save_and_launch(self) -> None:
+        self.app._start_role(CLIENT)
+        self.wait_until_idle()
+        self.assertIn("-MGFInitialCharacter", self.factory.calls[-1][1])
+        self.assertIn("avatar_default", self.factory.calls[-1][1])
+        manager = self.manager()
+        manager.select_profile(self.app.config.selected_client_id)
+        self.assertTrue(manager.form.skip_character_selection.get())
+        self.assertIn("-MGFInitialCharacter avatar_default", manager.preview_var.get())
+        manager.form.skip_character_selection.set(False)
+        self.assertNotIn("-MGFInitialCharacter", manager.preview_var.get())
+        self.assertTrue(manager.save())
+        self.assertFalse(self.app.store.load().selected(CLIENT).skip_character_selection)
+        self.app._start_role(CLIENT)
+        self.wait_until_idle()
+        self.assertNotIn("-MGFInitialCharacter", self.factory.calls[-1][1])
 
     def test_invalid_command_keeps_form_and_text_until_escape(self) -> None:
         manager = self.manager()
@@ -853,6 +887,68 @@ class LauncherUiTests(unittest.TestCase):
         self.assertEqual(str(manager.account_entry.cget("state")), "normal")
         self.assertTrue(manager.save())
         self.assertEqual(self.app.store.load().selected(HOST).server_mode, "Host")
+
+
+    def test_main_standalone_button_launches_without_a_server_and_can_restart(self) -> None:
+        role = NetworkRole.STANDALONE
+        profile = self.app.config.selected(role)
+        self.assertEqual(str(self.app.role_controls[role].start_button.cget("text")), "启动单机")
+        self.app.role_controls[role].start_button.invoke()
+        self.wait_until_idle()
+        self.wait_for_layout(1)
+        snapshot = self.app.controller.snapshots()[0]
+        self.assertEqual(snapshot.settings.network.role, role)
+        self.assertFalse(any(a.startswith(("-MGFNet", "-AICoreTest")) for a in snapshot.arguments))
+        self.assertEqual(self.tree_values()[0][1:3], (profile.name, "单机"))
+        self.assertIn("-lua-debug-port", self.app._instance_command(snapshot.instance_id))
+        self.app.restart_button.invoke()
+        self.wait_until_idle()
+        restarted = self.app.controller.snapshots()[0]
+        self.assertEqual(restarted.settings, snapshot.settings)
+        self.assertNotEqual(restarted.pid, snapshot.pid)
+
+    def test_standalone_form_hides_network_fields_and_edits_independent_parameters(self) -> None:
+        manager = self.manager()
+        single = self.app.config.selected(NetworkRole.STANDALONE)
+        manager.select_profile(single.id)
+        self.assertTrue(all(widget.winfo_manager() == "" for widget in manager.network_only + manager.client_only))
+        manager.form.port.set("unused")
+        manager.form.room_id.set("unused")
+        manager.form.dev_account.set("3")
+        manager.form.project_root.set("D:/Single Game")
+        manager.form.executable.set("D:/Single.exe")
+        self.assertEqual(manager.validation_var.get(), "")
+        self.assertTrue(manager.save())
+        saved = self.app.store.load()
+        self.assertEqual(saved.selected(NetworkRole.STANDALONE).project_root, "D:/Single Game")
+        self.assertEqual(saved.selected(NetworkRole.STANDALONE).dev_account, 3)
+        self.assertNotEqual(saved.selected(HOST).executable, "D:/Single.exe")
+        self.assertNotEqual(saved.selected(CLIENT).executable, "D:/Single.exe")
+        manager.select_profile(saved.selected_client_id)
+        self.assertTrue(all(widget.winfo_manager() == "grid" for widget in manager.network_only))
+
+    def test_network_button_does_not_depend_on_standalone_selection(self) -> None:
+        self.app._commit_profiles(self.app.config.with_selection(NetworkRole.STANDALONE, None))
+        self.assertEqual(str(self.app.role_controls[NetworkRole.STANDALONE].start_button.cget("state")), tk.DISABLED)
+        self.assertEqual(str(self.app.start_pair_button.cget("state")), tk.NORMAL)
+
+    def test_network_auth_fields_update_preview_and_persist_per_profile(self) -> None:
+        manager = self.manager()
+        manager.select_profile(self.app.config.selected_host_id)
+        manager.form.peer_ticket.set("room-ticket")
+        manager.form.service_identity.set("room-server")
+        self.assertIn("-AICorePeerTicket room-ticket", manager.preview_var.get())
+        self.assertIn("-AICoreTestServiceIdentity room-server", manager.preview_var.get())
+        self.assertTrue(manager.save())
+        manager.select_profile(self.app.config.selected_client_id)
+        manager.form.peer_ticket.set("room-ticket")
+        self.assertEqual(manager.form.service_identity.get(), "debug-launcher")
+        self.assertTrue(manager.save())
+        saved = self.app.store.load()
+        self.assertEqual(saved.selected(HOST).service_identity, "room-server")
+        self.assertEqual(saved.selected(CLIENT).peer_ticket, "room-ticket")
+        manager.form.test_mode.set(False)
+        self.assertNotIn("-AICoreTestMode", manager.preview_var.get())
 
 
 if __name__ == "__main__":

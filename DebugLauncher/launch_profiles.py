@@ -31,11 +31,28 @@ from launcher_core import (
 )
 
 
-PROFILE_CONFIG_VERSION = 5
-LAUNCH_ROLES = (NetworkRole.HOST, NetworkRole.CLIENT)
-ROLE_TITLES = {NetworkRole.HOST: "Host", NetworkRole.CLIENT: "Client"}
+PROFILE_CONFIG_VERSION = 7
+LAUNCH_ROLES = (NetworkRole.HOST, NetworkRole.CLIENT, NetworkRole.STANDALONE)
+ROLE_TITLES = {NetworkRole.HOST: "Host", NetworkRole.CLIENT: "Client", NetworkRole.STANDALONE: "单机"}
+SELECTION_FIELDS = {
+    NetworkRole.HOST: "selected_host_id",
+    NetworkRole.CLIENT: "selected_client_id",
+    NetworkRole.STANDALONE: "selected_standalone_id",
+}
 LOCAL_HOSTS = frozenset(("127.0.0.1", "localhost", "::1"))
 DEFAULT_CLIENT_DELAY_SECONDS = 2.0
+INITIAL_CHARACTER_ARGUMENT = "-MGFInitialCharacter"
+DEFAULT_INITIAL_CHARACTER = "avatar_default"
+TEST_ARGUMENT_FIELDS = {
+    "-aicoretestmode": "test_mode",
+    "-aicorepeerticket": "peer_ticket",
+    "-aicoretestserviceidentity": "service_identity",
+}
+
+
+def has_initial_character(arguments: tuple[str, ...]) -> bool:
+    return any(argument.partition("=")[0].casefold() == INITIAL_CHARACTER_ARGUMENT.casefold()
+               for argument in arguments)
 
 
 def new_profile_id() -> str:
@@ -46,9 +63,33 @@ def _is_integer(value: object) -> bool:
     return isinstance(value, int) and not isinstance(value, bool)
 
 
+def _split_project_arguments(arguments: tuple[str, ...]) -> tuple[str | None, tuple[str, ...]]:
+    project = None
+    extras = []
+    index = 0
+    while index < len(arguments):
+        argument = arguments[index]
+        key, separator, value = argument.partition("=")
+        if key.casefold() != "-aicoreroot":
+            extras.append(argument)
+        else:
+            if project is not None:
+                raise ConfigurationError("目标工程参数 -AICoreRoot 不能重复。")
+            if not separator:
+                index += 1
+                if index >= len(arguments) or arguments[index].startswith("-"):
+                    raise ConfigurationError("目标工程参数 -AICoreRoot 缺少值。")
+                value = arguments[index]
+            if not value.strip():
+                raise ConfigurationError("目标工程参数 -AICoreRoot 缺少值。")
+            project = value.strip()
+        index += 1
+    return project, tuple(extras)
+
+
 @dataclass(frozen=True)
 class LaunchProfile:
-    """One named, complete launch setting for a Host or a Client App."""
+    """One named launch setting for a standalone, Host or Client App."""
 
     name: str
     role: NetworkRole
@@ -64,6 +105,11 @@ class LaunchProfile:
     debug_wait: bool = False
     id: str = field(default_factory=new_profile_id)
     server_mode: str = "CloudServer"
+    project_root: str = DEFAULT_PROJECT_ROOT
+    skip_character_selection: bool = True
+    test_mode: bool = True
+    peer_ticket: str = ""
+    service_identity: str = "debug-launcher"
 
     def __post_init__(self) -> None:
         if not isinstance(self.id, str) or not self.id.strip():
@@ -76,17 +122,21 @@ class LaunchProfile:
         if self.server_mode not in ("CloudServer", "Host"):
             raise ConfigurationError("服务端模式必须是 CloudServer 或 Host。")
         if self.role not in LAUNCH_ROLES:
-            raise ConfigurationError("配置类型必须是 Host 或 Client。")
+            raise ConfigurationError("配置类型必须是单机、Host 或 Client。")
         if not _is_integer(self.port) or not 1 <= self.port <= MAX_PORT:
             raise ConfigurationError(f"端口必须是 1 到 {MAX_PORT} 之间的整数。")
         if not _is_integer(self.room_id) or self.room_id <= 0:
             raise ConfigurationError("房间号必须是正整数。")
         if self.dev_account == 0 and _is_integer(self.dev_account):
             object.__setattr__(self, "dev_account", default_dev_account(self.role))
-        if not _is_integer(self.dev_account) or self.dev_account <= 0:
+        if not _is_integer(self.dev_account) or self.dev_account < 0 or (
+            self.role is not NetworkRole.STANDALONE and self.dev_account == 0
+        ):
             raise ConfigurationError("开发账号序号必须是正整数。")
         for name, label in (
             ("auto_dev_account", "自动分配开发账号"), ("show_console", "显示控制台"), ("debug_wait", "等待 Lua 调试器"),
+            ("skip_character_selection", "跳过角色选择"),
+            ("test_mode", "本地联调测试模式"),
         ):
             if not isinstance(getattr(self, name), bool):
                 raise ConfigurationError(f"{label}必须是布尔值。")
@@ -94,6 +144,40 @@ class LaunchProfile:
             isinstance(argument, str) for argument in self.extra_arguments
         ):
             raise ConfigurationError("额外参数必须是字符串列表。")
+        if not isinstance(self.project_root, str):
+            raise ConfigurationError("目标工程必须是目录路径。")
+        project, extras = _split_project_arguments(self.extra_arguments)
+        object.__setattr__(self, "project_root", self.project_root.strip() if project is None else project)
+        object.__setattr__(self, "extra_arguments", extras)
+        remaining = []
+        index = 0
+        while index < len(extras):
+            argument = extras[index]
+            key, separator, value = argument.partition("=")
+            field_name = TEST_ARGUMENT_FIELDS.get(key.casefold())
+            if field_name is None:
+                remaining.append(argument)
+            elif field_name == "test_mode":
+                if separator and value != "true":
+                    raise ConfigurationError("-AICoreTestMode 仅支持 true 或无值。")
+                if not separator and extras[index + 1:index + 2] == ("true",):
+                    index += 1
+                object.__setattr__(self, field_name, True)
+            else:
+                if not separator:
+                    index += 1
+                    if index >= len(extras) or extras[index].startswith("-"):
+                        raise ConfigurationError(f"{key} 缺少值。")
+                    value = extras[index]
+                object.__setattr__(self, field_name, value)
+            index += 1
+        object.__setattr__(self, "extra_arguments", tuple(remaining))
+        for field_name, label, limit in (("peer_ticket", "联机票据", 32), ("service_identity", "服务身份", 128)):
+            value = getattr(self, field_name)
+            if not isinstance(value, str) or len(value.encode("utf-8")) > limit:
+                raise ConfigurationError(f"{label}必须是最多 {limit} 字节的字符串。")
+        if self.network.is_dedicated and self.test_mode and not self.service_identity:
+            raise ConfigurationError("本地联调的 CloudServer 需要服务身份。")
         for argument in self.extra_arguments:
             if argument in NETWORK_ARGUMENTS:
                 raise ConfigurationError(
@@ -116,12 +200,22 @@ class LaunchProfile:
 
     def settings(self) -> LauncherSettings:
         """Build the argv shared by previews and launches, in the .bat script order."""
-        arguments = self.network.arguments() + self.extra_arguments
-        # Match StartGame.bat's project; preserve explicitly chosen programs/projects.
-        from os.path import normcase, normpath
-        if (normcase(normpath(self.executable)) == normcase(normpath(DEFAULT_EXECUTABLE))
-                and not any(a.casefold() == "-aicoreroot" for a in arguments)):
-            arguments += ("-AICoreRoot", DEFAULT_PROJECT_ROOT)
+        arguments = self.network.arguments()
+        if self.role is NetworkRole.STANDALONE:
+            if self.dev_account:
+                arguments += ("-MGFDevAccount", str(self.dev_account))
+        else:
+            if self.test_mode:
+                arguments += ("-AICoreTestMode",)
+                if self.network.is_dedicated:
+                    arguments += ("-AICoreTestServiceIdentity", self.service_identity)
+            if self.peer_ticket:
+                arguments += ("-AICorePeerTicket", self.peer_ticket)
+        arguments += self.extra_arguments
+        if self.project_root:
+            arguments += ("-AICoreRoot", self.project_root)
+        if self.skip_character_selection and not has_initial_character(arguments):
+            arguments += (INITIAL_CHARACTER_ARGUMENT, DEFAULT_INITIAL_CHARACTER)
         if self.network.is_dedicated and not self.show_console and "-AICoreNoConsole" not in arguments:
             arguments += ("-AICoreNoConsole",)
         if self.debug_wait:
@@ -131,7 +225,11 @@ class LaunchProfile:
         )
 
     def summary(self) -> str:
-        if self.role is NetworkRole.HOST:
+        if self.role is NetworkRole.STANDALONE:
+            parts = [Path(self.executable).name, "单机运行", "无需服务端"]
+            if self.dev_account:
+                parts.append(f"账号 {self.dev_account}")
+        elif self.role is NetworkRole.HOST:
             parts = [
                 Path(self.executable).name, f"端口 {self.port}", f"房间 {self.room_id}",
                 "DS · mock 账号" if self.network.is_dedicated else f"账号 {self.dev_account}",
@@ -160,15 +258,33 @@ def profile_from_command(command: str, base: LaunchProfile) -> LaunchProfile:
                 f"{argument} 已移除（客机身份改取登录账号），请删除；用 -MGFDevAccount 选择账号。"
             )
     network = parse_network_arguments(arguments)
-    if network.role not in LAUNCH_ROLES:
-        raise ConfigurationError("命令中需要 -MGFNetRole CloudServer、Host 或 -MGFNetRole Client。")
+    if network.role is NetworkRole.STANDALONE and any(
+        argument in NETWORK_ARGUMENTS and argument not in ("-MGFNetRole", "-MGFDevAccount") for argument in arguments
+    ):
+        raise ConfigurationError("单机命令不能包含联机地址、端口或房间参数。")
     extras = apply_network_preset(arguments, NetworkRole.STANDALONE)
+    project, extras = _split_project_arguments(extras)
+    skip_selection = base.skip_character_selection if has_initial_character(extras) else False
+    # Keep explicit custom characters in extras; the checkbox supplies only the default Avatar.
+    if not has_initial_character(base.extra_arguments):
+        for index, argument in enumerate(extras):
+            if argument == INITIAL_CHARACTER_ARGUMENT and extras[index + 1:index + 2] == (DEFAULT_INITIAL_CHARACTER,):
+                extras = extras[:index] + extras[index + 2:]
+                skip_selection = True
+                break
     return replace(
-        base, role=network.role, executable=executable, server_mode=network.server_mode,
+        base, role=network.role, executable=executable,
+        server_mode=base.server_mode if network.role is NetworkRole.STANDALONE else network.server_mode,
         host=network.host if network.role is NetworkRole.CLIENT else DEFAULT_NETWORK_HOST,
         port=network.port, room_id=network.room_id, dev_account=network.dev_account or 0,
+        project_root=project or "",
         extra_arguments=tuple(argument for argument in extras if argument != DEBUG_WAIT_ARGUMENT),
         debug_wait=DEBUG_WAIT_ARGUMENT in extras,
+        skip_character_selection=skip_selection,
+        test_mode=base.test_mode if network.role is NetworkRole.STANDALONE else any(
+            argument.partition("=")[0].casefold() == "-aicoretestmode" for argument in arguments
+        ),
+        peer_ticket="",
     )
 
 
@@ -183,13 +299,20 @@ def pair_mismatches(host: LaunchProfile, client: LaunchProfile) -> tuple[str, ..
         mismatches.append(f"端口 {client.port} 与 Host 端口 {host.port} 不一致")
     if client.room_id != host.room_id:
         mismatches.append(f"房间 {client.room_id} 与 Host 房间 {host.room_id} 不一致")
+    if client.test_mode != host.test_mode:
+        mismatches.append("Client 与 Host 的本地联调测试模式不一致")
+    host_ticket = host.peer_ticket or ("aicore-test" if host.test_mode else "")
+    client_ticket = client.peer_ticket or ("aicore-test" if client.test_mode else "")
+    if client_ticket != host_ticket:
+        mismatches.append("Client 与 Host 的联机票据不一致")
     return tuple(mismatches)
 
 
-def default_profiles() -> tuple[LaunchProfile, LaunchProfile]:
+def default_profiles() -> tuple[LaunchProfile, ...]:
     return (
         LaunchProfile(name="默认 Host", role=NetworkRole.HOST),
         LaunchProfile(name="默认 Client", role=NetworkRole.CLIENT),
+        LaunchProfile(name="默认单机", role=NetworkRole.STANDALONE),
     )
 
 
@@ -204,6 +327,7 @@ class LauncherConfig:
     window_geometry: str = ""
     client_count: int = 1
     auto_tile_windows: bool = True
+    selected_standalone_id: str | None = None
 
     @classmethod
     def default(cls) -> LauncherConfig:
@@ -211,8 +335,11 @@ class LauncherConfig:
 
     @classmethod
     def with_default_selection(cls, profiles: tuple[LaunchProfile, ...], **values: object) -> LauncherConfig:
-        host, client = (next((p.id for p in profiles if p.role is role), None) for role in LAUNCH_ROLES)
-        return cls(profiles, host, client, **values)  # type: ignore[arg-type]
+        selection = {
+            SELECTION_FIELDS[role]: next((p.id for p in profiles if p.role is role), None)
+            for role in LAUNCH_ROLES
+        }
+        return cls(profiles=profiles, **selection, **values)  # type: ignore[arg-type]
 
     def __post_init__(self) -> None:
         if not isinstance(self.profiles, tuple) or not all(
@@ -255,7 +382,7 @@ class LauncherConfig:
         return tuple(profile for profile in self.profiles if profile.role is role)
 
     def selected_id(self, role: NetworkRole) -> str | None:
-        return self.selected_host_id if role is NetworkRole.HOST else self.selected_client_id
+        return getattr(self, SELECTION_FIELDS[role])
 
     def selected(self, role: NetworkRole) -> LaunchProfile | None:
         return self.profile(self.selected_id(role))
@@ -265,8 +392,7 @@ class LauncherConfig:
 
     def with_selection(self, role: NetworkRole, profile_id: str | None) -> LauncherConfig:
         """Activate one profile for a role (replacing the previous one), or none."""
-        field_name = "selected_host_id" if role is NetworkRole.HOST else "selected_client_id"
-        return replace(self, **{field_name: profile_id})
+        return replace(self, **{SELECTION_FIELDS[role]: profile_id})
 
     def save_profile(self, profile: LaunchProfile) -> LauncherConfig:
         """Insert or replace one profile; a role change deactivates it for the old role.
@@ -288,6 +414,7 @@ class LauncherConfig:
             self, profiles=profiles,
             selected_host_id=selection[NetworkRole.HOST],
             selected_client_id=selection[NetworkRole.CLIENT],
+            selected_standalone_id=selection[NetworkRole.STANDALONE],
         )
 
     def remove_profile(self, profile_id: str) -> LauncherConfig:
@@ -296,6 +423,7 @@ class LauncherConfig:
             profiles=tuple(profile for profile in self.profiles if profile.id != profile_id),
             selected_host_id=None if self.selected_host_id == profile_id else self.selected_host_id,
             selected_client_id=None if self.selected_client_id == profile_id else self.selected_client_id,
+            selected_standalone_id=None if self.selected_standalone_id == profile_id else self.selected_standalone_id,
         )
 
     def unique_name(self, base: str, exclude_id: str | None = None) -> str:
@@ -312,9 +440,13 @@ def _profile_from_settings(
 ) -> LaunchProfile:
     network = network or settings.network
     extras = apply_network_preset(settings.enabled_arguments, NetworkRole.STANDALONE)
+    project, extras = _split_project_arguments(extras)
     client_source = network.role is NetworkRole.CLIENT
     return LaunchProfile(
         name=name, role=role, executable=settings.executable,
+        project_root=project if project is not None else (
+            DEFAULT_PROJECT_ROOT if Path(settings.executable) == Path(DEFAULT_EXECUTABLE) else ""
+        ),
         host=network.host if client_source else DEFAULT_NETWORK_HOST,
         port=network.port, room_id=network.room_id,
         dev_account=network.dev_account if network.role is role else default_dev_account(role),
@@ -337,15 +469,15 @@ class ProfileStore:
             return LauncherConfig.default()
         version = raw.get("version")
         if version in (1, 2):
-            return self._migrate_single(ConfigStore.parse_settings(raw))
+            return self._add_standalone(self._migrate_single(ConfigStore.parse_settings(raw)))
         if version == 3:
-            return self._migrate_pair(raw)
-        if version not in (4, PROFILE_CONFIG_VERSION):
+            return self._add_standalone(self._migrate_pair(raw))
+        if version not in (4, 5, 6, PROFILE_CONFIG_VERSION):
             raise ConfigurationError(f"不支持的配置版本：{version!r}。")
         profiles = raw.get("profiles")
         if not isinstance(profiles, list):
             raise ConfigurationError("配置项 profiles 必须是数组。")
-        return LauncherConfig(
+        config = LauncherConfig(
             profiles=tuple(self._parse_profile(item) for item in profiles),
             selected_host_id=raw.get("selected_host"),  # type: ignore[arg-type]
             selected_client_id=raw.get("selected_client"),  # type: ignore[arg-type]
@@ -353,7 +485,26 @@ class ProfileStore:
             window_geometry=raw.get("window_geometry", ""),  # type: ignore[arg-type]
             client_count=raw.get("client_count", 1),  # type: ignore[arg-type]
             auto_tile_windows=raw.get("auto_tile_windows", True),  # type: ignore[arg-type]
+            selected_standalone_id=raw.get("selected_standalone"),  # type: ignore[arg-type]
         )
+        return self._add_standalone(config) if version < PROFILE_CONFIG_VERSION else config
+
+    @staticmethod
+    def _add_standalone(config: LauncherConfig) -> LauncherConfig:
+        """Give old installations an independent single-player entry without altering network profiles."""
+        if config.profiles_for(NetworkRole.STANDALONE):
+            return config
+        source = config.selected(NetworkRole.CLIENT) or config.selected(NetworkRole.HOST)
+        if source is None:
+            source = next(iter(config.profiles), None)
+        profile = LaunchProfile(
+            name=config.unique_name("默认单机"), role=NetworkRole.STANDALONE,
+            executable=source.executable if source else DEFAULT_EXECUTABLE,
+            project_root=source.project_root if source else DEFAULT_PROJECT_ROOT,
+            show_console=source.show_console if source else True,
+            skip_character_selection=source.skip_character_selection if source else True,
+        )
+        return config.save_profile(profile)
 
     @staticmethod
     def _parse_profile(raw: object) -> LaunchProfile:
@@ -362,14 +513,19 @@ class ProfileStore:
         name = raw.get("name")
         try:
             role = raw.get("role")
-            if role not in ("host", "client"):
-                raise ConfigurationError("配置类型必须是 host 或 client。")
+            if role not in tuple(item.value for item in LAUNCH_ROLES):
+                raise ConfigurationError("配置类型必须是 standalone、host 或 client。")
             extras = raw.get("extra_arguments", [])
             if not isinstance(extras, list):
                 raise ConfigurationError("额外参数必须是字符串列表。")
+            executable = raw.get("executable", DEFAULT_EXECUTABLE)
+            default_project = DEFAULT_PROJECT_ROOT if (
+                isinstance(executable, str) and Path(executable) == Path(DEFAULT_EXECUTABLE)
+            ) else ""
             return LaunchProfile(
                 id=raw.get("id"), name=name, role=NetworkRole(role),  # type: ignore[arg-type]
-                executable=raw.get("executable", DEFAULT_EXECUTABLE),  # type: ignore[arg-type]
+                executable=executable,  # type: ignore[arg-type]
+                project_root=raw.get("project_root", default_project),  # type: ignore[arg-type]
                 host=raw.get("host", DEFAULT_NETWORK_HOST),  # type: ignore[arg-type]
                 port=raw.get("port", DEFAULT_NETWORK_PORT),  # type: ignore[arg-type]
                 room_id=raw.get("room_id", DEFAULT_NETWORK_ROOM_ID),  # type: ignore[arg-type]
@@ -380,6 +536,10 @@ class ProfileStore:
                 show_console=raw.get("show_console", True),  # type: ignore[arg-type]
                 server_mode=raw.get("server_mode", "CloudServer"),
                 debug_wait=raw.get("debug_wait", False),  # type: ignore[arg-type]
+                skip_character_selection=raw.get("skip_character_selection", True),  # type: ignore[arg-type]
+                test_mode=raw.get("test_mode", True),  # type: ignore[arg-type]
+                peer_ticket=raw.get("peer_ticket", ""),  # type: ignore[arg-type]
+                service_identity=raw.get("service_identity", "debug-launcher"),  # type: ignore[arg-type]
             )
         except ConfigurationError as exc:
             label = f"「{name}」" if isinstance(name, str) and name.strip() else ""
@@ -442,6 +602,7 @@ class ProfileStore:
                     "role": profile.role.value,
                     "server_mode": profile.server_mode,
                     "executable": profile.executable,
+                    "project_root": profile.project_root,
                     "host": profile.host,
                     "port": profile.port,
                     "room_id": profile.room_id,
@@ -450,11 +611,16 @@ class ProfileStore:
                     "extra_arguments": list(profile.extra_arguments),
                     "show_console": profile.show_console,
                     "debug_wait": profile.debug_wait,
+                    "skip_character_selection": profile.skip_character_selection,
+                    "test_mode": profile.test_mode,
+                    "peer_ticket": profile.peer_ticket,
+                    "service_identity": profile.service_identity,
                 }
                 for profile in config.profiles
             ],
             "selected_host": config.selected_host_id,
             "selected_client": config.selected_client_id,
+            "selected_standalone": config.selected_standalone_id,
             "client_delay_seconds": config.client_delay_seconds,
             "client_count": config.client_count,
             "window_geometry": config.window_geometry,

@@ -31,7 +31,6 @@ from launcher_core import (
     validate_client_count,
 )
 from launch_profiles import (
-    LAUNCH_ROLES,
     ROLE_TITLES,
     LauncherConfig,
     ProfileStore,
@@ -115,7 +114,7 @@ class DebugLauncherApp:
         self.root.after_idle(self._initialize_default_debug_service)
 
     def _configure_window(self) -> None:
-        self.root.title("Host / Client 启动器")
+        self.root.title("单机 / Host / Client 启动器")
         self.root.geometry(DEFAULT_WINDOW_GEOMETRY)
         self.root.minsize(960, 720)
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
@@ -140,26 +139,27 @@ class DebugLauncherApp:
         launch_frame = ttk.Frame(outer)
         launch_frame.grid(row=0, column=0, sticky=tk.EW)
         launch_frame.columnconfigure(1, weight=1)
-        ttk.Label(launch_frame, text="Host / Client 启动器", style="Title.TLabel").grid(
+        ttk.Label(launch_frame, text="单机 / Host / Client 启动器", style="Title.TLabel").grid(
             row=0, column=0, columnspan=3, sticky=tk.W, pady=(0, 10),
         )
         ttk.Button(launch_frame, text="配置管理", command=self._open_profile_manager).grid(
             row=0, column=3, sticky=tk.E, pady=(0, 10),
         )
         client_count = ttk.Frame(launch_frame)
-        client_count.grid(row=3, column=2, sticky=tk.E, padx=8)
+        client_count.grid(row=5, column=2, sticky=tk.E, padx=8)
         ttk.Label(client_count, text="数量").pack(side=tk.LEFT, padx=(0, 5))
         ttk.Spinbox(
             client_count, textvariable=self.client_count_var,
             from_=1, to=MAX_CLIENT_COUNT, increment=1, width=4,
         ).pack(side=tk.LEFT)
-        self._build_role_row(launch_frame, NetworkRole.HOST, 1)
-        self._build_role_row(launch_frame, NetworkRole.CLIENT, 3)
+        self._build_role_row(launch_frame, NetworkRole.STANDALONE, 1)
+        self._build_role_row(launch_frame, NetworkRole.HOST, 3)
+        self._build_role_row(launch_frame, NetworkRole.CLIENT, 5)
 
         pair_bar = ttk.Frame(launch_frame)
-        pair_bar.grid(row=5, column=0, columnspan=4, sticky=tk.EW, pady=(14, 0))
+        pair_bar.grid(row=7, column=0, columnspan=4, sticky=tk.EW, pady=(14, 0))
         self.start_pair_button = ttk.Button(
-            pair_bar, text="一键启动 Host + Client", style="Primary.TButton",
+            pair_bar, text="启动联机", style="Primary.TButton",
             command=self._start_pair, padding=(12, 6),
         )
         self.start_pair_button.pack(side=tk.LEFT)
@@ -315,7 +315,7 @@ class DebugLauncherApp:
         )
         ttk.Label(parent, textvariable=name, style="Profile.TLabel").grid(row=row, column=1, sticky=tk.W)
         start_button = ttk.Button(
-            parent, text=f"启动 {title}", style="Primary.TButton", width=16,
+            parent, text="启动单机" if role is NetworkRole.STANDALONE else f"启动 {title}", style="Primary.TButton", width=16,
             command=lambda: self._start_role(role),
         )
         start_button.grid(row=row, column=3, sticky=tk.E)
@@ -446,7 +446,7 @@ class DebugLauncherApp:
         host = self.config.selected(NetworkRole.HOST)
         title = "DS" if host is not None and host.server_mode == "CloudServer" else "Host"
         self.role_controls[NetworkRole.HOST].start_button.configure(text=f"启动 {title}")
-        self.start_pair_button.configure(text=f"一键启动 {title} + {clients}")
+        self.start_pair_button.configure(text=f"启动联机：{title} + {clients}")
 
     def _open_profile_manager(self) -> None:
         if self.profile_manager is None:
@@ -480,7 +480,7 @@ class DebugLauncherApp:
         self.layout_generation += 1
 
     def _layout_targets(self) -> tuple[LayoutTarget, ...]:
-        role_order = {NetworkRole.HOST: 0, NetworkRole.CLIENT: 1}
+        role_order = {NetworkRole.STANDALONE: 0, NetworkRole.HOST: 1, NetworkRole.CLIENT: 2}
         snapshots = [
             snapshot
             for snapshot in self.snapshots_by_id.values()
@@ -639,7 +639,12 @@ class DebugLauncherApp:
             self._show_error("启动失败", exc)
             return
         self._cancel_window_layout()
-        if role is NetworkRole.HOST:
+        if role is NetworkRole.STANDALONE:
+            self._run_async(
+                "正在启动单机…", lambda: self.controller.start(settings, profile.name),
+                self._on_standalone_started,
+            )
+        elif role is NetworkRole.HOST:
             self._run_async(
                 "正在启动 Host…", lambda: self.controller.ensure_host(settings, profile.name),
                 lambda result: self._on_host_started(*result),
@@ -696,6 +701,12 @@ class DebugLauncherApp:
             ),
             self._on_pair_started,
         )
+
+    def _on_standalone_started(self, snapshot: ControllerSnapshot) -> None:
+        self._on_instance_started(snapshot)
+        self._render_instances()
+        self.instance_tree.selection_set(str(snapshot.instance_id))
+        self._request_window_layout()
 
     def _on_host_started(
         self, snapshot: ControllerSnapshot, reused: bool, *, request_layout: bool = True,
@@ -1242,7 +1253,7 @@ class DebugLauncherApp:
         for role, controls in self.role_controls.items():
             has_profile = self.config.selected(role) is not None
             controls.start_button.configure(state=tk.NORMAL if idle and has_profile else tk.DISABLED)
-        both_selected = all(self.config.selected(role) is not None for role in LAUNCH_ROLES)
+        both_selected = all(self.config.selected(role) is not None for role in (NetworkRole.HOST, NetworkRole.CLIENT))
         self.start_pair_button.configure(state=tk.NORMAL if idle and both_selected else tk.DISABLED)
         instance_state = tk.NORMAL if idle and selected_count else tk.DISABLED
         self.stop_button.configure(

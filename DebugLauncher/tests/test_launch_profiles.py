@@ -33,13 +33,32 @@ class LaunchProfileTests(unittest.TestCase):
         self.assertEqual(profile.settings().arguments, (
             "-MGFDevAccount", "2", "-MGFNetRole", "Client", "-MGFNetHost", "127.0.0.1", "-MGFNetPort", "7000",
             "-MGFNetRoomId", "1", "-MGFNetServer", "CloudServer",
-            "-client-only", "a b", "-AICoreRoot", r"C:\MiniGame\Source\AIGamePlay", "-script-debug-wait-client",
+            "-AICoreTestMode",
+            "-client-only", "a b", "-AICoreRoot", r"C:\MiniGame\Source\AIGamePlay",
+            "-MGFInitialCharacter", "avatar_default", "-script-debug-wait-client",
         ))
         self.assertEqual(host().settings().arguments, (
             "-MGFNetRole", "CloudServer", "-MGFNetPort", "7000", "-MGFNetRoomId", "1",
+            "-AICoreTestMode", "-AICoreTestServiceIdentity", "debug-launcher",
             "-AICoreRoot", r"C:\MiniGame\Source\AIGamePlay",
+            "-MGFInitialCharacter", "avatar_default",
         ))
         self.assertIn('"a b"', format_command_preview(profile.settings()))
+
+    def test_skip_character_selection_defaults_and_explicit_override(self) -> None:
+        for create in (host, client):
+            with self.subTest(role=create.__name__):
+                self.assertIn("avatar_default", create().settings().arguments)
+                self.assertNotIn("-MGFInitialCharacter", create(skip_character_selection=False).settings().arguments)
+                for extras in (("-MGFInitialCharacter", "custom_avatar"), ("-MGFInitialCharacter=custom_avatar",)):
+                    profile = create(executable="App.exe", extra_arguments=extras)
+                    self.assertNotIn("avatar_default", profile.settings().arguments)
+                    self.assertEqual(profile_from_command(format_command_preview(profile.settings()), profile), profile)
+
+    def test_command_removing_initial_character_disables_skip(self) -> None:
+        profile = profile_from_command("App.exe -MGFNetRole Client", client())
+        self.assertFalse(profile.skip_character_selection)
+        self.assertNotIn("-MGFInitialCharacter", profile.settings().arguments)
 
     def test_summary_shows_key_parameters(self) -> None:
         self.assertEqual(host().summary(), "AICore_profile.exe · 端口 7000 · 房间 1 · DS · mock 账号")
@@ -59,6 +78,10 @@ class LaunchProfileTests(unittest.TestCase):
             "端口": lambda: host(port=70000),
             "房间号": lambda: host(room_id=0),
             "程序路径": lambda: host(executable=""),
+            "目标工程必须": lambda: host(project_root=None),
+            "跳过角色选择": lambda: host(skip_character_selection="true"),
+            "目标工程.*缺少值": lambda: host(extra_arguments=("-AICoreRoot",)),
+            "目标工程.*不能重复": lambda: host(extra_arguments=("-AICoreRoot", "A", "-aicoreroot=B")),
         }
         for message, create in cases.items():
             with self.subTest(message=message), self.assertRaisesRegex(ConfigurationError, message):
@@ -68,6 +91,7 @@ class LaunchProfileTests(unittest.TestCase):
         profile = client(
             executable=r"C:\Program Files\Game\AICore.exe", host="10.0.0.8", port=7010,
             room_id=3, dev_account=5, extra_arguments=("-x", "a b"), debug_wait=True,
+            project_root=r"D:\Projects\Game With Spaces",
             show_console=False, auto_dev_account=False,
         )
         command = format_command_preview(profile.settings())
@@ -92,7 +116,7 @@ class LaunchProfileTests(unittest.TestCase):
     def test_invalid_commands_are_explained(self) -> None:
         cases = {
             "程序路径": "-MGFNetRole Host",
-            "-MGFNetRole CloudServer": "App.exe -MGFNetPort 7000",
+            "单机命令": "App.exe -MGFNetPort 7000",
             "已移除": "App.exe -MGFNetRole Client -MGFNetUin 10001",
             "缺少值": "App.exe -MGFNetRole Host -MGFNetPort",
             "-lua-debug-port": "App.exe -MGFNetRole Host -lua-debug-port 3382",
@@ -188,14 +212,15 @@ class ProfileStoreTests(unittest.TestCase):
         self.store = ProfileStore(self.path)
 
     def test_missing_file_loads_defaults(self) -> None:
-        self.assertEqual(len(self.store.load().profiles), 2)
+        self.assertEqual(len(self.store.load().profiles), 3)
 
     def test_named_profiles_and_selection_round_trip(self) -> None:
         profiles = (
             host(executable=r"C:\Host\AICore.exe", show_console=False, extra_arguments=("-h", "a b")),
             host("Debug Host", port=7010, debug_wait=True),
             client(),
-            client("测试机 Client", host="10.0.0.8", dev_account=8, auto_dev_account=False),
+            client("测试机 Client", host="10.0.0.8", dev_account=8, auto_dev_account=False,
+                   skip_character_selection=False),
         )
         config = LauncherConfig(
             profiles, profiles[1].id, profiles[3].id,
@@ -205,8 +230,18 @@ class ProfileStoreTests(unittest.TestCase):
         self.store.save(config)
         self.assertEqual(self.store.load(), config)
         payload = json.loads(self.path.read_text(encoding="utf-8"))
-        self.assertEqual(payload["version"], 5)
+        self.assertEqual(payload["version"], 7)
         self.assertFalse(payload["auto_tile_windows"])
+        self.assertTrue(payload["profiles"][0]["skip_character_selection"])
+        self.assertFalse(payload["profiles"][3]["skip_character_selection"])
+
+    def test_old_profiles_default_to_skipping_character_selection(self) -> None:
+        self.path.write_text(json.dumps({"version": 6, "profiles": [
+            {"id": "c", "name": "旧 Client", "role": "client"},
+        ], "selected_client": "c"}), encoding="utf-8")
+        profile = self.store.load().selected(NetworkRole.CLIENT)
+        self.assertTrue(profile.skip_character_selection)
+        self.assertIn("avatar_default", profile.settings().arguments)
 
     def test_v2_host_migrates_to_default_host_and_client(self) -> None:
         ConfigStore(self.path).save(LauncherSettings(
@@ -297,6 +332,25 @@ class ProfileStoreTests(unittest.TestCase):
         with self.assertRaises(ConfigurationError):
             self.store.load()
 
+    def test_legacy_project_argument_migrates_and_saves_as_a_field(self) -> None:
+        self.path.write_text(json.dumps({"version": 5, "profiles": [
+            {"id": "c", "name": "旧 Client", "role": "client",
+             "extra_arguments": ["-AICoreRoot", "D:/My Game", "-custom"]},
+        ], "selected_client": "c"}), encoding="utf-8")
+        profile = self.store.load().selected(NetworkRole.CLIENT)
+        self.assertEqual(profile.project_root, "D:/My Game")
+        self.assertEqual(profile.extra_arguments, ("-custom",))
+        self.store.save(self.store.load())
+        saved = json.loads(self.path.read_text(encoding="utf-8"))["profiles"][0]
+        self.assertEqual(saved["project_root"], "D:/My Game")
+        self.assertNotIn("-AICoreRoot", saved["extra_arguments"])
+
+    def test_legacy_custom_program_without_project_keeps_its_default(self) -> None:
+        self.path.write_text(json.dumps({"version": 5, "profiles": [
+            {"id": "c", "name": "其他程序", "role": "client", "executable": "D:/App.exe"},
+        ], "selected_client": "c"}), encoding="utf-8")
+        self.assertEqual(self.store.load().selected(NetworkRole.CLIENT).project_root, "")
+
 
 class DedicatedProfilesTests(unittest.TestCase):
     def test_dedicated_server_uses_mock_and_client_targets_cloud_server(self) -> None:
@@ -320,6 +374,74 @@ class DedicatedProfilesTests(unittest.TestCase):
         profile = host(extra_arguments=("-AICoreRoot", "D:/custom project"))
         self.assertEqual(profile.settings().arguments.count("-AICoreRoot"), 1)
         self.assertIn("D:/custom project", profile.settings().arguments)
+
+
+class StandaloneProfilesTests(unittest.TestCase):
+    def test_standalone_round_trip_has_no_network_or_test_flags(self) -> None:
+        profile = LaunchProfile(name="单机", role=NetworkRole.STANDALONE,
+                                executable="App.exe", project_root="D:/My Game", debug_wait=True)
+        settings = profile.settings()
+        self.assertEqual(settings.network.role, NetworkRole.STANDALONE)
+        self.assertEqual(settings.network.dev_account, 0)
+        self.assertFalse(any(a.startswith(("-MGFNet", "-AICoreTest", "-AICorePeer")) for a in settings.arguments))
+        self.assertEqual(profile_from_command(format_command_preview(settings), profile), profile)
+        self.assertEqual(profile_from_command('App.exe -AICoreRoot "D:/My Game"', host()).role,
+                         NetworkRole.STANDALONE)
+        selected = replace(profile, dev_account=3)
+        self.assertEqual(selected.settings().network.dev_account, 3)
+        self.assertEqual(profile_from_command(format_command_preview(selected.settings()), selected), selected)
+
+    def test_standalone_selection_is_independent_and_clears_on_role_change(self) -> None:
+        config = LauncherConfig.default()
+        single = config.selected(NetworkRole.STANDALONE)
+        changed = config.save_profile(replace(single, role=NetworkRole.CLIENT))
+        self.assertIsNone(changed.selected_standalone_id)
+        self.assertEqual(changed.selected_host_id, config.selected_host_id)
+        self.assertEqual(changed.selected_client_id, config.selected_client_id)
+        self.assertIsNone(config.remove_profile(single.id).selected_standalone_id)
+
+    def test_old_config_adds_standalone_with_selected_client_paths(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "settings.json"
+            original = {"version": 6, "profiles": [
+                {"id": "h", "name": "服务端", "role": "host", "executable": "D:/Server.exe"},
+                {"id": "c", "name": "客机", "role": "client", "executable": "D:/App.exe",
+                 "project_root": "D:/My Game", "skip_character_selection": False,
+                 "extra_arguments": ["-client-only"]},
+            ], "selected_host": "h", "selected_client": "c", "client_count": 5}
+            path.write_text(json.dumps(original), encoding="utf-8")
+            store = ProfileStore(path)
+            config = store.load()
+            single = config.selected(NetworkRole.STANDALONE)
+            self.assertEqual((single.executable, single.project_root), ("D:/App.exe", "D:/My Game"))
+            self.assertEqual(single.extra_arguments, ())
+            self.assertFalse(single.skip_character_selection)
+            self.assertEqual((config.selected_host_id, config.selected_client_id, config.client_count), ("h", "c", 5))
+            self.assertEqual(config.selected(NetworkRole.CLIENT).extra_arguments, ("-client-only",))
+            store.save(config)
+            self.assertEqual(store.load(), config)
+            removed = config.remove_profile(single.id)
+            store.save(removed)
+            self.assertEqual(store.load(), removed)
+
+    def test_network_identity_fields_round_trip_and_default_to_working_test_mode(self) -> None:
+        for profile in (host(executable="App.exe"), client(executable="App.exe"), host(executable="App.exe", server_mode="Host"),
+                        host(executable="App.exe", peer_ticket="custom-ticket", service_identity="local-service"),
+                        client(executable="App.exe", test_mode=False, peer_ticket="external-ticket")):
+            with self.subTest(role=profile.role, mode=profile.server_mode):
+                arguments = profile.settings().arguments
+                self.assertEqual("-AICoreTestMode" in arguments, profile.test_mode)
+                self.assertEqual("-AICoreTestServiceIdentity" in arguments,
+                                 profile.network.is_dedicated and profile.test_mode)
+                self.assertEqual(profile_from_command(format_command_preview(profile.settings()), profile), profile)
+        self.assertIn("票据", pair_mismatches(host(peer_ticket="one"), client(peer_ticket="two"))[-1])
+        for values in ({"service_identity": ""}, {"peer_ticket": "x" * 33}, {"service_identity": "x" * 129}):
+            with self.subTest(values=values), self.assertRaises(ConfigurationError):
+                host(**values)
+        legacy = host(extra_arguments=("-AICoreTestMode", "-AICoreTestServiceIdentity", "legacy",
+                                       "-AICorePeerTicket=legacy-ticket"))
+        self.assertEqual((legacy.service_identity, legacy.peer_ticket, legacy.extra_arguments),
+                         ("legacy", "legacy-ticket", ()))
 
 
 if __name__ == "__main__":

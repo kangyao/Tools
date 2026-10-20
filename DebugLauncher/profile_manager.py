@@ -45,6 +45,11 @@ class _FormVars:
     show_console: tk.BooleanVar
     debug_wait: tk.BooleanVar
     server_mode: tk.StringVar
+    project_root: tk.StringVar
+    skip_character_selection: tk.BooleanVar
+    test_mode: tk.BooleanVar
+    peer_ticket: tk.StringVar
+    service_identity: tk.StringVar
 
     @classmethod
     def create(cls, master: tk.Misc) -> _FormVars:
@@ -53,6 +58,10 @@ class _FormVars:
             tk.StringVar(master), tk.StringVar(master), tk.StringVar(master), tk.StringVar(master),
             tk.BooleanVar(master), tk.StringVar(master), tk.BooleanVar(master), tk.BooleanVar(master),
             tk.StringVar(master, value="CloudServer"),
+            tk.StringVar(master),
+            tk.BooleanVar(master, value=True),
+            tk.BooleanVar(master, value=True), tk.StringVar(master),
+            tk.StringVar(master, value="debug-launcher"),
         )
 
     def all(self) -> tuple[tk.Variable, ...]:
@@ -80,8 +89,8 @@ class ProfileManagerWindow:
 
         self.window = tk.Toplevel(master)
         self.window.title("配置管理")
-        self.window.geometry("900x560")
-        self.window.minsize(820, 520)
+        self.window.geometry("980x720")
+        self.window.minsize(900, 640)
         self.window.transient(master)  # type: ignore[arg-type]
         self.window.protocol("WM_DELETE_WINDOW", self.close)
         self.form = _FormVars.create(self.window)
@@ -151,60 +160,90 @@ class ProfileManagerWindow:
             row=3, column=4, padx=(6, 0), pady=3,
         )
 
+        self._label(form, "目标工程", 4)
+        ttk.Entry(form, textvariable=f.project_root).grid(
+            row=4, column=1, columnspan=3, sticky=tk.EW, pady=3,
+        )
+        ttk.Button(form, text="浏览", width=6, command=self._browse_project).grid(
+            row=4, column=4, padx=(6, 0), pady=3,
+        )
+
         self.client_only: list[tk.Widget] = []
-        host_label = self._label(form, "主机地址", 4)
+        host_label = self._label(form, "主机地址", 5)
         host_entry = ttk.Entry(form, textvariable=f.host)
-        host_entry.grid(row=4, column=1, columnspan=4, sticky=tk.EW, pady=3)
+        host_entry.grid(row=5, column=1, columnspan=4, sticky=tk.EW, pady=3)
         self.client_only += [host_label, host_entry]
-        self._label(form, "端口", 5)
-        ttk.Entry(form, textvariable=f.port, width=10).grid(row=5, column=1, sticky=tk.W, pady=3)
-        ttk.Label(form, text="房间").grid(row=5, column=2, sticky=tk.W, padx=(16, 6))
-        ttk.Entry(form, textvariable=f.room_id, width=10).grid(row=5, column=3, sticky=tk.W, pady=3)
+        self._label(form, "端口", 6)
+        ttk.Entry(form, textvariable=f.port, width=10).grid(row=6, column=1, sticky=tk.W, pady=3)
+        ttk.Label(form, text="房间").grid(row=6, column=2, sticky=tk.W, padx=(16, 6))
+        ttk.Entry(form, textvariable=f.room_id, width=10).grid(row=6, column=3, sticky=tk.W, pady=3)
         # 开发账号序号：AIGamePlay/.dev/account.json 的第 N 项，生成 -MGFDevAccount N；Host 与 Client 都需要登录。
-        self._label(form, "开发账号序号", 6)
+        self.account_label = self._label(form, "开发账号序号", 7)
         self.account_entry = ttk.Entry(form, textvariable=f.dev_account, width=10)
-        self.account_entry.grid(row=6, column=1, sticky=tk.W, pady=3)
-        ttk.Label(form, text="服务端模式").grid(row=6, column=2, sticky=tk.W, padx=(16, 6))
+        self.account_entry.grid(row=7, column=1, sticky=tk.W, pady=3)
+        ttk.Label(form, text="服务端模式").grid(row=7, column=2, sticky=tk.W, padx=(16, 6))
         ttk.Combobox(form, textvariable=f.server_mode, values=("CloudServer", "Host"), state="readonly", width=14).grid(
-            row=6, column=3, columnspan=2, sticky=tk.W, pady=3,
+            row=7, column=3, columnspan=2, sticky=tk.W, pady=3,
         )
         auto_dev_account = ttk.Checkbutton(
             form, text="多开时自动分配不同账号（本机每个进程须用不同账号）", variable=f.auto_dev_account,
         )
-        auto_dev_account.grid(row=7, column=1, columnspan=4, sticky=tk.W, pady=3)
+        auto_dev_account.grid(row=8, column=1, columnspan=4, sticky=tk.W, pady=3)
         self.client_only += [auto_dev_account]
+        self.network_only = [widget for widget in (*form.grid_slaves(row=6), *form.grid_slaves(row=7))
+                             if widget not in (self.account_label, self.account_entry)]
 
-        self._label(form, "额外参数", 8)
-        ttk.Entry(form, textvariable=f.extra_arguments).grid(row=8, column=1, columnspan=4, sticky=tk.EW, pady=3)
+        network_options = ttk.Frame(form)
+        network_options.grid(row=9, column=0, columnspan=5, sticky=tk.EW, pady=3)
+        network_options.columnconfigure(1, weight=1)
+        ttk.Checkbutton(network_options, text="本地联调测试模式", variable=f.test_mode).grid(
+            row=0, column=0, columnspan=2, sticky=tk.W,
+        )
+        ttk.Label(network_options, text="联机票据").grid(row=1, column=0, sticky=tk.W, padx=(0, 8))
+        ttk.Entry(network_options, textvariable=f.peer_ticket).grid(row=1, column=1, sticky=tk.EW)
+        ttk.Label(network_options, text="测试模式留空使用默认票据；两端保持一致。", foreground="#6b7280").grid(
+            row=2, column=1, sticky=tk.W,
+        )
+        self.service_identity_label = ttk.Label(network_options, text="服务身份")
+        self.service_identity_label.grid(row=3, column=0, sticky=tk.W, padx=(0, 8))
+        self.service_identity_entry = ttk.Entry(network_options, textvariable=f.service_identity)
+        self.service_identity_entry.grid(row=3, column=1, sticky=tk.EW)
+        self.network_only.append(network_options)
+
+        self._label(form, "额外参数", 10)
+        ttk.Entry(form, textvariable=f.extra_arguments).grid(row=10, column=1, columnspan=4, sticky=tk.EW, pady=3)
         ttk.Label(form, text="可填写其他 App 参数，含空格的值使用双引号。", foreground="#6b7280").grid(
-            row=9, column=1, columnspan=4, sticky=tk.W,
+            row=11, column=1, columnspan=4, sticky=tk.W,
         )
-        ttk.Checkbutton(form, text="显示控制台", variable=f.show_console).grid(
-            row=10, column=1, columnspan=4, sticky=tk.W, pady=(8, 2),
-        )
+        options = ttk.Frame(form)
+        options.grid(row=12, column=1, columnspan=4, sticky=tk.W, pady=(8, 2))
+        ttk.Checkbutton(options, text="显示控制台", variable=f.show_console).pack(side=tk.LEFT)
+        ttk.Checkbutton(
+            options, text="跳过角色选择（默认 Avatar）", variable=f.skip_character_selection,
+        ).pack(side=tk.LEFT, padx=(16, 0))
         ttk.Checkbutton(form, text="等待 Lua 调试器", variable=f.debug_wait).grid(
-            row=11, column=1, columnspan=4, sticky=tk.W, pady=2,
+            row=13, column=1, columnspan=4, sticky=tk.W, pady=2,
         )
         ttk.Label(form, text=DEBUG_WAIT_HINT, foreground="#6b7280", wraplength=520).grid(
-            row=12, column=1, columnspan=4, sticky=tk.W,
+            row=14, column=1, columnspan=4, sticky=tk.W,
         )
 
-        self._label(form, "启动命令", 13).grid_configure(pady=(12, 3))
+        self._label(form, "启动命令", 15).grid_configure(pady=(12, 3))
         self.command_entry = ttk.Entry(form, textvariable=self.preview_var)
-        self.command_entry.grid(row=13, column=1, columnspan=3, sticky=tk.EW, pady=(12, 3))
+        self.command_entry.grid(row=15, column=1, columnspan=3, sticky=tk.EW, pady=(12, 3))
         self.command_entry.bind("<Return>", lambda _event: self._finish_command_edit())
         self.command_entry.bind("<FocusOut>", lambda _event: self._finish_command_edit())
         self.command_entry.bind("<Escape>", lambda _event: self._cancel_command_edit())
         ttk.Button(form, text="复制", width=6, command=self._copy_preview).grid(
-            row=13, column=4, padx=(6, 0), pady=(12, 3),
+            row=15, column=4, padx=(6, 0), pady=(12, 3),
         )
         ttk.Label(
             form, foreground="#6b7280", wraplength=560,
             text="可直接编辑，能解析的修改立即同步到表单；Esc 放弃无效的命令文字。\n"
                  "名称、控制台等不在命令中的设置不变；Lua 调试端口在启动时分配。",
-        ).grid(row=14, column=1, columnspan=4, sticky=tk.W)
+        ).grid(row=16, column=1, columnspan=4, sticky=tk.W)
         ttk.Label(form, textvariable=self.validation_var, foreground="#b91c1c", wraplength=560).grid(
-            row=15, column=0, columnspan=5, sticky=tk.W, pady=(8, 0),
+            row=17, column=0, columnspan=5, sticky=tk.W, pady=(8, 0),
         )
 
         actions = ttk.Frame(outer)
@@ -243,6 +282,7 @@ class ProfileManagerWindow:
             f.role.set(ROLE_TITLES[profile.role])
             f.server_mode.set(profile.server_mode)
             f.executable.set(profile.executable)
+            f.project_root.set(profile.project_root)
             f.host.set(profile.host)
             f.port.set(str(profile.port))
             f.room_id.set(str(profile.room_id))
@@ -251,6 +291,10 @@ class ProfileManagerWindow:
             f.extra_arguments.set(format_argument_text(profile.extra_arguments))
             f.show_console.set(profile.show_console)
             f.debug_wait.set(profile.debug_wait)
+            f.skip_character_selection.set(profile.skip_character_selection)
+            f.test_mode.set(profile.test_mode)
+            f.peer_ticket.set(profile.peer_ticket)
+            f.service_identity.set(profile.service_identity)
         finally:
             self.loading = False
         self.baseline = self._form_values()
@@ -296,7 +340,19 @@ class ProfileManagerWindow:
         if self.loading:
             return
         is_client = ROLE_BY_TITLE.get(self.form.role.get()) is NetworkRole.CLIENT
-        self.account_entry.configure(state="normal" if is_client or self.form.server_mode.get() == "Host" else "disabled")
+        is_standalone = ROLE_BY_TITLE.get(self.form.role.get()) is NetworkRole.STANDALONE
+        for widget in self.network_only:
+            if is_standalone:
+                widget.grid_remove()
+            else:
+                widget.grid()
+        for widget in (self.service_identity_label, self.service_identity_entry):
+            if not is_standalone and self.form.server_mode.get() == "CloudServer" and not is_client:
+                widget.grid()
+            else:
+                widget.grid_remove()
+        self.account_label.configure(text="开发账号（0=默认）" if is_standalone else "开发账号序号")
+        self.account_entry.configure(state="normal" if is_standalone or is_client or self.form.server_mode.get() == "Host" else "disabled")
         for widget in self.client_only:
             if is_client:
                 widget.grid()
@@ -344,6 +400,7 @@ class ProfileManagerWindow:
         f.role.set(ROLE_TITLES[profile.role])
         f.server_mode.set(profile.server_mode)
         f.executable.set(profile.executable)
+        f.project_root.set(profile.project_root)
         if profile.role is NetworkRole.CLIENT:
             f.host.set(profile.host)
         f.port.set(str(profile.port))
@@ -351,6 +408,10 @@ class ProfileManagerWindow:
         f.dev_account.set(str(profile.dev_account))
         f.extra_arguments.set(format_argument_text(profile.extra_arguments))
         f.debug_wait.set(profile.debug_wait)
+        f.skip_character_selection.set(profile.skip_character_selection)
+        f.test_mode.set(profile.test_mode)
+        f.peer_ticket.set(profile.peer_ticket)
+        f.service_identity.set(profile.service_identity)
 
     def _finish_command_edit(self) -> None:
         """Leave command editing; a valid command is rewritten in canonical form."""
@@ -406,17 +467,23 @@ class ProfileManagerWindow:
                 raise ConfigurationError(f"{label}必须是整数。") from exc
 
         is_client = role is NetworkRole.CLIENT
-        # Host 不使用地址和自动分配开关，隐藏字段中的内容不参与校验。
+        is_standalone = role is NetworkRole.STANDALONE
+        # 隐藏的联机字段不参与单机校验。
         return LaunchProfile(
             id=self.current_id or new_profile_id(),
             name=f.name.get(), role=role, executable=f.executable.get(), server_mode=f.server_mode.get(),
+            project_root=f.project_root.get(),
             host=f.host.get() if is_client else DEFAULT_NETWORK_HOST,
-            port=integer(f.port, "端口"), room_id=integer(f.room_id, "房间号"),
-            dev_account=(integer(f.dev_account, "开发账号序号") if is_client or f.server_mode.get() == "Host"
+            port=7000 if is_standalone else integer(f.port, "端口"),
+            room_id=1 if is_standalone else integer(f.room_id, "房间号"),
+            dev_account=(integer(f.dev_account, "开发账号序号") if is_standalone or is_client or f.server_mode.get() == "Host"
                          else int(f.dev_account.get().strip()) if f.dev_account.get().strip().isdigit() else 0),
             auto_dev_account=bool(f.auto_dev_account.get()) if is_client else True,
             extra_arguments=parse_argument_text(f.extra_arguments.get()),
             show_console=bool(f.show_console.get()), debug_wait=bool(f.debug_wait.get()),
+            skip_character_selection=bool(f.skip_character_selection.get()),
+            test_mode=bool(f.test_mode.get()), peer_ticket=f.peer_ticket.get(),
+            service_identity=f.service_identity.get(),
         )
 
     # ----- actions ------------------------------------------------------------------------------
@@ -568,6 +635,14 @@ class ProfileManagerWindow:
         )
         if selected:
             self.form.executable.set(selected)
+
+    def _browse_project(self) -> None:
+        selected = filedialog.askdirectory(
+            parent=self.window, title="选择目标工程", mustexist=True,
+            initialdir=self.form.project_root.get().strip() or str(Path.home()),
+        )
+        if selected:
+            self.form.project_root.set(selected)
 
     def _copy_preview(self) -> None:
         command = self.preview_var.get()
