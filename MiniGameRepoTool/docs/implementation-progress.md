@@ -114,6 +114,17 @@
 - 最终完整回归：160 passed，321.95 秒，0 失败。命令：.venv\Scripts\python.exe -m pytest -q。布局微调后复跑界面相关 11 项通过。compileall、git diff --check、示例配置解析通过。管理方案对话框离屏截图：artifacts/init-acceleration-dialog.png。
 - 真实环境只读核对：以默认方案和草稿区不存在的根目录执行初始化计划，只对 D:\MiniGame、D:\AIMiniGame、D:\MiniGameProfiler 运行 rev-parse / config 读取，结果见方案文档“第一版实现情况”。没有对真实工程执行克隆、fetch、复制或配置修改；磁盘不足与 UGit 场景未测试。
 
-## 集成裁定
+## 初版集成裁定（历史）
 
 遵照用户“操作完 git commit，不要 push”的约定，仅将本工具目录提交到 codex/minigame-repo-tool，保留现有目录和分支。无合并、远端推送或工作树清理操作。
+
+## BAT 多任务生成与多 SLN 批量编译（2026-10-21）
+
+- 构建窗口改为生成任务表、编译任务表，高级设置默认折叠。扫描当前方案根目录的 SetupScript 生成 BAT，支持多选入口、复制同一 BAT 的多组参数与独立输出目录。
+- 生成执行原 BAT，通过 CI 与 --no-pause 跳过暂停，保留原退出码；成功后读取返回的一个或多个元数据对象、MINIW_PRODUCT.json，或只在指定输出目录收集 SLN。失败不会被旧 SLN 掩盖，不扫描全部 Projects 猜测本次产物。
+- 每个 SLN 独立选择 C++ 目标、配置、平台与 Build/Rebuild/Clean，按勾选顺序串行运行。扩展 mini-compile-ib 的 SolutionPath 参数，保留旧默认入口，并改为从实际 SLN 项目引用定位 vcxproj、校验解决方案配置。
+- 任务使用稳定 ID，重新生成保留相对路径配置、任务顺序及编译选择；已完成生成的结果会保存，即使后续任务失败。每个编译任务有独立请求、日志、会话文件；失败停止队列，中断只停止当前任务拥有的会话。
+- 旧版单工程配置迁移为关联任务，保留 VS、架构、目标、配置与动作。README、使用说明、设计、构建说明和示例配置同步更新，移除不再使用的旧生成启动器。
+- 完整回归：198 passed，417.72 秒；最终构建相关回归：47 passed，15.80 秒。覆盖原 BAT 执行、同一 BAT 多任务、一个 BAT 多 SLN、中文与空格路径、实际 PowerShell 入口、独立配置、旧配置迁移、失败停止、取消、部分成功保存及界面操作。
+- 程序 --smoke-test 启动检查退出码 0；离屏渲染并检查生成、编译任务页。测试使用临时工程与替身编译入口，真实技能仅执行 ValidateOnly，没有对 C:/MiniGame 执行工程生成或 C++ 编译。
+- 本次分别在 Tools 和 skills 仓库提交任务相关文件，保留原有其他改动；不执行 push。

@@ -138,13 +138,13 @@ Discard 必须由用户勾选文件并在确认框核对后触发。已跟踪文
 
 **编译构建**
 
-BuildDialog 将构建设置、生成 SLN、IB 编译组成可勾选的固定顺序流程，默认只编译。BuildOptions 随方案持久化，缺省配置兼容旧 schema_version=1。参数涵盖 Python、VS/平台、目标、配置、动作、生成环境、离线包/打包、IB 技能和程序路径、日志与命令超时。保存构建参数不失效现有 Git 快照。
+BuildDialog 以生成、编译两张任务表组织构建，保留设置 → 生成 → 编译的步骤勾选；高级参数默认折叠。BuildOptions 保存 GenerationTask 和 CompileTask 列表，旧单工程配置迁移为关联任务，schema_version 仍为 1。任务有稳定 ID，支持相同 BAT 多组参数、每个 SLN 独立目标和配置。保存构建参数不失效现有 Git 快照。
 
 BuildService 与 Git 服务共用配置目录 RunLock，通过 JobThread 执行、逐步发布结果。手动构建按本地工程执行，不检查 Git 提交关系或脏工作区。每一步失败、中断或超时均阻止后续步骤；配置检查则逐项报告缺失项，不运行设置、生成或编译。
 
-设置复用 SetupRunner，在根目录执行 SetupWin.py，保留 Python39 解压与脚本退出码。生成沿用 VS2019_64-MiniGame.bat 的 dev 模式、环境变量和 Tools/buildtools 工作目录；Python helper 用 runpy 执行原生成脚本，将 os.system 失败变为非零退出，并核对预期 SLN，跳过 BAT 的 pause。
+设置复用 SetupRunner，在根目录执行 SetupWin.py，保留 Python39 解压与脚本退出码。生成从当前方案 SetupScript 扫描 BAT，通过固定包装脚本和带引号的环境参数调用原 BAT，保留退出码并跳过 pause；CMD 特殊字符不接受为参数。优先读取生成元数据，否则只在指定输出目录收集 SLN；成功后自动合并关联编译行，保留原有选择。失败阻止后续任务，已经产生的结果仍保存。
 
-编译仅调用用户指定 mini-compile-ib 技能中的 invoke/read/stop 脚本。先 ValidateOnly，再构建；参数以 JSON 和 PowerShell splatting 传递，使用 UTF-8 输出，每次都有独立日志与会话文件。IB 状态以会话 ExitCode 为依据，不自动改用 MSBuild 或生成工程，不传 AllowConcurrent。取消/超时先以本次 session 文件调用停止脚本，再终止本次进程树。原始日志和摘要均保留。
+编译调用用户指定 mini-compile-ib 技能中的 invoke/read/stop 脚本，显式传入 SolutionPath，按勾选的多 SLN 任务串行运行。先 ValidateOnly，再构建；参数以 JSON 和 PowerShell splatting 传递，使用 UTF-8 输出，每个任务都有独立子目录、日志与会话文件。IB 状态以本次启动器和会话 ExitCode 为依据，不自动改用 MSBuild 或生成工程，不传 AllowConcurrent。取消只停止当前任务的 session 和进程树，原始日志和摘要均保留。
 
 同步后的自动准备继续只执行设置，并检查全部环境必需仓库；不连带生成或编译。完整参数与操作流程见 build.md。
 

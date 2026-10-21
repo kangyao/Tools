@@ -653,7 +653,7 @@ class MainWindow(QMainWindow):
         self.native_menu_open = True
         self.update_controls()
         try:
-            with RunLock(self.data_dir):
+            with RunLock(self.data_dir, self.profile.root):
                 invoked = show_repository_menu(path, self, self.tree.viewport().mapTo(self, point))
         except (OSError, RuntimeError) as error:
             self.message.setText("无法打开原生右键菜单：" + str(error))

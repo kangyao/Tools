@@ -1,168 +1,115 @@
 from __future__ import annotations
 
+import subprocess
 from copy import deepcopy
 from pathlib import Path
 
 from PySide6.QtCore import Qt, QUrl
 from PySide6.QtGui import QColor, QDesktopServices
-from PySide6.QtWidgets import (
-    QAbstractItemView, QCheckBox, QComboBox, QDialog, QFileDialog, QFormLayout,
-    QHBoxLayout, QHeaderView, QLabel, QLineEdit, QMessageBox, QPlainTextEdit,
-    QPushButton, QScrollArea, QSpinBox, QTableWidget, QTableWidgetItem,
-    QTabWidget, QVBoxLayout, QWidget,
-)
+from PySide6.QtWidgets import (QAbstractItemView, QCheckBox, QComboBox, QDialog, QDialogButtonBox,
+                               QFileDialog, QFormLayout, QHBoxLayout, QHeaderView, QLabel, QLineEdit,
+                               QListWidget, QMessageBox, QPlainTextEdit, QPushButton, QSpinBox,
+                               QTableWidget, QTableWidgetItem, QTabWidget, QVBoxLayout, QWidget)
 
 from ..build import build_preview
-from ..build_config import (
-    BUILD_ACTIONS, BUILD_STEPS, CONFIGURATIONS, DEFAULT_TARGET, PLATFORMS, VS_VERSIONS, BuildOptions,
-    read_solution_targets, validate_build_options,
-)
+from ..build_config import (BUILD_ACTIONS, BUILD_STEPS, CONFIGURATIONS, PLATFORMS, CompileTask,
+                            GenerationTask, discover_generation_scripts, read_solution_configurations, read_solution_targets,
+                            resolve_build_path, task_id, validate_build_options)
+from ..build_tasks import compile_task_for_solution, split_arguments
 from ..process import redact
 from .worker import JobThread
 
 
-BUILD_OUTCOMES = {"success": "完成", "failed": "失败", "blocked": "待处理",
-                  "cancelled": "已停止", "skipped": "未执行"}
+BUILD_OUTCOMES = {"success": "完成", "failed": "失败", "skipped": "未执行", "cancelled": "已停止"}
 
 
 class BuildDialog(QDialog):
     def __init__(self, data_dir: Path, profile, save_options, parent=None):
         super().__init__(parent)
-        self.data_dir = Path(data_dir)
-        self.profile = deepcopy(profile)
+        self.data_dir, self.profile = data_dir, deepcopy(profile)
         self.save_options = save_options
         self.worker = None
-        self.closing_requested = False
         self.results = {}
-        self.log_path = ""
-        self.build_directory = ""
         self.validate_only = False
-        self.setWindowTitle("编译构建 — " + profile.name)
-        self.resize(1180, 900)
-        self.setMinimumSize(920, 720)
+        self.loading = True
+        self.generated_changed = False
+        self.closing_requested = False
+        self.log_path = self.build_directory = ""
+        self.setWindowTitle(f"编译构建 · {profile.name}")
+        self.resize(1120, 760)
         layout = QVBoxLayout(self)
-        root = QLabel(f"当前方案：{profile.name}     工程根目录：{profile.root}")
-        root.setTextFormat(Qt.TextFormat.PlainText)
-        root.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
-        root.setWordWrap(True)
-        layout.addWidget(root)
-
         self.settings = QWidget()
-        settings_layout = QVBoxLayout(self.settings)
-        settings_layout.setContentsMargins(0, 0, 0, 0)
-        steps_row = QHBoxLayout()
-        steps_row.addWidget(QLabel("执行步骤"))
+        settings = QVBoxLayout(self.settings)
+        settings.setContentsMargins(0, 0, 0, 0)
+        top = QHBoxLayout()
         self.steps = {}
-        for number, (key, name) in enumerate(BUILD_STEPS.items(), 1):
-            check = QCheckBox(f"{number}. {name}")
+        for key, label in BUILD_STEPS.items():
+            check = QCheckBox(label)
             check.setChecked(key in profile.build.steps)
+            check.toggled.connect(self.refresh_preview)
             self.steps[key] = check
-            steps_row.addWidget(check)
-        steps_row.addStretch()
-        settings_layout.addLayout(steps_row)
-        note = QLabel("可单选任一步；多选时按 1 → 2 → 3 执行，失败即停止后续步骤。默认只编译，参数随当前方案保存。")
-        note.setWordWrap(True)
-        settings_layout.addWidget(note)
-
-        common = QHBoxLayout()
-        self.vs_version = self.combo(VS_VERSIONS, profile.build.visual_studio_version)
-        self.platform = self.combo(PLATFORMS, profile.build.platform)
-        self.python = QLineEdit(profile.build.python_path)
-        common.addWidget(QLabel("Visual Studio"))
-        common.addWidget(self.vs_version)
-        common.addWidget(QLabel("平台"))
-        common.addWidget(self.platform)
-        common.addWidget(QLabel("Python"))
-        common.addWidget(self.python, 1)
-        choose_python = QPushButton("选择 Python")
-        choose_python.clicked.connect(lambda: self.browse_file(self.python, "选择构建用 Python", "Python (python.exe);;全部文件 (*)"))
-        common.addWidget(choose_python)
-        settings_layout.addLayout(common)
-
+            top.addWidget(check)
+        top.addStretch()
+        advanced_button = QPushButton("高级设置")
+        advanced_button.setCheckable(True)
+        top.addWidget(advanced_button)
+        settings.addLayout(top)
         self.parameter_tabs = QTabWidget()
-        setup_form = self.form_tab("构建设置")
-        setup_note = QLabel("对应 SetupScript/Win_Setup.bat：解压所需的内置 Python，执行 Tools/Setup/SetupWin.py。")
-        setup_note.setWordWrap(True)
-        setup_form.addRow(setup_note)
+        self.generation_table = self.task_table(["启用", "BAT", "参数", "输出目录（可留空）", "状态"])
+        self.compile_table = self.task_table(["启用", "SLN", "编译目标", "配置", "平台", "动作", "状态"])
+        self.add_task_page("生成任务", self.generation_table,
+                           [("添加 BAT", self.add_generation_tasks), ("复制任务", self.copy_generation_tasks),
+                            ("移除", lambda: self.remove_tasks(self.generation_table))])
+        self.add_task_page("编译任务", self.compile_table,
+                           [("添加 SLN", self.add_solutions), ("读取目标", self.load_targets),
+                            ("移除", lambda: self.remove_tasks(self.compile_table))])
+        self.generation_table.setColumnWidth(1, 240)
+        self.compile_table.setColumnWidth(2, 170)
+        for column in (2, 3):
+            self.generation_table.horizontalHeader().setSectionResizeMode(column, QHeaderView.ResizeMode.Stretch)
+        self.compile_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+        self.parameter_tabs.setCurrentIndex(0 if "generate" in profile.build.steps else 1)
+        settings.addWidget(self.parameter_tabs, 1)
+        self.advanced = QWidget()
+        advanced = QFormLayout(self.advanced)
+        advanced.setContentsMargins(0, 0, 0, 0)
+        self.python = QLineEdit(profile.build.python_path)
+        advanced.addRow("构建设置 Python", self.path_row(self.python, "Python (*.exe)"))
         self.install_file = QLineEdit(profile.build.setup_install_file)
-        self.install_file.setPlaceholderText("留空：按 Dependence.json 下载和设置依赖")
-        setup_form.addRow("离线依赖包", self.file_row(self.install_file, "选择依赖安装包", "ZIP (*.zip);;全部文件 (*)"))
-        self.pack_zip = QCheckBox("下载依赖并打包为 WinSetup.zip")
+        self.install_file.setPlaceholderText("构建设置使用的离线依赖包，可留空")
+        advanced.addRow("离线依赖包", self.path_row(self.install_file, "ZIP (*.zip)"))
+        self.pack_zip = QCheckBox("构建设置时下载并打包依赖")
         self.pack_zip.setChecked(profile.build.setup_pack_zip)
-        setup_form.addRow(self.pack_zip)
-
-        generate_form = self.form_tab("生成 SLN 工程")
-        generator_note = QLabel("沿用 VS2019_64-MiniGame.bat 的 dev 生成方式；预设随上方 VS 版本和平台切换。环境参数每行一个“名称=值”。")
-        generator_note.setWordWrap(True)
-        generate_form.addRow(generator_note)
-        self.compile_type = QLineEdit(profile.build.compile_type)
-        self.compile_type.setPlaceholderText("对应批处理的第一个参数 mComplieType，可留空")
-        generate_form.addRow("生成参数", self.compile_type)
-        self.environment = QPlainTextEdit("\n".join(f"{k}={v}" for k, v in profile.build.generation_environment.items()))
-        self.environment.setMinimumHeight(140)
-        generate_form.addRow("环境参数", self.environment)
-
-        compile_form = self.form_tab("IncrediBuild 编译")
-        target_row = QHBoxLayout()
-        self.target = self.combo([profile.build.target], profile.build.target)
-        self.target.setEditable(True)
-        target_row.addWidget(self.target, 1)
-        read_targets = QPushButton("读取 SLN 目标")
-        read_targets.clicked.connect(self.load_targets)
-        target_row.addWidget(read_targets)
-        compile_form.addRow("编译目标", target_row)
-        config_row = QHBoxLayout()
-        self.configuration = self.combo(CONFIGURATIONS, profile.build.configuration)
-        self.action = self.combo(BUILD_ACTIONS, profile.build.action)
-        config_row.addWidget(self.configuration)
-        config_row.addWidget(QLabel("动作"))
-        config_row.addWidget(self.action)
-        self.monitor = QCheckBox("打开 IB 监视器")
-        self.monitor.setToolTip("另开 IncrediBuild 自带的监视窗口；不勾选时编译日志照样实时显示在下方“运行日志”")
-        self.monitor.setChecked(profile.build.open_monitor)
-        config_row.addWidget(self.monitor)
-        config_row.addStretch()
-        compile_form.addRow("构建配置", config_row)
+        advanced.addRow(self.pack_zip)
         self.skill_dir = QLineEdit(profile.build.ib_skill_dir)
-        compile_form.addRow("mini-compile-ib 技能目录", self.directory_row(self.skill_dir))
+        advanced.addRow("IB 技能目录", self.path_row(self.skill_dir))
         self.build_console = QLineEdit(profile.build.build_console_path)
-        self.build_console.setPlaceholderText("留空：由技能脚本自动查找 BuildConsole.exe")
-        compile_form.addRow("BuildConsole", self.file_row(self.build_console, "选择 BuildConsole.exe", "应用程序 (*.exe)"))
-        ib_note = QLabel("Build 增量编译；Rebuild 重新编译；Clean 清理指定目标。编译调用技能脚本，使用已有 SLN，不自动生成工程。"
-                         "编译不限时，只能手动中断；编译输出实时显示在下方“运行日志”，并保存到本次构建目录。")
-        ib_note.setWordWrap(True)
-        compile_form.addRow(ib_note)
-        self.parameter_tabs.setCurrentIndex(2)
-        self.parameter_tabs.setMinimumHeight(255)
-        settings_layout.addWidget(self.parameter_tabs, 1)
-        advanced = QHBoxLayout()
+        self.build_console.setPlaceholderText("留空自动查找 BuildConsole.exe")
+        advanced.addRow("BuildConsole", self.path_row(self.build_console, "应用程序 (*.exe)"))
+        self.environment = QPlainTextEdit("\n".join(f"{k}={v}" for k, v in profile.build.generation_environment.items()))
+        self.environment.setPlaceholderText("生成 BAT 的环境变量，每行 名称=值，可留空")
+        self.environment.setMaximumHeight(65)
+        advanced.addRow("生成环境变量", self.environment)
+        self.log_directory = QLineEdit(profile.build.log_directory)
+        self.log_directory.setPlaceholderText("留空使用工具配置目录")
+        advanced.addRow("日志目录", self.path_row(self.log_directory))
+        limits = QHBoxLayout()
         self.timeout = QSpinBox()
         self.timeout.setRange(0, 1440)
         self.timeout.setSpecialValueText("不限时")
         self.timeout.setSuffix(" 分钟")
         self.timeout.setValue(profile.build.timeout_minutes)
-        self.timeout.setToolTip("作用于构建设置、生成 SLN 工程和各项检查；IncrediBuild 编译不受此限制")
-        advanced.addWidget(QLabel("单个命令超时（不含编译）"))
-        advanced.addWidget(self.timeout)
-        advanced.addWidget(QLabel("构建日志目录"))
-        self.log_directory = QLineEdit(profile.build.log_directory)
-        self.log_directory.setPlaceholderText("留空：工具配置目录/builds；每次构建使用独立子目录")
-        advanced.addLayout(self.directory_row(self.log_directory), 1)
-        settings_layout.addLayout(advanced)
-        layout.addWidget(self.settings, 1)
-
-        self.status_table = QTableWidget(3, 3)
-        self.status_table.setHorizontalHeaderLabels(["步骤", "状态", "说明"])
-        self.status_table.verticalHeader().hide()
-        self.status_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
-        self.status_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
-        self.status_table.setColumnWidth(0, 180)
-        self.status_table.setColumnWidth(1, 95)
-        self.status_table.setFixedHeight(131)
-        for row, label in enumerate(BUILD_STEPS.values()):
-            for column, text in enumerate([label, "待执行", ""]):
-                self.status_table.setItem(row, column, QTableWidgetItem(text))
-        layout.addWidget(self.status_table)
+        limits.addWidget(self.timeout)
+        limits.addWidget(QLabel("编译不限时，可手动中断"))
+        self.monitor = QCheckBox("打开 IB 监视器")
+        self.monitor.setChecked(profile.build.open_monitor)
+        limits.addWidget(self.monitor)
+        limits.addStretch()
+        advanced.addRow("设置 / 生成 / 检查超时", limits)
+        self.advanced.hide()
+        advanced_button.toggled.connect(self.advanced.setVisible)
+        settings.addWidget(self.advanced)
+        layout.addWidget(self.settings, 3)
         self.output_tabs = QTabWidget()
         self.logs = QPlainTextEdit()
         self.logs.setReadOnly(True)
@@ -171,176 +118,317 @@ class BuildDialog(QDialog):
         self.preview.setReadOnly(True)
         self.output_tabs.addTab(self.preview, "执行计划")
         self.output_tabs.addTab(self.logs, "运行日志")
-        layout.addWidget(self.output_tabs, 1)
-        self.message = QLabel("准备就绪；检查配置仅校验入口和 IB 参数，不执行构建。")
+        layout.addWidget(self.output_tabs, 2)
+        self.message = QLabel("勾选任务后执行；生成成功的 SLN 会自动加入编译列表。")
         self.message.setTextFormat(Qt.TextFormat.PlainText)
         self.message.setWordWrap(True)
         layout.addWidget(self.message)
         actions = QHBoxLayout()
-        self.save_button = QPushButton("保存参数")
-        self.save_button.clicked.connect(self.save)
-        self.check_button = QPushButton("检查配置")
-        self.check_button.clicked.connect(lambda: self.start(True))
-        self.run_button = QPushButton("执行所选步骤")
+        self.save_button = self.button("保存", self.save)
+        self.check_button = self.button("检查", lambda: self.start(True))
+        self.run_button = self.button("执行所选步骤", lambda: self.start(False))
         self.run_button.setObjectName("primary")
-        self.run_button.clicked.connect(lambda: self.start(False))
-        self.stop_button = QPushButton("停止后续步骤")
-        self.stop_button.clicked.connect(self.stop_after_step)
-        self.cancel_button = QPushButton("中断当前步骤")
-        self.cancel_button.clicked.connect(self.cancel_step)
-        self.open_logs_button = QPushButton("打开日志目录")
-        self.open_logs_button.clicked.connect(self.open_logs)
-        self.close_button = QPushButton("关闭")
-        self.close_button.clicked.connect(self.close)
-        for button in [self.save_button, self.check_button, self.run_button, self.stop_button,
-                       self.cancel_button, self.open_logs_button, self.close_button]:
+        self.stop_button = self.button("停止后续任务", self.stop_after_step)
+        self.cancel_button = self.button("中断当前任务", self.cancel_step)
+        self.open_logs_button = self.button("日志目录", self.open_logs)
+        for button in (self.save_button, self.check_button, self.run_button, self.stop_button,
+                       self.cancel_button, self.open_logs_button):
             actions.addWidget(button)
+        actions.addStretch()
+        actions.addWidget(self.button("关闭", self.close))
         layout.addLayout(actions)
-        for widget in [self.python, self.install_file, self.compile_type, self.skill_dir, self.build_console, self.log_directory]:
-            widget.textChanged.connect(self.refresh_preview)
-        for combo in [self.vs_version, self.platform, self.target, self.configuration, self.action]:
-            combo.currentTextChanged.connect(self.refresh_preview)
-        for check in [*self.steps.values(), self.pack_zip, self.monitor]:
-            check.toggled.connect(self.refresh_preview)
+        for task in profile.build.generation_tasks:
+            self.append_generation(task)
+        for task in profile.build.compile_tasks:
+            self.append_compile(task)
+        for edit in (self.python, self.install_file, self.skill_dir, self.build_console, self.log_directory):
+            edit.textChanged.connect(self.refresh_preview)
         self.environment.textChanged.connect(self.refresh_preview)
         self.timeout.valueChanged.connect(self.refresh_preview)
+        self.pack_zip.toggled.connect(self.refresh_preview)
+        self.monitor.toggled.connect(self.refresh_preview)
+        self.loading = False
         self.refresh_preview()
         self.update_controls()
 
     @staticmethod
-    def combo(values, selected):
+    def button(label, action):
+        button = QPushButton(label)
+        button.clicked.connect(action)
+        return button
+
+    def task_table(self, headers):
+        table = QTableWidget(0, len(headers))
+        table.setHorizontalHeaderLabels(headers)
+        table.verticalHeader().hide()
+        table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
+        table.setColumnWidth(0, 45)
+        table.setColumnWidth(len(headers) - 1, 100)
+        table.cellChanged.connect(self.refresh_preview)
+        return table
+
+    def add_task_page(self, title, table, buttons):
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        bar = QHBoxLayout()
+        for label, callback in buttons:
+            bar.addWidget(self.button(label, callback))
+        bar.addStretch()
+        layout.addLayout(bar)
+        layout.addWidget(table)
+        self.parameter_tabs.addTab(page, title)
+
+    def path_row(self, edit, file_filter=""):
+        row = QHBoxLayout()
+        row.addWidget(edit, 1)
+        def browse():
+            value = (QFileDialog.getOpenFileName(self, "选择文件", self.profile.root, file_filter)[0] if file_filter
+                     else QFileDialog.getExistingDirectory(self, "选择目录", self.profile.root))
+            if value:
+                edit.setText(value)
+        row.addWidget(self.button("浏览", browse))
+        return row
+
+    def combo(self, values, selected, editable=False):
         combo = QComboBox()
-        combo.addItems(values)
+        combo.setEditable(editable)
+        combo.addItems(list(dict.fromkeys([*values, selected])))
         combo.setCurrentText(selected)
+        combo.currentTextChanged.connect(self.refresh_preview)
         return combo
 
-    def form_tab(self, title):
-        page = QWidget()
-        form = QFormLayout(page)
-        form.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.ExpandingFieldsGrow)
-        scroll = QScrollArea()
-        scroll.setWidgetResizable(True)
-        scroll.setWidget(page)
-        self.parameter_tabs.addTab(scroll, title)
-        return form
+    @staticmethod
+    def enable_item(task):
+        item = QTableWidgetItem()
+        item.setFlags(Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable | Qt.ItemFlag.ItemIsUserCheckable)
+        item.setCheckState(Qt.CheckState.Checked if task.enabled else Qt.CheckState.Unchecked)
+        item.setData(Qt.ItemDataRole.UserRole, task.id)
+        return item
 
-    def file_row(self, edit, title, file_filter):
-        row = QHBoxLayout()
-        row.addWidget(edit, 1)
-        button = QPushButton("浏览")
-        button.clicked.connect(lambda: self.browse_file(edit, title, file_filter))
-        row.addWidget(button)
-        return row
+    @staticmethod
+    def status_item():
+        item = QTableWidgetItem("待执行")
+        item.setFlags(Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable)
+        return item
 
-    def directory_row(self, edit):
-        row = QHBoxLayout()
-        row.addWidget(edit, 1)
-        button = QPushButton("浏览")
-        button.clicked.connect(lambda: self.browse_directory(edit))
-        row.addWidget(button)
-        return row
+    def append_generation(self, task):
+        table = self.generation_table
+        was_loading, self.loading = self.loading, True
+        row = table.rowCount()
+        table.insertRow(row)
+        table.setItem(row, 0, self.enable_item(task))
+        root = Path(self.profile.root)
+        choices = [str(path.relative_to(root)).replace("\\", "/") for path in discover_generation_scripts(root)]
+        combo = QComboBox()
+        for value in dict.fromkeys([*choices, task.bat]):
+            combo.addItem(Path(value).name, value)
+        combo.setCurrentIndex(combo.findData(task.bat))
+        combo.setToolTip(str(root / "SetupScript"))
+        combo.currentTextChanged.connect(self.refresh_preview)
+        table.setCellWidget(row, 1, combo)
+        table.setItem(row, 2, QTableWidgetItem(subprocess.list2cmdline(task.arguments)))
+        table.item(row, 2).setToolTip('BAT 参数，例如 --product AICore --configuration Profile；空格路径用双引号括起')
+        table.setItem(row, 3, QTableWidgetItem(task.build_directory))
+        table.item(row, 3).setToolTip("独立生成目录，自动转换为 --build-dir；相对路径基于当前工程根目录")
+        table.setItem(row, 4, self.status_item())
+        self.loading = was_loading
+        self.refresh_preview()
 
-    def browse_file(self, edit, title, file_filter):
-        value, _ = QFileDialog.getOpenFileName(self, title, self.profile.root, file_filter)
-        if value:
-            edit.setText(value)
+    def append_compile(self, task):
+        table = self.compile_table
+        was_loading, self.loading = self.loading, True
+        row = table.rowCount()
+        table.insertRow(row)
+        check = self.enable_item(task)
+        check.setData(Qt.ItemDataRole.UserRole + 1, task.generation_id)
+        table.setItem(row, 0, check)
+        table.setItem(row, 1, QTableWidgetItem(task.solution))
+        try:
+            solution = resolve_build_path(Path(self.profile.root), task.solution)
+            targets = read_solution_targets(solution)
+            pairs = read_solution_configurations(solution)
+        except (ValueError, OSError):
+            targets, pairs = [], []
+        table.setCellWidget(row, 2, self.combo(targets, task.target, True))
+        table.setCellWidget(row, 3, self.combo([pair[0] for pair in pairs] or CONFIGURATIONS, task.configuration))
+        table.setCellWidget(row, 4, self.combo([pair[1] for pair in pairs] or PLATFORMS, task.platform))
+        table.setCellWidget(row, 5, self.combo(BUILD_ACTIONS, task.action))
+        table.setItem(row, 6, self.status_item())
+        self.loading = was_loading
+        self.refresh_preview()
 
-    def browse_directory(self, edit):
-        value = QFileDialog.getExistingDirectory(self, "选择目录", self.profile.root)
-        if value:
-            edit.setText(value)
+    def generation_tasks(self):
+        table = self.generation_table
+        return [GenerationTask(id=table.item(row, 0).data(Qt.ItemDataRole.UserRole),
+                               enabled=table.item(row, 0).checkState() == Qt.CheckState.Checked,
+                               bat=table.cellWidget(row, 1).currentData(),
+                               arguments=split_arguments(table.item(row, 2).text()),
+                               build_directory=table.item(row, 3).text().strip()) for row in range(table.rowCount())]
 
-    def options(self) -> BuildOptions:
+    def compile_tasks(self):
+        table = self.compile_table
+        return [CompileTask(id=table.item(row, 0).data(Qt.ItemDataRole.UserRole),
+                            generation_id=table.item(row, 0).data(Qt.ItemDataRole.UserRole + 1) or "",
+                            enabled=table.item(row, 0).checkState() == Qt.CheckState.Checked,
+                            solution=table.item(row, 1).text().strip(),
+                            target=table.cellWidget(row, 2).currentText().strip(),
+                            configuration=table.cellWidget(row, 3).currentText(),
+                            platform=table.cellWidget(row, 4).currentText(),
+                            action=table.cellWidget(row, 5).currentText()) for row in range(table.rowCount())]
+
+    def add_generation_tasks(self):
+        scripts = discover_generation_scripts(Path(self.profile.root))
+        if not scripts:
+            QMessageBox.warning(self, "没有生成入口", f"未在 {Path(self.profile.root) / 'SetupScript'} 找到生成 BAT")
+            return
+        picker = QDialog(self)
+        picker.setWindowTitle("选择生成 BAT（可多选）")
+        layout = QVBoxLayout(picker)
+        listing = QListWidget()
+        listing.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
+        listing.addItems([script.name for script in scripts])
+        layout.addWidget(listing)
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+        buttons.accepted.connect(picker.accept)
+        buttons.rejected.connect(picker.reject)
+        layout.addWidget(buttons)
+        picker.resize(460, 320)
+        if picker.exec() == QDialog.DialogCode.Accepted:
+            for item in listing.selectedItems():
+                name = item.text()
+                args = ["--product", "MiniGame"] if name.lower() in {
+                    "generate_projects.bat", "win_product_generateproject.bat"} else []
+                self.append_generation(GenerationTask(bat="SetupScript/" + name, arguments=args))
+
+    @staticmethod
+    def selected_rows(table):
+        return sorted({index.row() for index in table.selectionModel().selectedRows()})
+
+    def copy_generation_tasks(self):
+        try:
+            tasks = self.generation_tasks()
+            for row in self.selected_rows(self.generation_table):
+                task = deepcopy(tasks[row])
+                task.id = task_id()
+                if task.build_directory:
+                    task.build_directory += "-copy"
+                self.append_generation(task)
+        except ValueError as error:
+            QMessageBox.warning(self, "无法复制任务", str(error))
+
+    def remove_tasks(self, table):
+        self.loading = True
+        for row in reversed(self.selected_rows(table)):
+            table.removeRow(row)
+        self.loading = False
+        self.refresh_preview()
+
+    def add_solutions(self):
+        paths, _ = QFileDialog.getOpenFileNames(self, "选择 SLN（可多选）",
+                                               str(Path(self.profile.root) / "Projects"), "解决方案 (*.sln)")
+        for path in paths:
+            try:
+                self.append_compile(compile_task_for_solution(Path(path)))
+            except (ValueError, OSError) as error:
+                QMessageBox.warning(self, "读取 SLN 失败", str(error))
+
+    def load_targets(self):
+        try:
+            tasks = self.compile_tasks()
+            rows = self.selected_rows(self.compile_table) or list(range(len(tasks)))
+            for row in rows:
+                task = tasks[row]
+                targets = read_solution_targets(resolve_build_path(Path(self.profile.root), task.solution))
+                combo = self.compile_table.cellWidget(row, 2)
+                current = task.target if task.target in targets else compile_task_for_solution(
+                    resolve_build_path(Path(self.profile.root), task.solution)).target
+                combo.blockSignals(True)
+                combo.clear()
+                combo.addItems(targets)
+                combo.setCurrentText(current)
+                combo.blockSignals(False)
+            self.refresh_preview()
+            self.message.setText(f"已读取 {len(rows)} 个 SLN 的 C++ 目标")
+        except (ValueError, OSError) as error:
+            QMessageBox.warning(self, "读取目标失败", str(error))
+
+    def options(self):
         environment = {}
         for line in self.environment.toPlainText().splitlines():
             if not line.strip():
                 continue
             key, sep, value = line.partition("=")
-            if not sep or key.strip() in environment:
-                raise ValueError("生成环境参数应为每行 名称=值，名称不能重复")
-            environment[key.strip()] = value.strip()
-        options = BuildOptions(
-            steps=[key for key, check in self.steps.items() if check.isChecked()],
-            python_path=self.python.text().strip(), setup_install_file=self.install_file.text().strip(),
-            setup_pack_zip=self.pack_zip.isChecked(), compile_type=self.compile_type.text(),
-            generation_environment=environment, target=self.target.currentText().strip(),
-            configuration=self.configuration.currentText(), platform=self.platform.currentText(),
-            visual_studio_version=self.vs_version.currentText(), action=self.action.currentText(),
-            ib_skill_dir=self.skill_dir.text().strip(), build_console_path=self.build_console.text().strip(),
-            log_directory=self.log_directory.text().strip(), open_monitor=self.monitor.isChecked(),
-            timeout_minutes=self.timeout.value())
+            if not sep or key.strip().upper() in environment:
+                raise ValueError("环境变量应为每行 名称=值，名称不能重复")
+            environment[key.strip().upper()] = value.strip()
+        options = deepcopy(self.profile.build)
+        options.steps = [key for key, check in self.steps.items() if check.isChecked()]
+        options.generation_tasks, options.compile_tasks = self.generation_tasks(), self.compile_tasks()
+        options.python_path, options.setup_install_file = self.python.text().strip(), self.install_file.text().strip()
+        options.setup_pack_zip, options.open_monitor = self.pack_zip.isChecked(), self.monitor.isChecked()
+        options.ib_skill_dir, options.build_console_path = self.skill_dir.text().strip(), self.build_console.text().strip()
+        options.generation_environment = environment
+        options.log_directory, options.timeout_minutes = self.log_directory.text().strip(), self.timeout.value()
         validate_build_options(options)
         return options
 
-    def refresh_preview(self):
+    def refresh_preview(self, *_):
+        if self.loading:
+            return
         try:
             updated = deepcopy(self.profile)
             updated.build = self.options()
             self.preview.setPlainText(build_preview(updated))
         except ValueError as error:
             self.preview.setPlainText(str(error))
-        if self.worker is None:
-            self.results = {}
-            for row, key in enumerate(BUILD_STEPS):
-                self.status_table.item(row, 1).setText("待执行" if self.steps[key].isChecked() else "未选择")
-                self.status_table.item(row, 1).setForeground(QColor("#182536"))
-                self.status_table.item(row, 2).setText("")
 
-    def save(self) -> bool:
+    def save(self, *_):
         try:
             options = self.options()
             if self.save_options(deepcopy(options)) is False:
                 return False
             self.profile.build = options
-            self.message.setText("构建参数已保存到当前方案")
+            self.message.setText("构建任务已保存到当前方案")
             return True
         except (ValueError, OSError) as error:
-            QMessageBox.warning(self, "构建参数未保存", str(error))
+            QMessageBox.warning(self, "构建任务未保存", str(error))
             return False
-
-    def load_targets(self):
-        try:
-            options = self.options()
-            targets = read_solution_targets(options.solution(Path(self.profile.root)))
-            if not targets:
-                raise ValueError("SLN 中没有找到 C++ 编译目标")
-            current = self.target.currentText().strip()
-            message = f"已读取 {len(targets)} 个编译目标"
-            if current.casefold() not in {name.casefold() for name in targets} and DEFAULT_TARGET in targets:
-                message += f"；{current or '当前目标'} 不是 C++ 工程，已切换为 {DEFAULT_TARGET}"
-                current = DEFAULT_TARGET
-            self.target.blockSignals(True)
-            self.target.clear()
-            self.target.addItems(targets)
-            self.target.setCurrentText(current)
-            self.target.blockSignals(False)
-            self.refresh_preview()
-            self.message.setText(message)
-        except (ValueError, OSError) as error:
-            QMessageBox.warning(self, "读取目标失败", str(error))
 
     def start(self, validate_only=False):
         if self.worker is not None or not self.save():
             return
-        self.validate_only = validate_only
+        self.validate_only, self.generated_changed = validate_only, False
         self.results = {}
         self.logs.clear()
         self.log_path = self.build_directory = ""
         self.output_tabs.setCurrentIndex(1)
-        for row, key in enumerate(BUILD_STEPS):
-            self.status_table.item(row, 1).setText("待检查" if validate_only else "待执行")
-            if key not in self.profile.build.steps:
-                self.status_table.item(row, 1).setText("未选择")
-            self.status_table.item(row, 1).setForeground(QColor("#182536"))
-            self.status_table.item(row, 2).setText("")
+        for step, table in (("generate", self.generation_table), ("compile", self.compile_table)):
+            for row in range(table.rowCount()):
+                self.set_task_status(table, row, "待检查" if validate_only else "待执行")
+                if step not in self.profile.build.steps or table.item(row, 0).checkState() != Qt.CheckState.Checked:
+                    self.set_task_status(table, row, "未选择")
         self.worker = JobThread(self.data_dir, self.profile, "build-check" if validate_only else "build", [], parent=self)
         self.worker.event.connect(self.handle_event)
         self.worker.completed.connect(self.job_completed)
         self.worker.failed.connect(self.job_failed)
         self.worker.finished.connect(self.job_finished)
-        self.message.setText("正在检查构建配置…" if validate_only else "正在执行构建步骤…")
+        self.message.setText("正在检查配置…" if validate_only else "正在执行构建任务…")
         self.update_controls()
         self.worker.start()
+
+    def set_task_status(self, table, row, label, message="", failed=False):
+        self.loading = True
+        item = table.item(row, table.columnCount() - 1)
+        item.setText(label)
+        item.setToolTip(message)
+        item.setForeground(QColor("#b45309" if failed else "#182536"))
+        self.loading = False
+
+    def task_row(self, step, identity):
+        table = self.generation_table if step == "generate" else self.compile_table
+        return table, next((row for row in range(table.rowCount())
+                            if table.item(row, 0).data(Qt.ItemDataRole.UserRole) == identity), -1)
 
     def handle_event(self, kind, payload):
         if kind == "log":
@@ -351,27 +439,55 @@ class BuildDialog(QDialog):
         elif kind == "build_directory":
             self.build_directory = payload
             self.update_controls()
+        elif kind == "build_compile_tasks":
+            self.loading = True
+            self.compile_table.setRowCount(0)
+            for task in deepcopy(payload):
+                self.append_compile(task)
+            self.loading = False
+            self.generated_changed = True
+            self.refresh_preview()
+        elif kind == "build_task_started":
+            step, identity = payload
+            table, row = self.task_row(step, identity)
+            if row >= 0:
+                self.set_task_status(table, row, "检查中" if self.validate_only else "执行中")
+        elif kind == "build_task_result":
+            table, row = self.task_row(payload.step, payload.repo_id)
+            if row >= 0:
+                label = "检查通过" if self.validate_only and payload.outcome == "success" else BUILD_OUTCOMES[payload.outcome]
+                self.set_task_status(table, row, label, payload.message, payload.outcome == "failed")
         elif kind == "build_started":
-            row = list(BUILD_STEPS).index(payload)
-            self.status_table.item(row, 1).setText("检查中" if self.validate_only else "执行中")
             self.message.setText(("正在检查：" if self.validate_only else "正在执行：") + BUILD_STEPS[payload])
         elif kind == "build_result":
             self.results[payload.repo_id] = payload
-            row = list(BUILD_STEPS).index(payload.repo_id)
-            label = "检查通过" if self.validate_only and payload.outcome == "success" else BUILD_OUTCOMES[payload.outcome]
-            self.status_table.item(row, 1).setText(label)
-            self.status_table.item(row, 1).setForeground(QColor("#188153" if payload.outcome == "success" else "#b45309"))
-            self.status_table.item(row, 2).setText(payload.message)
-            self.status_table.item(row, 2).setToolTip(payload.message)
+            if payload.repo_id in {"generate", "compile"} and not payload.tasks:
+                table = self.generation_table if payload.repo_id == "generate" else self.compile_table
+                for row in range(table.rowCount()):
+                    if table.item(row, 0).checkState() == Qt.CheckState.Checked:
+                        self.set_task_status(table, row, BUILD_OUTCOMES[payload.outcome], payload.message,
+                                             payload.outcome == "failed")
 
     def job_completed(self, results):
         self.results = results
+        if self.generated_changed:
+            self.save()
         succeeded = sum(result.outcome == "success" for result in results.values())
-        self.message.setText(f"{'配置检查' if self.validate_only else '构建执行'}结束：{succeeded} / {len(results)} 项成功；详情见各步骤和日志。")
+        self.message.setText(f"{'配置检查' if self.validate_only else '构建'}结束：{succeeded}/{len(results)} 个步骤成功；详情见任务状态和日志。")
 
     def job_failed(self, message):
-        self.logs.appendPlainText(redact(message))
-        self.message.setText("构建任务未完成，详情见日志")
+        if self.generated_changed:
+            self.save()
+        message = redact(message).strip()
+        for table in (self.generation_table, self.compile_table):
+            for row in range(table.rowCount()):
+                status = table.item(row, table.columnCount() - 1).text()
+                if status in {"待执行", "待检查"}:
+                    self.set_task_status(table, row, "未执行", message)
+                elif status in {"执行中", "检查中"}:
+                    self.set_task_status(table, row, "失败", message, failed=True)
+        self.logs.appendPlainText(message)
+        self.message.setText(message if "\n" not in message else "构建任务未完成，详情见日志")
 
     def job_finished(self):
         old, self.worker = self.worker, None
@@ -384,7 +500,7 @@ class BuildDialog(QDialog):
     def update_controls(self):
         busy = self.worker is not None
         self.settings.setEnabled(not busy)
-        for button in [self.save_button, self.check_button, self.run_button]:
+        for button in (self.save_button, self.check_button, self.run_button):
             button.setEnabled(not busy)
         self.stop_button.setEnabled(busy and not self.worker.stop_requested.is_set())
         self.cancel_button.setEnabled(busy and not self.worker.cancel_requested.is_set())
@@ -393,14 +509,14 @@ class BuildDialog(QDialog):
     def stop_after_step(self):
         if self.worker:
             self.worker.stop_requested.set()
-            self.message.setText("当前步骤结束后停止，不执行后续步骤")
+            self.message.setText("当前任务结束后停止")
             self.update_controls()
 
     def cancel_step(self):
         if self.worker:
             self.worker.stop_requested.set()
             self.worker.cancel_requested.set()
-            self.message.setText("正在中断当前步骤并停止后续步骤；IB 使用本次会话文件停止")
+            self.message.setText("正在中断当前任务并停止后续任务")
             self.update_controls()
 
     def open_logs(self):
@@ -416,7 +532,7 @@ class BuildDialog(QDialog):
             event.accept()
             return
         if not self.closing_requested:
-            answer = QMessageBox.question(self, "构建仍在执行", "中断当前步骤并关闭？本次构建日志将保留。",
+            answer = QMessageBox.question(self, "构建仍在执行", "中断当前任务并关闭？日志将保留。",
                                           QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
                                           QMessageBox.StandardButton.No)
             if answer == QMessageBox.StandardButton.Yes:

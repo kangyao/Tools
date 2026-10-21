@@ -188,11 +188,11 @@ class ChangesService:
         return ChangeSnapshot(repo_id, str(root), head, files, submodule, operation)
 
     def scan(self, profile: Profile, repo_id: str) -> ChangeSnapshot:
-        with RunLock(self.data_dir):
+        with RunLock(self.data_dir, profile.root):
             return self._scan(profile, repo_id)
 
     def diff(self, profile: Profile, repo_id: str, path: str) -> str:
-        with RunLock(self.data_dir):
+        with RunLock(self.data_dir, profile.root):
             snapshot = self._scan(profile, repo_id)
             row = next((r for r in snapshot.files if r.path == path), None)
             if row is None:
@@ -284,7 +284,7 @@ class ChangesService:
 
     def discard(self, profile: Profile, repo_id: str, approved: ChangeSnapshot,
                 selected: list[str]) -> DiscardResult:
-        with RunLock(self.data_dir):
+        with RunLock(self.data_dir, profile.root):
             fresh, rows = self._recheck(profile, repo_id, approved, selected)
             root = Path(fresh.root)
             backup = (self.data_dir / "discard-backups" /

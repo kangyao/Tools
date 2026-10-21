@@ -9,6 +9,7 @@ from ..build import BuildService
 from ..changes import ChangesService
 from ..process import redact
 from ..service import RepoService
+from ..storage import RunLockBusyError
 
 
 class JobThread(QThread):
@@ -51,9 +52,11 @@ class JobThread(QThread):
             elif self.operation == "init-plan":
                 result = service.init_plan(self.profile, self.selected)
             elif self.operation == "branches":
-                result = service.branch_list(self.extra)
+                result = service.branch_list(self.extra, self.profile.root)
             else:
                 result = service.check(self.profile, self.selected, remote=self.operation == "check")
             self.completed.emit(result)
+        except RunLockBusyError as error:
+            self.failed.emit(str(error))
         except Exception:
             self.failed.emit(redact(traceback.format_exc()))

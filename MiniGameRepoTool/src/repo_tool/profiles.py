@@ -7,7 +7,7 @@ import tempfile
 from dataclasses import asdict
 from pathlib import Path
 
-from .build_config import BuildOptions
+from .build_config import parse_build_options
 from .models import InitOptions, Profile, ProfileDocument, RepoSpec, SetupOptions, validate_profile
 
 
@@ -50,7 +50,7 @@ def parse_document(data: dict) -> ProfileDocument:
         for item in data["profiles"]:
             repos = [RepoSpec(**r) for r in item["repositories"]]
             setup = SetupOptions(**item.get("setup", {}))
-            build = BuildOptions(**item.get("build", {}))
+            build = parse_build_options(item.get("build", {}))
             init = InitOptions(**item.get("init", {}))
             profile = Profile(item["id"], item["name"], item["root"], item["branch_groups"], repos, setup, build, init)
             validate_profile(profile)

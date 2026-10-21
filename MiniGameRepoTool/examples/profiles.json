@@ -95,12 +95,45 @@
       "build": {
         "steps": ["compile"],
         "python_path": "Tools/buildtools/Python39/python.exe",
-        "target": "MiniGameApp",
-        "configuration": "Debug",
-        "platform": "x64",
-        "visual_studio_version": "2019",
-        "action": "Build",
-        "ib_skill_dir": "W:/git/skills/mini-compile-ib"
+        "generation_tasks": [
+          {
+            "id": "generate-game",
+            "bat": "SetupScript/Win_MiniGame_GenerateProject.bat",
+            "arguments": [],
+            "build_directory": "",
+            "enabled": true
+          },
+          {
+            "id": "generate-ai",
+            "bat": "SetupScript/Win_AICore_GenerateProject.bat",
+            "arguments": [],
+            "build_directory": "",
+            "enabled": true
+          }
+        ],
+        "compile_tasks": [
+          {
+            "id": "compile-game",
+            "generation_id": "generate-game",
+            "solution": "Projects/vs2019-win64-MiniGame/MiniGame.sln",
+            "target": "MiniGameApp",
+            "configuration": "Debug",
+            "platform": "x64",
+            "action": "Build",
+            "enabled": true
+          },
+          {
+            "id": "compile-ai",
+            "generation_id": "generate-ai",
+            "solution": "Projects/vs2019-win64-AICore/AICore.sln",
+            "target": "AICore",
+            "configuration": "Debug",
+            "platform": "x64",
+            "action": "Build",
+            "enabled": true
+          }
+        ],
+        "ib_skill_dir": "D:/git/skills/mini-compile-ib"
       },
       "setup": {
         "auto_run": false,

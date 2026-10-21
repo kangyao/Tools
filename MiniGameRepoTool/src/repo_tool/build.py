@@ -5,11 +5,12 @@ import shutil
 import subprocess
 import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
-from .build_config import (BUILD_STEPS, default_generation_environment, require_solution_target, resolve_build_path,
-                           validate_build_options)
+from .build_config import (BUILD_STEPS, CompileTask, GenerationTask, read_solution_configurations,
+                           require_solution_target, resolve_build_path, validate_build_options)
+from .build_tasks import generated_compile_tasks, generation_command, merge_generated_tasks
 from .models import Profile
 from .process import ProcessRunner, redact
 from .profiles import atomic_json
@@ -29,14 +30,15 @@ class BuildResult:
     duration: float = 0
     log_path: str = ""
     session_file: str = ""
+    step: str = ""
+    tasks: list[BuildResult] = field(default_factory=list)
 
 
 def generation_environment(profile: Profile) -> dict[str, str | None]:
     root = Path(profile.root).resolve()
     python = resolve_build_path(root, profile.build.python_path)
     bundled = root / "Tools/buildtools/Python39/python.exe"
-    return {**default_generation_environment(),
-            **{key.upper(): value for key, value in profile.build.generation_environment.items()},
+    return {**{key.upper(): value for key, value in profile.build.generation_environment.items()},
             "PROJECT_ROOT_DIR": str(root) + "\\",
             "mComplieType": profile.build.compile_type or None, "PYTHON_EXE": str(python),
             "PYTHONHOME": str(python.parent) if python == bundled else None,
@@ -48,38 +50,30 @@ def build_preview(profile: Profile) -> str:
     validate_build_options(options)
     root = Path(profile.root).resolve()
     python = str(resolve_build_path(root, options.python_path))
-    commands = {
-        "setup": subprocess.list2cmdline([python, *SetupRunner.arguments(profile)]),
-        "generate": subprocess.list2cmdline([python, "-u", str(root / "Tools/buildtools/cmake_generate_projects.py"),
-                                             options.preset, "dev"]),
-        "compile": subprocess.list2cmdline(["powershell.exe", "-NoProfile", "-File",
-                    str(resolve_build_path(root, options.ib_skill_dir) / "scripts/invoke-mini-ib-build.ps1"),
-                    "-ProjectRoot", str(root), "-Target", options.target, "-Configuration", options.configuration,
-                    "-Platform", options.platform, "-VisualStudioVersion", options.visual_studio_version,
-                    "-Action", options.action]),
-    }
-    if options.build_console_path:
-        commands["compile"] += " -BuildConsolePath " + subprocess.list2cmdline([
-            str(resolve_build_path(root, options.build_console_path))])
-    if options.open_monitor:
-        commands["compile"] += " -OpenMonitor"
     lines = []
     for step, label in BUILD_STEPS.items():
         if step not in options.steps:
             continue
-        cwd = root / "Tools/buildtools" if step == "generate" else root
-        lines += [label, f"工作目录：{cwd}", commands[step]]
+        lines += [label]
         if step == "setup":
-            lines += ["对应 SetupScript/Win_Setup.bat；缺少内置 Python 时先解压 Python39.zip。"]
+            lines += [subprocess.list2cmdline([python, *SetupRunner.arguments(profile)]),
+                      "对应 SetupScript/Win_Setup.bat；缺少内置 Python 时先解压 Python39.zip。"]
         if step == "generate":
-            lines += ["对应 Tools/ProjectBat/VS2019_64-MiniGame.bat；不执行末尾 pause。",
-                      "环境参数：" + "; ".join(f"{k}={v}" for k, v in generation_environment(profile).items() if v is not None),
-                      f"mComplieType={options.compile_type}"]
-            if generation_environment(profile).get("USE_RAINBOW_LIB") == "1":
-                lines += ["先执行 Tools/Setup/PullEngine.py 获取引擎库，再生成工程。"]
+            for task in options.generation_tasks:
+                if task.enabled:
+                    arguments = [str(resolve_build_path(root, task.bat)), *task.arguments, "--no-pause"]
+                    if task.build_directory:
+                        arguments += ["--build-dir", str(resolve_build_path(root, task.build_directory))]
+                    lines += [subprocess.list2cmdline(arguments)]
+            lines += ["成功后将本次生成的 SLN 加入编译列表。"]
+        if step == "compile":
+            lines += [f"{task.solution} → {task.target} {task.configuration}|{task.platform} {task.action}"
+                      for task in options.compile_tasks if task.enabled]
+            if "generate" in options.steps:
+                lines += ["包含本次生成后加入的编译任务。"]
         lines.append("")
-    lines += [f"解决方案：{options.solution(root)}",
-              "按上述顺序执行；任一步失败或中断即停止后续步骤。检查配置不会执行构建设置、生成或编译。"]
+    lines += ["按设置 → 生成任务 → 编译任务顺序执行，失败或停止后不再启动后续任务。",
+              "检查配置不会执行构建设置、生成或编译；编译使用独立的 IB 会话和日志。"]
     return redact("\n".join(lines))
 
 
@@ -93,6 +87,7 @@ class BuildService:
         self.journal = None
         self.current = ""
         self.run_dir = None
+        self.task_dir = None
 
     def _log(self, line: str):
         line = redact(line)
@@ -116,7 +111,7 @@ class BuildService:
         powershell = shutil.which("powershell.exe")
         if not powershell:
             raise ValueError("找不到 Windows PowerShell：powershell.exe")
-        request = self.run_dir / (name + ".request.json")
+        request = (self.task_dir or self.run_dir) / (name + ".request.json")
         atomic_json(request, {"Script": str(script), "Parameters": parameters})
         runner = ProcessRunner(self._log) if cleanup else self.runner
         if cleanup:
@@ -148,36 +143,73 @@ class BuildService:
         result = runner.prepare(profile)
         return BuildResult("setup", result.outcome, result.message, runner.last_exit_code)
 
+    def _run_tasks(self, profile: Profile, step: str, tasks: list, operation, validate_only: bool) -> BuildResult:
+        selected = [task for task in tasks if task.enabled]
+        if not selected:
+            raise ValueError("请先添加并勾选生成 BAT 任务" if step == "generate" else
+                             "请先添加并勾选 SLN 编译任务，或先执行生成")
+        results = []
+        failed = False
+        for index, task in enumerate(selected, 1):
+            self.task_dir = self.run_dir / f"{step}-{index:02d}-{task.id}"
+            self.task_dir.mkdir(parents=True, exist_ok=True)
+            started = time.monotonic()
+            if self.stop.is_set() or self.cancel.is_set():
+                result = BuildResult(task.id, "cancelled", "已停止，未执行此任务")
+            elif failed and not validate_only:
+                result = BuildResult(task.id, "skipped", "前一任务未成功，未执行此任务")
+            else:
+                self.emit("build_task_started", (step, task.id))
+                label = task.bat if step == "generate" else task.solution
+                self._log(f"[{index}/{len(selected)}] {label}")
+                try:
+                    result = operation(profile, task, validate_only)
+                except (OSError, ValueError, RuntimeError) as error:
+                    result = BuildResult(task.id, "failed", redact(str(error)))
+            result.repo_id, result.step = task.id, step
+            result.duration = round(time.monotonic() - started, 2)
+            result.log_path = result.log_path or str(self.run_dir / "build.log")
+            failed |= result.outcome != "success"
+            results.append(result)
+            self._log(result.message)
+            self.emit("build_task_result", result)
+        self.task_dir = None
+        unsuccessful = next((result for result in results if result.outcome != "success"), None)
+        last = unsuccessful or results[-1]
+        return BuildResult(step, unsuccessful.outcome if unsuccessful else "success",
+                           f"{sum(item.outcome == 'success' for item in results)}/{len(results)} 项成功；{last.message}",
+                           last.exit_code, log_path=last.log_path, session_file=last.session_file, tasks=results)
+
     def _generate(self, profile: Profile, validate_only: bool) -> BuildResult:
         root = Path(profile.root).resolve()
+        destinations = set()
+        for task in profile.build.generation_tasks:
+            if not task.enabled:
+                continue
+            key = ("directory", str(resolve_build_path(root, task.build_directory)).casefold()) if task.build_directory else (
+                task.bat.casefold(), tuple(task.arguments))
+            if key in destinations:
+                raise ValueError("多条生成任务指向相同输出；请为复制的任务设置不同参数或独立输出目录")
+            destinations.add(key)
+        return self._run_tasks(profile, "generate", profile.build.generation_tasks, self._generate_task, validate_only)
+
+    def _generate_task(self, profile: Profile, task: GenerationTask, validate_only: bool) -> BuildResult:
+        root = Path(profile.root).resolve()
         options = profile.build
-        python = resolve_build_path(root, options.python_path)
-        script = root / "Tools/buildtools/cmake_generate_projects.py"
-        preset = root / "Tools/buildtools/platformconfig/public" / (options.preset + ".xml")
-        self._require(python, "Python（请先执行构建设置）")
-        self._require(script, "工程生成脚本")
-        self._require(preset, "生成预设")
-        pull_engine = generation_environment(profile).get("USE_RAINBOW_LIB") == "1"
-        if pull_engine:
-            self._require(root / "Tools/Setup/PullEngine.py", "引擎库下载脚本")
+        arguments, environment = generation_command(root, task, self.task_dir)
         if validate_only:
-            return BuildResult("generate", "success", f"生成入口和预设 {options.preset} 通过检查；未生成工程")
-        timeout = options.timeout_minutes * 60 or None
-        environment = generation_environment(profile)
-        if pull_engine:
-            result = self.runner.run(str(python), ["-u", str(root / "Tools/Setup/PullEngine.py")], root,
-                                     timeout=timeout, environment=environment)
-            if result.returncode or result.cancelled or result.timed_out:
-                return self._process_result("generate", result, "获取引擎库")
-        result = self.runner.run(str(python), ["-u", str(HELPERS / "run_generation.py"), str(script), options.preset],
-                                 root / "Tools/buildtools", timeout=timeout, environment=environment)
-        outcome = self._process_result("generate", result, "生成 SLN 工程")
+            return BuildResult(task.id, "success", f"{Path(task.bat).name} 入口和参数通过检查；未生成工程")
+        command = shutil.which("cmd.exe")
+        if not command:
+            raise ValueError("找不到 Windows 命令解释器 cmd.exe")
+        result = self.runner.run(command, arguments, self.task_dir, timeout=options.timeout_minutes * 60 or None,
+                                 environment={**generation_environment(profile), **environment})
+        outcome = self._process_result(task.id, result, Path(task.bat).name)
         if outcome.outcome == "success":
-            if not options.solution(root).is_file():
-                outcome.outcome = "failed"
-                outcome.message = f"生成脚本已退出，但没有找到预期解决方案：{options.solution(root)}"
-            else:
-                outcome.message = f"工程生成完成：{options.solution(root)}"
+            generated = generated_compile_tasks(root, task, result.output)
+            options.compile_tasks = merge_generated_tasks(root, options.compile_tasks, task.id, generated)
+            self.emit("build_compile_tasks", options.compile_tasks)
+            outcome.message = f"{Path(task.bat).name} 完成，已加入 {len(generated)} 个 SLN 编译任务"
         return outcome
 
     @staticmethod
@@ -191,18 +223,25 @@ class BuildService:
                            process.returncode)
 
     def _compile(self, profile: Profile, validate_only: bool) -> BuildResult:
+        return self._run_tasks(profile, "compile", profile.build.compile_tasks, self._compile_task, validate_only)
+
+    def _compile_task(self, profile: Profile, task: CompileTask, validate_only: bool) -> BuildResult:
         root = Path(profile.root).resolve()
         options = profile.build
-        self._require(options.solution(root), "已有 SLN 工程（请先执行生成 SLN 工程）")
-        require_solution_target(options.solution(root), options.target)
+        solution = resolve_build_path(root, task.solution)
+        self._require(solution, "已有 SLN 工程（请先执行生成 SLN 工程）")
+        require_solution_target(solution, task.target)
+        pairs = read_solution_configurations(solution)
+        if pairs and (task.configuration, task.platform) not in pairs:
+            raise ValueError(f"{solution.name} 不支持 {task.configuration}|{task.platform}")
         skill = resolve_build_path(root, options.ib_skill_dir) / "scripts"
         for name in ("invoke-mini-ib-build.ps1", "stop-mini-ib-build.ps1", "read-mini-ib-result.ps1"):
             self._require(skill / name, "IB 技能脚本")
-        log = self.run_dir / "incredibuild.log"
-        session = self.run_dir / "incredibuild.session.json"
-        parameters = {"ProjectRoot": str(root), "Target": options.target, "Configuration": options.configuration,
-                      "Platform": options.platform, "VisualStudioVersion": options.visual_studio_version,
-                      "Action": options.action, "LogPath": str(log), "SessionFile": str(session)}
+        log = self.task_dir / "incredibuild.log"
+        session = self.task_dir / "incredibuild.session.json"
+        parameters = {"ProjectRoot": str(root), "SolutionPath": str(solution), "Target": task.target,
+                      "Configuration": task.configuration, "Platform": task.platform,
+                      "Action": task.action, "LogPath": str(log), "SessionFile": str(session)}
         if options.build_console_path:
             parameters["BuildConsolePath"] = str(resolve_build_path(root, options.build_console_path))
         if options.open_monitor:
@@ -234,7 +273,7 @@ class BuildService:
                 code = recorded.get("ExitCode")
                 result.exit_code = code if type(code) is int else None
                 result.outcome = "success" if type(code) is int and code == 0 and process.returncode == 0 else "failed"
-                result.message = f"IB {options.target} {options.configuration}|{options.platform} {options.action}：退出码 {code}"
+                result.message = f"IB {solution.name} / {task.target} {task.configuration}|{task.platform} {task.action}：退出码 {code}"
             else:
                 result.outcome = "failed"
                 result.message = "IB 未产生本次会话记录，未确认编译成功；详情见日志"
@@ -247,7 +286,7 @@ class BuildService:
     def run(self, profile: Profile, *, validate_only=False) -> dict[str, BuildResult]:
         validate_build_options(profile.build)
         root = Path(profile.root).resolve()
-        with RunLock(self.data_dir):
+        with RunLock(self.data_dir, profile.root):
             self.journal = RunJournal(self.data_dir, profile.id, "build-check" if validate_only else "build")
             self.emit("journal", str(self.journal.log_path))
             log_root = (resolve_build_path(root, profile.build.log_directory) if profile.build.log_directory

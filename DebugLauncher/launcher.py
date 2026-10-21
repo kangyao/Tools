@@ -442,7 +442,7 @@ class DebugLauncherApp:
     def _update_launch_labels(self) -> None:
         count = self._client_count()
         clients = "Client" if count in (None, 1) else f"{count} 个 Client"
-        self.role_controls[NetworkRole.CLIENT].start_button.configure(text=f"启动 {clients}")
+        self.role_controls[NetworkRole.CLIENT].start_button.configure(text="启动一个 Client")
         host = self.config.selected(NetworkRole.HOST)
         title = "DS" if host is not None and host.server_mode == "CloudServer" else "Host"
         self.role_controls[NetworkRole.HOST].start_button.configure(text=f"启动 {title}")
@@ -631,10 +631,6 @@ class DebugLauncherApp:
             return
         try:
             settings = profile.settings()
-            count = 1
-            if role is NetworkRole.CLIENT:
-                count = self._validated_client_count(profile.auto_dev_account)
-                self._save_config(replace(self.config, client_count=count))
         except LauncherError as exc:
             self._show_error("启动失败", exc)
             return
@@ -652,9 +648,9 @@ class DebugLauncherApp:
         else:
             self.launch_cancel.clear()
             self._run_async(
-                f"正在启动 {count} 个 Client…",
+                "正在启动一个 Client…",
                 lambda: self.controller.start_clients(
-                    settings, count, auto_dev_account=profile.auto_dev_account,
+                    settings, 1, auto_dev_account=profile.auto_dev_account,
                     label=profile.name, cancel=self.launch_cancel,
                 ),
                 self._on_clients_started,

@@ -1,89 +1,67 @@
 # 编译构建
 
-入口：主窗口右下角“编译构建”。工程根目录来自当前方案；所有构建参数保存在该方案的 build 字段中。原配置不含 build 字段时自动使用默认值，不需要迁移文件。
+从主窗口点击“编译构建”。窗口使用当前方案的根目录，生成任务和编译任务随方案保存、复制、导入、导出。高级设置默认折叠。
 
-## 常见操作
+## 生成任务
 
-| 需要做什么 | 勾选步骤 | 常用参数 |
-|---|---|---|
-| 首次设置并生成、编译 | 构建设置 + 生成 SLN 工程 + IncrediBuild 编译 | VS2019、x64、MiniGame、Debug、Build |
-| 日常增量编译 | 仅 IncrediBuild 编译 | 已有工程的目标、配置和平台，动作 Build |
-| 重新编译目标 | 仅 IncrediBuild 编译 | 动作 Rebuild |
-| 重新生成 SLN | 仅生成 SLN 工程 | VS/平台、生成参数、环境变量 |
-| 配置或修复构建依赖 | 仅构建设置 | Python、离线依赖包或依赖打包选项 |
-| 清理目标产物 | 仅 IncrediBuild 编译 | 动作 Clean，由 IB 清理该目标 |
+“添加 BAT”扫描 `<工程根目录>/SetupScript` 中名称含 Generate 的 BAT，可一次选择多个。当前 C:/MiniGame 的入口包括 MiniGame、AICore、CoreAIHub、MiniGameServer、RainbowEditor 和通用生成 BAT。
 
-默认只选择编译；勾选多个步骤时固定按设置 → 生成 → 编译运行，前一步不成功则后续步骤显示“未执行”。Git 仓库列表的勾选范围与构建步骤无关；手动构建不检查 Git 是否已经同步或有本地修改。
+每行包含：启用、BAT、参数、输出目录、状态。“复制任务”可以为同一 BAT 添加多条任务，任务有独立 ID、参数和输出目录。
 
-“保存参数”只保存配置。“检查配置”检查选中步骤的文件入口，以及已有 SLN、目标和 IB 程序；编译检查使用技能脚本的 ValidateOnly，不启动 BuildConsole。未生成的 SLN 会在检查中报缺失；可以先执行生成步骤，或直接执行包含生成的完整流程，每一步在实际执行时重新校验。
+例如，对 `Win_Product_GenerateProject.bat` 添加两行：
 
-## 参数
+| 参数 | 输出目录 |
+| --- | --- |
+| `--product MiniGame` | `Projects/custom-game` |
+| `--product AICore` | `Projects/custom-ai` |
 
-| 参数 | 默认值与含义 |
-|---|---|
-| Visual Studio | 2019；可选 2022，需要工程已有对应生成预设和本机工具链 |
-| 平台 | x64；可选 Win32，同样要求对应预设和工具链可用 |
-| Python | Tools/buildtools/Python39/python.exe；可以选择其他 Python，默认版本缺失时构建设置会解压 Python39.zip |
-| 离线依赖包 | 留空表示按 Tools/Setup/Dependence.json 下载和设置；指定 ZIP 时传入 SetupWin.py 的 --install，并明确 --workdir 为工程根目录 |
-| 依赖打包 | 选中后传 --packzip True，生成 WinSetup.zip；不能与离线包同时使用 |
-| 生成参数 | 对应原生成 BAT 的第一个参数 mComplieType，可留空 |
-| 生成环境参数 | 每行 名称=值；支持 USE_LUA_JIT、USE_RAINBOW_LIB、USE_DEV_BUILD 等原 BAT 参数，默认值见下方 |
-| 编译目标 | MiniGameApp；SLN 中的 MiniGame 只是解决方案文件夹，不能作为目标。可以输入其他已有目标，也可点“读取 SLN 目标”选择实际存在的 C++ 项目（当前目标不在列表中时自动切到 MiniGameApp）。编译和检查前，工具先确认目标是 SLN 中的 C++ 项目 |
-| 构建配置 | Debug；可选 Release、Profile、EditorDebug、EditorRelease，实际支持情况由现有工程与 IB 判定 |
-| 动作 | Build 增量编译、Rebuild 重新编译、Clean 清理，均只针对指定目标 |
-| mini-compile-ib 技能目录 | W:/git/skills/mini-compile-ib；必须含 scripts 下的 invoke/read/stop 三个脚本 |
-| BuildConsole | 留空由技能在 PATH 和 IncrediBuild 常见安装位置查找，也可指定 BuildConsole.exe |
-| 打开 IB 监视器 | 默认关闭；打开后传入技能 OpenMonitor，并生成本次监视器文件 |
-| 构建日志目录 | 留空使用工具配置目录/builds；可填写绝对目录或相对工程根目录的路径，每次执行创建独立子目录 |
-| 单个命令超时 | 0 不限时；1–1440 分钟，超时使用与中断相同的当前任务停止流程 |
+参数遵循 Windows 引号规则，例如 `--configuration Profile --binary-dir "C:\Build Output\Game"`。输出目录支持工程根目录下的相对路径或绝对路径；该列由工具转换为 `--build-dir`，不要在参数列重复填写。同一 BAT 的重复任务应使用不同参数或独立输出目录。
 
-生成默认环境：
+工具在工程根目录执行原 BAT，设置 `CI=1` 并附加 `--no-pause`。BAT 退出码非零、取消或超时均视为失败，已有旧 SLN 不会覆盖失败结果。BAT 路径必须位于当前工程的 SetupScript 中；参数是普通参数列表，不支持 CMD 命令拼接和环境变量展开。
 
-```text
-USE_LUA_JIT=1
-USE_RAINBOW_LIB=0
-USE_SANDBOXENGINE_DRIVER_LIB=0
-USE_DEV_BUILD=1
-USE_UNIVERSE_BUILD=0
-USE_POCO_BUILD=1
-ADVANCE_BETA_CLIENT_BUILD=0
-ENABLE_MEMORY_LEAK_CHECK_LOG=1
-```
+成功后优先读取控制台返回的元数据与已发布的 `MINIW_PRODUCT.json`，提取实际 SLN、主目标、配置和平台。支持一个 BAT 返回一个或多个 SLN。自定义 BAT 不返回 JSON 时，填写输出目录，工具只在该目录中收集元数据或 SLN，不扫描整个 Projects 猜测结果。
 
-删掉某个默认变量时恢复它的默认值；将其改为 0 表示关闭。USE_RAINBOW_LIB=1 时，先执行 Tools/Setup/PullEngine.py 获取引擎库，成功后才生成工程。PROJECT_ROOT_DIR、PYTHON_EXE、PYTHONHOME、PYTHONPATH 和 mComplieType 由路径和独立参数生成，不能在环境参数区重复覆盖。
+本次生成的 SLN 自动加入编译表。再次生成相同任务会更新关联行，并保留已有 ID、勾选状态、目标、配置、平台和动作；不会重复追加同一任务的结果。即使后续任务失败，已经生成的结果仍会保存。
 
-## 与工程脚本的对应关系
+## 多 SLN 编译
 
-| 步骤 | 用户提供的入口 | 工具执行方式 |
-|---|---|---|
-| 构建设置 | SetupScript/Win_Setup.bat | 必要时使用 Tools/7z.exe 解压 Python39.zip，然后在工程根目录用配置的 Python 执行 Tools/Setup/SetupWin.py |
-| 生成 SLN | Tools/ProjectBat/VS2019_64-MiniGame.bat | 在 Tools/buildtools 目录执行原 cmake_generate_projects.py，传入由 VS/平台形成的预设和 dev，保留 BAT 的环境变量；跳过 pause |
-| IB 编译 | mini-compile-ib/SKILL.md | 通过该技能的 scripts/invoke-mini-ib-build.ps1 校验、构建；结束后调用 read-mini-ib-result.ps1 读取摘要 |
+“添加 SLN”支持一次选择多个已有解决方案；“读取目标”从所选行对应的 SLN 读取 C++ 项目，排除解决方案文件夹。
 
-默认解决方案是 Projects/vs2019-win64-MiniGame/MiniGame.sln。VS 和平台变化时，生成预设及 IB 解决方案目录一起变化。工具使用现有项目脚本，不修改 MiniGame 源码、BAT 或技能脚本，也不把工程生成隐藏在“仅编译”中。
+每行独立设置：启用、SLN、编译目标、配置、平台、Build / Rebuild / Clean。允许对同一 SLN 添加不同配置或不同目标的任务。导入时优先使用元数据中的主目标和配置，否则从 SLN 中读取。
 
-生成脚本原本不返回内部 os.system 调用的失败码。工具使用小型 Python 启动器运行原脚本，将内部命令失败传递为生成步骤失败，并核对预期 SLN；避免已有旧 SLN 掩盖本次 CMake 失败。脚本自身的工具链、依赖和路径限制仍由其实际执行结果报告。
+编译按勾选的行顺序执行，每次只运行一个 IB 会话。调用 `mini-compile-ib/scripts/invoke-mini-ib-build.ps1` 的 `-SolutionPath` 参数，不再根据 VS 版本拼出固定的 MiniGame.sln。所选技能目录需要包含支持该参数的新版脚本。每个任务先 ValidateOnly，再启动 BuildConsole；检查 SLN、实际 C++ 目标和配置。缺少 SLN 时提示先生成，不自动生成替代工程，也不回退到直接 MSBuild。
 
-IB 参数通过 JSON 文件传给 PowerShell 适配器，再以参数表调用技能脚本，含空格和中文的路径保持为完整参数。适配器不拼接用户输入为 PowerShell 命令。IB 结果以独立会话 JSON 中的 BuildConsole ExitCode 为准，保留原始日志；编译警告不会自动变为失败。缺少 IB、缺少目标或已有活动会话时，报告技能给出的原因，不回退到 MSBuild，不启用 AllowConcurrent。
+## 执行与停止
 
-## 日志、中断和再次执行
+- 顶部选择“构建设置 / 生成 SLN 工程 / IncrediBuild 编译”，执行顺序固定为设置 → 生成任务 → 编译任务。可以只选择其中一步。
+- “保存”只保存任务和参数；“检查”只校验入口与已有 SLN/目标，不执行设置、生成或编译。尚未生成的结果需要先生成才能检查。
+- “执行所选步骤”执行所选步骤中已启用的任务，逐行展示状态；失败后不再启动后续任务。
+- “停止后续任务”等待当前任务完成；“中断当前任务”终止当前任务并停止后续任务。IB 仅通过本次独立会话文件停止，不按进程名全局停止。
+- “日志目录”打开本次运行目录。已完成的生成和编译产物不会回滚。
 
-构建窗口持续显示输出和每步结果，界面保留最近 8000 行。点击“打开日志目录”可查看本次完整文件：
+不同工程目录的同步和构建可以在不同工具窗口中并行执行。同一工程的不同方案，以及相互嵌套的工程目录仍共用互斥保护；占用时提示工程目录，未启动的任务显示“未执行”，释放后可重试。旧版工具运行中的任务仍持有全局锁，需等其结束并重新打开工具后才能按工程并行。
 
-```text
-builds/<本次运行标识>/
-  build.log                        设置、生成、IB 与摘要的完整输出
-  incredibuild.log                  IB 原始日志（真正开始编译后）
-  incredibuild.session.json         IB 退出码和会话信息
-  incredibuild.ib_mon               启用监视器时由 IB 生成
-  *.request.json                   各技能调用的实际脚本和参数
-```
+构建设置仍复用 SetupWin.py，支持内置 Python 解压、离线依赖包和打包依赖。同步后的自动准备继续只执行构建设置，并检查环境必需仓库；生成和编译由用户在构建窗口选择。
 
-runs 目录还保存本次步骤的结构化结果和工具运行日志。日志目录可按方案修改；每次运行均使用新目录，避免混用历史会话和退出码。
+## 高级设置与日志
 
-- 停止后续步骤：当前步骤继续完成，余下步骤不运行。
-- 中断当前步骤：设置和生成终止当前进程树；IB 使用本次会话文件调用 stop-mini-ib-build.ps1 -IncludeWorkers，并终止本次调用进程。不会发送不带会话信息的全局停止命令。
-- 关闭执行中的窗口：确认中断后等待工作线程结束，保留日志。
-- 再次执行：处理错误后重新勾选需要的步骤，再点“执行所选步骤”。已完成的设置、工程生成或编译产物不会回滚。
+高级设置包括构建设置 Python、离线依赖包、依赖打包、生成环境变量、IB 技能目录、BuildConsole 路径、日志目录、监视器、设置/生成/检查超时。编译不限时，可手动中断。生成 BAT 的 VS、架构、产品等参数填写在各任务的参数列，由原 BAT 解析。
 
-原有“同步后自动准备构建环境”设置继续可用，仅运行构建设置并使用已保存的设置参数；该自动流程仍检查全部“环境必需”仓库。自动流程不执行工程生成或 IB 编译。
+参数通过 JSON、PowerShell 参数表和带引号的 BAT 环境参数传递，支持中文和空格路径。CMD 特殊字符 `% ! ^ & | < >`、参数内部引号和控制字符会被拒绝。
+
+每次运行保留：
+
+~~~text
+builds/<run-id>/
+  build.log
+  generate-01-<task-id>/generate.bat
+  compile-01-<task-id>/
+    invoke-mini-ib-build.ps1.request.json
+    incredibuild.log
+    incredibuild.session.json
+  compile-02-<task-id>/...
+~~~
+
+IB 结果同时核对启动器退出码和本次会话中的 BuildConsole ExitCode。原始日志完整保留，警告不会自动改为失败。
+
+旧版单工程配置读取时会迁移为一条生成任务和一条关联的编译任务，保留旧的目标、配置、平台和动作；JSON schema_version 仍为 1。

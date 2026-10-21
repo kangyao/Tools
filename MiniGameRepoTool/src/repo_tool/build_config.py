@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -11,6 +12,36 @@ PLATFORMS = ("x64", "Win32")
 VS_VERSIONS = ("2019", "2022")
 BUILD_ACTIONS = ("Build", "Rebuild", "Clean")
 DEFAULT_TARGET = "MiniGameApp"
+
+
+def task_id() -> str:
+    return uuid.uuid4().hex[:12]
+
+
+@dataclass
+class GenerationTask:
+    bat: str = "SetupScript/Win_MiniGame_GenerateProject.bat"
+    arguments: list[str] = field(default_factory=list)
+    build_directory: str = ""
+    enabled: bool = True
+    id: str = field(default_factory=task_id)
+
+
+@dataclass
+class CompileTask:
+    solution: str = ""
+    target: str = DEFAULT_TARGET
+    configuration: str = "Debug"
+    platform: str = "x64"
+    action: str = "Build"
+    enabled: bool = True
+    generation_id: str = ""
+    id: str = field(default_factory=task_id)
+
+
+def default_ib_skill_dir() -> str:
+    candidate = Path(__file__).resolve().parents[4] / "mini-compile-ib"
+    return str(candidate) if candidate.is_dir() else "W:/git/skills/mini-compile-ib"
 
 
 def default_generation_environment() -> dict[str, str]:
@@ -27,25 +58,46 @@ class BuildOptions:
     setup_install_file: str = ""
     setup_pack_zip: bool = False
     compile_type: str = ""
-    generation_environment: dict[str, str] = field(default_factory=default_generation_environment)
+    generation_environment: dict[str, str] = field(default_factory=dict)
     # "MiniGame" in the generated SLN is only a solution folder; the game executable project is MiniGameApp.
     target: str = DEFAULT_TARGET
     configuration: str = "Debug"
     platform: str = "x64"
     visual_studio_version: str = "2019"
     action: str = "Build"
-    ib_skill_dir: str = "W:/git/skills/mini-compile-ib"
+    ib_skill_dir: str = field(default_factory=default_ib_skill_dir)
     build_console_path: str = ""
     log_directory: str = ""
     open_monitor: bool = False
     timeout_minutes: int = 0
+    generation_tasks: list[GenerationTask] = field(default_factory=list)
+    compile_tasks: list[CompileTask] = field(default_factory=list)
 
     @property
     def preset(self) -> str:
         return f"vs{self.visual_studio_version}-{'win64' if self.platform == 'x64' else 'win32'}-MiniGame"
 
     def solution(self, root: Path) -> Path:
+        # Kept for reading pre-task-list profiles; execution uses CompileTask.solution.
         return root / "Projects" / self.preset / "MiniGame.sln"
+
+
+def parse_build_options(data: dict) -> BuildOptions:
+    values = dict(data)
+    generations = values.pop("generation_tasks", None)
+    compilations = values.pop("compile_tasks", None)
+    options = BuildOptions(**values)
+    options.generation_tasks = ([GenerationTask(**task) for task in generations] if generations is not None else
+                                [GenerationTask(arguments=["--vs-version", options.visual_studio_version,
+                                                           "--architecture", "Win64" if options.platform == "x64" else "Win32",
+                                                           "--configuration", options.configuration])] if data else [])
+    options.compile_tasks = ([CompileTask(**task) for task in compilations] if compilations is not None else
+                             [CompileTask(solution=f"Projects/{options.preset}/MiniGame.sln", target=options.target,
+                                          configuration=options.configuration, platform=options.platform,
+                                          action=options.action)] if data else [])
+    if compilations is None and options.generation_tasks and options.compile_tasks:
+        options.compile_tasks[0].generation_id = options.generation_tasks[0].id
+    return options
 
 
 def resolve_build_path(root: Path, value: str) -> Path:
@@ -92,6 +144,60 @@ def validate_build_options(options: BuildOptions) -> None:
                 or not isinstance(value, str) or any(c in value for c in "\0\r\n")):
             raise ValueError(f"生成环境参数无效、重复或由工具管理：{key}")
         names.add(key.casefold())
+    identities = set()
+    for tasks, kind in ((options.generation_tasks, GenerationTask), (options.compile_tasks, CompileTask)):
+        if not isinstance(tasks, list) or any(not isinstance(task, kind) for task in tasks):
+            raise ValueError("构建任务必须是任务列表")
+        for task in tasks:
+            if (not isinstance(task.id, str) or not re.fullmatch(r"[A-Za-z0-9_-]+", task.id)
+                    or task.id in identities or type(task.enabled) is not bool):
+                raise ValueError("任务 ID 必须唯一，启用状态必须是布尔值")
+            identities.add(task.id)
+            if isinstance(task, GenerationTask):
+                if (not isinstance(task.arguments, list)
+                        or not all(isinstance(arg, str) for arg in task.arguments)):
+                    raise ValueError("BAT 参数必须是字符串列表")
+                for value in [task.bat, task.build_directory, *task.arguments]:
+                    validate_bat_value(value)
+                if task.enabled and (not task.bat.strip() or Path(task.bat).suffix.lower() != ".bat"):
+                    raise ValueError("请选择 SetupScript 中的 BAT")
+                if any(arg.lower() in {"--build-dir", "--dry-run", "--no-pause"} for arg in task.arguments):
+                    raise ValueError("输出目录请填写在输出目录列；--dry-run 和 --no-pause 由工具管理")
+            else:
+                for value in (task.solution, task.target, task.configuration, task.platform, task.action,
+                              task.generation_id):
+                    if not isinstance(value, str) or any(c in value for c in "\0\r\n"):
+                        raise ValueError("编译任务参数必须是单行文本")
+                if task.enabled:
+                    if not task.solution.strip() or Path(task.solution).suffix.lower() != ".sln":
+                        raise ValueError("请为编译任务选择 SLN")
+                    if not re.fullmatch(r"[\w .+\-]+", task.target) or task.target.startswith("-"):
+                        raise ValueError("请选择 SLN 中的 C++ 编译目标")
+                    if (task.configuration not in CONFIGURATIONS or task.platform not in PLATFORMS
+                            or task.action not in BUILD_ACTIONS):
+                        raise ValueError("编译任务的配置、平台或动作无效")
+
+
+def validate_bat_value(value: str) -> None:
+    # CALL inside the original BAT expands arguments again. Reject shell expansion and control characters.
+    if not isinstance(value, str) or any(c in value for c in '\0\r\n"%!^&|<>'):
+        raise ValueError("BAT 路径和参数不能包含控制字符、引号或 CMD 特殊字符（% ! ^ & | < >）")
+
+
+def discover_generation_scripts(root: Path) -> list[Path]:
+    folder = root / "SetupScript"
+    if not folder.is_dir():
+        return []
+    return sorted((path for path in folder.iterdir() if path.is_file() and path.suffix.lower() == ".bat"
+                   and "generat" in path.stem.lower()), key=lambda path: path.name.lower())
+
+
+def read_solution_configurations(solution: Path) -> list[tuple[str, str]]:
+    text = solution.read_text(encoding="utf-8-sig", errors="replace")
+    section = re.search(r"GlobalSection\(SolutionConfigurationPlatforms\)[^\n]*\n(.*?)EndGlobalSection",
+                        text, re.S | re.I)
+    return list(dict.fromkeys((config.strip(), platform.strip()) for config, platform in
+                             re.findall(r"^\s*([^|=\r\n]+)\|([^=\r\n]+)\s*=", section[1], re.M))) if section else []
 
 
 def read_solution_targets(solution: Path) -> list[str]:

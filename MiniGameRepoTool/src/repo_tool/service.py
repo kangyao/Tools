@@ -158,7 +158,7 @@ class RepoService:
         validate_profile(profile)
         if set(selected) - {repo.id for repo in profile.repositories}:
             raise ValueError("所选仓库不存在")
-        with RunLock(self.data_dir):
+        with RunLock(self.data_dir, profile.root):
             return ParallelChecks(self.emit, self.stop, self.cancel).run(profile, selected, remote)
 
     def init_plan(self, profile: Profile, selected: list[str]) -> dict[str, InitPlan]:
@@ -167,7 +167,7 @@ class RepoService:
         if set(selected) - {repo.id for repo in profile.repositories}:
             raise ValueError("所选仓库不存在")
         plans: dict[str, InitPlan] = {}
-        with RunLock(self.data_dir):
+        with RunLock(self.data_dir, profile.root):
             scanner = SourceScanner(self.git)
             sourced = self._with_managed_sources(profile)
             for repo in profile.repositories:
@@ -181,8 +181,8 @@ class RepoService:
                 self.emit("init_plan", plans[repo.id])
         return plans
 
-    def branch_list(self, remote: str) -> list[str]:
-        with RunLock(self.data_dir):
+    def branch_list(self, remote: str, root: str | None = None) -> list[str]:
+        with RunLock(self.data_dir, root):
             return self.git.branches(remote)
 
     def _execute(self, profile: Profile, repo_id: str, snap: Snapshot, *, allow_force: bool = False) -> RepoResult:
@@ -283,7 +283,7 @@ class RepoService:
         unknown = set(selected) - {r.id for r in profile.repositories}
         if unknown:
             raise ValueError("所选仓库不存在")
-        with RunLock(self.data_dir):
+        with RunLock(self.data_dir, profile.root):
             self.journal = RunJournal(self.data_dir, profile.id, "sync")
             self.emit("journal", str(self.journal.log_path))
             results: dict[str, RepoResult] = {}
@@ -335,7 +335,7 @@ class RepoService:
 
     def setup(self, profile: Profile) -> dict[str, RepoResult]:
         validate_profile(profile)
-        with RunLock(self.data_dir):
+        with RunLock(self.data_dir, profile.root):
             self.journal = RunJournal(self.data_dir, profile.id, "setup")
             self.emit("journal", str(self.journal.log_path))
             try:
